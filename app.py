@@ -1,6 +1,6 @@
-# ===============================
+# =========================================
 # 01) IMPORTS & SETUP
-# ===============================
+# =========================================
 import os
 from typing import Optional, List, Dict, Any, Tuple
 
@@ -11,12 +11,13 @@ import streamlit as st
 from dotenv import load_dotenv
 
 load_dotenv()
-st.set_page_config(page_title="Allocation CGP — Analyse UC (EODHD)", page_icon="🦉", layout="wide")
+st.set_page_config(page_title="Allocation CGP — Analyse fonds (EODHD - ISIN only)",
+                   page_icon="🦉", layout="wide")
 
 
-# ===============================
+# =========================================
 # 02) SECRET TOKEN HELPER
-# ===============================
+# =========================================
 def Secret_Token(name: str, default: Optional[str] = None) -> str:
     """
     Récupère un secret depuis l'environnement (prioritaire) ou st.secrets.
@@ -36,9 +37,9 @@ def Secret_Token(name: str, default: Optional[str] = None) -> str:
     raise RuntimeError(f"Secret '{name}' is missing. Provide it via environment or st.secrets.")
 
 
-# ===============================
-# 03) EODHD — CLIENT LÉGER (+ mapping & fallbacks)
-# ===============================
+# =========================================
+# 03) EODHD — CLIENT (ISIN -> EXCHANGE -> /eod)
+# =========================================
 def eodhd_base_url() -> str:
     return os.getenv("EODHD_BASE_URL") or st.secrets.get("EODHD_BASE_URL", "https://eodhd.com/api")
 
@@ -51,129 +52,67 @@ def eodhd_params(extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         params.update(extra)
     return params
 
-@st.cache_data(ttl=6 * 3600, show_spinner=False)
+@st.cache_data(ttl=6*3600, show_spinner=False)
 def eodhd_get(path: str, params: Optional[Dict[str, Any]] = None) -> Any:
     url = f"{eodhd_base_url().rstrip('/')}{path}"
     r = requests.get(url, params=eodhd_params(params or {}), headers=eodhd_headers(), timeout=25)
     r.raise_for_status()
     return r.json()
 
-@st.cache_data(ttl=24 * 3600, show_spinner=False)
-def eodhd_search(query: str, limit: int = 25) -> List[Dict[str, Any]]:
+@st.cache_data(ttl=24*3600, show_spinner=False)
+def eodhd_search_isin(isin: str) -> List[Dict[str, Any]]:
     """
-    Recherche générique EODHD: /search/{query}
-    Normalise en liste.
+    Recherche /search/{ISIN}. Retourne toujours une liste.
+    On s’attend à recevoir un Exchange (ex: EUFUND) pour les OPCVM.
     """
     try:
-        data = eodhd_get(f"/search/{query}", params={"limit": limit})
+        data = eodhd_get(f"/search/{isin}", params={"limit": 5})
     except Exception:
         return []
     if isinstance(data, dict) and "data" in data:
         return data["data"] or []
     return data if isinstance(data, list) else []
 
-def _pick(d: Dict[str, Any], *keys: str) -> Optional[str]:
-    for k in keys:
-        if k in d and d[k]:
-            return str(d[k])
-        K = k[0].upper() + k[1:]
-        if K in d and d[K]:
-            return str(d[K])
-    return None
-
-def pick_best_item(items: List[Dict[str, Any]], isin: Optional[str]) -> Optional[Dict[str, Any]]:
-    """Retourne l'item le plus pertinent (match ISIN > bourse EU > premier)."""
-    if not items:
-        return None
-    if isin:
-        for it in items:
-            if str(_pick(it, "isin") or "").upper() == isin.upper():
-                return it
-    eu_ex = {"PAR", "XETRA", "MIL", "AMS", "LSE", "VIE", "MAD", "BRU", "LIS", "VTX"}
-    eu = [it for it in items if str(_pick(it, "exchange") or "").upper() in eu_ex]
-    return eu[0] if eu else items[0]
-
-def candidate_symbols_from_item(it: Dict[str, Any]) -> List[str]:
+@st.cache_data(ttl=24*3600, show_spinner=False)
+def eodhd_symbol_candidates_from_isin(isin: str) -> List[str]:
     """
-    Fabrique des candidats possibles pour /eod:
-      - code, symbol, ticker, Code, Symbol, Ticker
-      - + suffixe '.EXCHANGE' quand exchange est présent
+    Construit des candidats pour /eod à partir de l’ISIN :
+      1) ISIN.EXCHANGE (si Exchange trouvé par /search)
+      2) ISIN (fallback)
+    Exemple: FR0011253624 -> ["FR0011253624.EUFUND", "FR0011253624"]
     """
-    cands = []
-    code = _pick(it, "code", "symbol", "ticker", "Code", "Symbol", "Ticker")
-    exch = _pick(it, "exchange", "Exchange")
-    if code:
-        cands.append(code)
-        if exch and "." not in code:
-            cands.append(f"{code}.{exch}")
-    # parfois 'name' est directement utilisable
-    name = _pick(it, "name", "Name")
-    if name:
-        cands.append(name)
-        if exch and "." not in name:
-            cands.append(f"{name}.{exch}")
-    # dédupliquer en conservant l'ordre
+    items = eodhd_search_isin(isin)
+    cands: List[str] = []
+    if items:
+        it0 = items[0]
+        exch = None
+        for k in ("exchange", "Exchange"):
+            if k in it0 and it0[k]:
+                exch = str(it0[k]).upper()
+                break
+        if exch:
+            cands.append(f"{isin}.{exch}")
+    cands.append(isin)
+    # dédup
     seen, out = set(), []
     for s in cands:
-        if s and s not in seen:
-            out.append(s)
-            seen.add(s)
+        if s not in seen:
+            out.append(s); seen.add(s)
     return out
 
-def find_symbol_best_effort(name: str, isin: Optional[str]) -> Tuple[Optional[str], Dict[str, Any]]:
+@st.cache_data(ttl=6*3600, show_spinner=False)
+def eodhd_prices_daily_safe(candidates: List[str], days: int = 450) -> Tuple[pd.DataFrame, Optional[str], List[str], Optional[str]]:
     """
-    Stratégie robuste pour trouver un symbole exploitable par /eod:
-      A) /search/{ISIN} → item → candidates
-      B) /search/{name} → item → candidates
-      C) /fundamentals/{ISIN} → General.Code/Ticker/Symbol (au pire)
-    Renvoie (best_candidate_or_none, debug)
+    Essaie /eod sur la liste de symboles, sans planter.
+    Retourne (df, successful_symbol_or_none, tried_symbols, last_http_error_text_or_none)
     """
-    debug: Dict[str, Any] = {"search_isin": None, "search_name": None, "fundamentals_isin": None, "candidates": []}
+    tried: List[str] = []
+    last_err: Optional[str] = None
 
-    # A) par ISIN
-    if isin:
-        items = eodhd_search(isin, limit=25)
-        debug["search_isin"] = items
-        it = pick_best_item(items, isin)
-        if it:
-            debug["candidates"].extend(candidate_symbols_from_item(it))
-            if debug["candidates"]:
-                return debug["candidates"][0], debug
-
-    # B) par nom
-    items2 = eodhd_search(name, limit=25)
-    debug["search_name"] = items2
-    it2 = pick_best_item(items2, isin)
-    if it2:
-        debug["candidates"].extend(candidate_symbols_from_item(it2))
-        if debug["candidates"]:
-            return debug["candidates"][0], debug
-
-    # C) fallback fundamentals sur ISIN (parfois renvoie un code exploitable ailleurs que /eod)
-    if isin:
-        f = eodhd_get(f"/fundamentals/{isin}") if isin else {}
-        debug["fundamentals_isin"] = f
-        gen = f.get("General") or {}
-        tick = _pick(gen, "Code", "Ticker", "Symbol")
-        if tick:
-            debug["candidates"].append(tick)
-            return tick, debug
-
-    return None, debug
-
-@st.cache_data(ttl=6 * 3600, show_spinner=False)
-def eodhd_prices_daily_safe(symbol: str, days: int = 450) -> Tuple[pd.DataFrame, Optional[str]]:
-    """
-    Essaie plusieurs variantes pour /eod ; ne plante jamais.
-    Retourne (df, successful_symbol_or_none).
-    """
-    # On génère quelques variantes utiles
-    tries = [symbol]
-    if "." not in symbol:
-        # Quelques suffixes courants — on tente en best-effort
-        tries += [f"{symbol}.PAR", f"{symbol}.LSE", f"{symbol}.AMS", f"{symbol}.XETRA", f"{symbol}.MIL"]
-
-    for sym in tries:
+    for sym in candidates:
+        if not sym:
+            continue
+        tried.append(sym)
         try:
             js = eodhd_get(f"/eod/{sym}", params={"period": "d"})
             df = pd.DataFrame(js)
@@ -181,19 +120,20 @@ def eodhd_prices_daily_safe(symbol: str, days: int = 450) -> Tuple[pd.DataFrame,
                 continue
             dcol = "date" if "date" in df.columns else "Date"
             df[dcol] = pd.to_datetime(df[dcol])
-            df = df.set_index(dcol).sort_index()
-            df = df.tail(days)[["close"]].rename(columns={"close": "Close"})
+            df = df.set_index(dcol).sort_index().tail(days)[["close"]].rename(columns={"close": "Close"})
             if not df.empty:
-                return df, sym
-        except requests.HTTPError:
+                return df, sym, tried, None
+        except requests.HTTPError as he:
+            last_err = f"HTTPError for {sym}"
             continue
-        except Exception:
+        except Exception as e:
+            last_err = f"{type(e).__name__} for {sym}"
             continue
-    # échec total
-    return pd.DataFrame(), None
+
+    return pd.DataFrame(), None, tried, last_err
 
 def perf_series(prices: pd.DataFrame) -> Dict[str, Optional[float]]:
-    """Perf % (1M/3M/6M/YTD/1Y) sur la base du dernier close. Renvoie None si pas calculable."""
+    """Perf % (1M/3M/6M/YTD/1Y) à partir du dernier close. None si non calculable."""
     out = {"1M": None, "3M": None, "6M": None, "YTD": None, "1Y": None}
     if prices.empty:
         return out
@@ -223,48 +163,48 @@ def perf_series(prices: pd.DataFrame) -> Dict[str, Optional[float]]:
     return out
 
 
-# ===============================
-# 04) UNIVERS — ESPACE INVEST 5
-# ===============================
+# =========================================
+# 04) UNIVERS — ESPACE INVEST 5 (foncièrement identique)
+# =========================================
 UNIVERSE: List[Dict[str, Any]] = [
     {"name": "R-co Valor C EUR", "isin": "FR0011253624", "sri": 4, "sfdr": 8, "type": "UC Actions Monde",
-     "vl": False, "vlp": False, "transferts_programmes_eligibles": True, "notes": ""},
+     "notes": ""},
     {"name": "Vivalor International", "isin": "FR0014001LS1", "sri": 4, "sfdr": None, "type": "UC Actions Monde",
-     "vl": False, "vlp": False, "transferts_programmes_eligibles": False, "notes": "Non éligible aux transferts programmés"},
+     "notes": "Non éligible aux transferts programmés"},
     {"name": "COMGEST Monde C", "isin": "FR0000284689", "sri": 4, "sfdr": 8, "type": "UC Actions Monde",
-     "vl": False, "vlp": False, "transferts_programmes_eligibles": True, "notes": ""},
+     "notes": ""},
     {"name": "Echiquier World Equity Growth", "isin": "FR0010859769", "sri": 4, "sfdr": 8, "type": "UC Actions Monde",
-     "vl": False, "vlp": False, "transferts_programmes_eligibles": True, "notes": ""},
+     "notes": ""},
     {"name": "Franklin Mutual Global Discovery", "isin": "LU0211333298", "sri": 4, "sfdr": 8, "type": "UC Actions Monde",
-     "vl": False, "vlp": False, "transferts_programmes_eligibles": True, "notes": ""},
+     "notes": ""},
     {"name": "CARMIGNAC INVESTISSEMENT A EUR", "isin": "FR0010148981", "sri": 4, "sfdr": 8, "type": "UC Actions Monde",
-     "vl": False, "vlp": False, "transferts_programmes_eligibles": True, "notes": ""},
+     "notes": ""},
     {"name": "Natixis - Thematics Meta A EUR", "isin": "LU1951204046", "sri": 5, "sfdr": 8, "type": "UC Thématique Monde",
-     "vl": False, "vlp": False, "transferts_programmes_eligibles": True, "notes": ""},
+     "notes": ""},
     {"name": "Pictet Global Megatrend Selection P", "isin": "LU0386882277", "sri": 4, "sfdr": 8, "type": "UC Thématique Monde",
-     "vl": False, "vlp": False, "transferts_programmes_eligibles": True, "notes": ""},
+     "notes": ""},
     {"name": "Morgan Stanley Gl Brands A", "isin": "LU0119620416", "sri": 4, "sfdr": 8, "type": "UC Actions Monde",
-     "vl": False, "vlp": False, "transferts_programmes_eligibles": True, "notes": ""},
+     "notes": ""},
     {"name": "FIDELITY FUNDS - WORLD FUND", "isin": "LU0069449576", "sri": 4, "sfdr": 8, "type": "UC Actions Monde",
-     "vl": False, "vlp": False, "transferts_programmes_eligibles": True, "notes": ""},
+     "notes": ""},
     {"name": "CLARTAN VALEURS", "isin": "LU1100076550", "sri": 4, "sfdr": 8, "type": "UC Actions Monde",
-     "vl": False, "vlp": False, "transferts_programmes_eligibles": True, "notes": ""},
+     "notes": ""},
     {"name": "CARMIGNAC PATRIMOINE", "isin": "FR0010135103", "sri": 3, "sfdr": 8, "type": "UC Diversifié (patrimonial)",
-     "vl": False, "vlp": False, "transferts_programmes_eligibles": True, "notes": ""},
+     "notes": ""},
     {"name": "SYCOYIELD 2030 RC", "isin": "FR001400MCQ6", "sri": 2, "sfdr": 8, "type": "Obligataire daté 2030",
-     "vl": False, "vlp": False, "transferts_programmes_eligibles": True, "notes": ""},
+     "notes": ""},
     {"name": "R-Co Target 2029 HY", "isin": None, "sri": None, "sfdr": None, "type": "Obligataire daté 2029 HY",
-     "vl": False, "vlp": False, "transferts_programmes_eligibles": True, "notes": "ISIN à compléter"},
+     "notes": "ISIN à compléter"},
     {"name": "Fonds en euros AGGV", "isin": None, "sri": 1, "sfdr": None, "type": "Fonds en euros",
-     "vl": False, "vlp": False, "transferts_programmes_eligibles": True, "notes": ""},
+     "notes": ""},
 ]
 
 
-# ===============================
+# =========================================
 # 05) UI — HEADER & DEBUG
-# ===============================
-st.title("🦉 Analyse UC — Espace Invest 5 (via EODHD)")
-st.caption("Aucune allocation calculée. Analyse variations & infos techniques via EODHD.")
+# =========================================
+st.title("🦉 Analyse fonds — Espace Invest 5 (EODHD, ISIN-only)")
+st.caption("On mappe l’ISIN vers l’Exchange avec /search, puis /eod sur ISIN.EXCHANGE (fallback ISIN).")
 
 with st.sidebar:
     st.header("Clé API EODHD")
@@ -273,12 +213,12 @@ with st.sidebar:
         st.success("Clé EODHD détectée")
     except Exception:
         st.error("Clé EODHD manquante — ajoutez EODHD_API_KEY dans secrets/env.")
-    debug_mode = st.toggle("Mode debug EODHD", value=False, help="Affiche les retours et les symboles testés.")
+    debug_mode = st.toggle("Mode debug", value=False, help="Affiche les candidats et les symboles testés.")
 
 
-# ===============================
-# 06) SÉLECTION & PARAMS
-# ===============================
+# =========================================
+# 06) SÉLECTION & PARAMÈTRES
+# =========================================
 st.subheader("Sélection des fonds à analyser")
 df_univ = pd.DataFrame(UNIVERSE)
 
@@ -291,9 +231,9 @@ choices = st.multiselect(
 period_days = st.slider("Historique (jours ouvrés)", min_value=120, max_value=750, value=450, step=30)
 
 
-# ===============================
-# 07) ACTION — ANALYSE EODHD
-# ===============================
+# =========================================
+# 07) ACTION — ANALYSE EODHD (ISIN -> /eod)
+# =========================================
 if st.button("🔎 Analyser via EODHD") and choices:
     rows: List[Dict[str, Any]] = []
     debug_dump: Dict[str, Any] = {}
@@ -302,45 +242,33 @@ if st.button("🔎 Analyser via EODHD") and choices:
         row = df_univ.loc[df_univ["name"] == name].iloc[0].to_dict()
         isin = row.get("isin")
 
-        # 1) Trouver un symbole plausible
-        symbol, dbg = find_symbol_best_effort(name, isin)
-        debug_dump[name] = {"search_debug": dbg, "eod_tries": []}
+        candidates = eodhd_symbol_candidates_from_isin(isin) if isin else []
+        close_df, ok_symbol, tried, last_err = (pd.DataFrame(), None, [], None)
+        if candidates:
+            close_df, ok_symbol, tried, last_err = eodhd_prices_daily_safe(candidates, days=period_days)
 
-        # 2) Tenter les /eod sur plusieurs variantes en sécurité
-        close_df, ok_symbol = (pd.DataFrame(), None)
-        if symbol:
-            close_df, ok_symbol = eodhd_prices_daily_safe(symbol, days=period_days)
-            debug_dump[name]["eod_tries"] = [symbol] + (
-                [f"{symbol}.PAR", f"{symbol}.LSE", f"{symbol}.AMS", f"{symbol}.XETRA", f"{symbol}.MIL"]
-                if "." not in symbol else []
-            )
+        debug_dump[name] = {"candidates": candidates, "eod_tries": tried, "last_error": last_err}
 
         perfs = perf_series(close_df)
-
         row.update({
-            "ticker": ok_symbol or symbol,
+            "ticker": ok_symbol if ok_symbol else (candidates[0] if candidates else None),
             "Close": close_df["Close"].iloc[-1] if not close_df.empty else None,
-            "Perf 1M %": perfs["1M"],
-            "Perf 3M %": perfs["3M"],
-            "Perf 6M %": perfs["6M"],
-            "Perf YTD %": perfs["YTD"],
-            "Perf 1Y %": perfs["1Y"],
+            "Perf 1M %": perfs["1M"], "Perf 3M %": perfs["3M"], "Perf 6M %": perfs["6M"],
+            "Perf YTD %": perfs["YTD"], "Perf 1Y %": perfs["1Y"]
         })
         rows.append(row)
 
-    # ===============================
+    # =========================================
     # 08) TABLEAU — FORMATAGE SÛR
-    # ===============================
+    # =========================================
     st.subheader("Tableau récapitulatif")
 
-    view_cols = [
-        "name", "isin", "ticker", "type", "sri", "sfdr", "Close",
-        "Perf 1M %", "Perf 3M %", "Perf 6M %", "Perf YTD %", "Perf 1Y %", "notes"
-    ]
+    view_cols = ["name","isin","ticker","type","sri","sfdr","Close",
+                 "Perf 1M %","Perf 3M %","Perf 6M %","Perf YTD %","Perf 1Y %","notes"]
     view = pd.DataFrame(rows)[view_cols].copy()
 
     # Colonnes numériques -> coerce
-    num_cols = ["Close", "Perf 1M %", "Perf 3M %", "Perf 6M %", "Perf YTD %", "Perf 1Y %"]
+    num_cols = ["Close","Perf 1M %","Perf 3M %","Perf 6M %","Perf YTD %","Perf 1Y %"]
     for c in num_cols:
         view[c] = pd.to_numeric(view[c], errors="coerce")
 
@@ -363,8 +291,8 @@ if st.button("🔎 Analyser via EODHD") and choices:
 
     styled = (
         view.rename(columns={
-            "name": "Nom", "isin": "ISIN", "type": "Type", "sri": "SRI", "sfdr": "SFDR",
-            "Close": "Dernier cours", "notes": "Notes"
+            "name":"Nom","isin":"ISIN","type":"Type","sri":"SRI","sfdr":"SFDR",
+            "Close":"Dernier cours","notes":"Notes"
         })
         .style.format({
             "Dernier cours": fmt_money,
@@ -378,12 +306,12 @@ if st.button("🔎 Analyser via EODHD") and choices:
 
     st.dataframe(styled, use_container_width=True, hide_index=True)
 
-    # ===============================
-    # 09) DEBUG (optionnel)
-    # ===============================
+    # =========================================
+    # 09) DEBUG (facultatif)
+    # =========================================
     if debug_mode:
-        st.subheader("🔍 Debug EODHD")
-        st.caption("Résultats de recherche et symboles tentés pour /eod.")
+        st.subheader("🔍 Debug requêtes")
+        st.caption("Candidats dérivés de l’ISIN et symboles testés /eod.")
         for nm, dbg in debug_dump.items():
             with st.expander(f"Debug: {nm}", expanded=False):
                 st.write(dbg)
@@ -392,9 +320,9 @@ else:
     st.info("Sélectionne au moins un fonds puis clique sur « Analyser via EODHD ».")
 
 
-# ===============================
+# =========================================
 # 10) FOOTER
-# ===============================
+# =========================================
 st.divider()
-st.caption("⚠️ On teste plusieurs variantes de symbole (CODE, SYMBOL, CODE.EXCHANGE...). "
-           "Si un fond n'a pas de série /eod sur EODHD, la ligne reste vide sans casser l'app.")
+st.caption("Méthode ISIN → Exchange (via /search) → /eod ISIN.EXCHANGE (fallback ISIN). "
+           "Si EODHD expose la VL du fonds, elle remontera ici.")

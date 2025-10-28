@@ -132,39 +132,30 @@ def eodhd_prices_daily_safe(candidates: List[str], days: int = 450) -> Tuple[pd.
 
     return pd.DataFrame(), None, tried, last_err
 
-def perf_series(prices: pd.DataFrame) -> Dict[str, Optional[float]]:
-    """
-    Perf % (1M / YTD / 1Y / 3Y / 5Y / 10Y) à partir du dernier close.
-    None si non calculable (pas assez d'historique).
-    """
-    out = {"1M": None, "YTD": None, "1Y": None, "3Y": None, "5Y": None, "10Y": None}
-    if prices.empty:
-        return out
-    last = prices["Close"].iloc[-1]
-    if last is None or last <= 0:
-        return out
+view_cols = [
+    "name","isin","ticker","type","sri","sfdr","Close",
+    "Perf 1M %","Perf YTD %","Perf 1Y %","Perf 3Y %","Perf 5Y %","Perf 10Y %","notes"
+]
 
-    def pct(dt_from: pd.Timestamp) -> Optional[float]:
-        s = prices.loc[:dt_from]
-        if s.empty:
-            return None
-        base = s["Close"].iloc[-1]
-        if base is None or base <= 0:
-            return None
-        return (last / base - 1.0) * 100.0
+num_cols = ["Close","Perf 1M %","Perf YTD %","Perf 1Y %","Perf 3Y %","Perf 5Y %","Perf 10Y %"]
+# ... (le reste du code identique)
 
-    idx = prices.index
-    end = idx[-1]
-    try:
-        out["1M"]  = pct(end - pd.DateOffset(months=1))
-        out["YTD"] = pct(pd.Timestamp(year=end.year, month=1, day=1, tz=end.tz))
-        out["1Y"]  = pct(end - pd.DateOffset(years=1))
-        out["3Y"]  = pct(end - pd.DateOffset(years=3))
-        out["5Y"]  = pct(end - pd.DateOffset(years=5))
-        out["10Y"]  = pct(end - pd.DateOffset(years=10))
-    except Exception:
-        pass
-    return out
+styled = (
+    view.rename(columns={
+        "name":"Nom","isin":"ISIN","type":"Type","sri":"SRI","sfdr":"SFFR",
+        "Close":"Dernier cours","notes":"Notes"
+    })
+    .style.format({
+        "Dernier cours": to_eur,
+        "Perf 1M %": pct_eu,
+        "Perf YTD %": pct_eu,
+        "Perf 1Y %": pct_eu,
+        "Perf 3Y %": pct_eu,
+        "Perf 5Y %": pct_eu,
+        "Perf 10Y %": pct_eu,
+    }, na_rep="")
+)
+
 
 
 # =========================================

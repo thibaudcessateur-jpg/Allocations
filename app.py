@@ -420,22 +420,89 @@ st.divider()
 st.caption("Méthode ISIN → Exchange (via /search) → /eod daily + fallback mensuel. "
            "Perfs: 1M, YTD, 1Y, 3Y, 5Y, 8Y, 10Y. Format monétaire européen.")
 # =========================================
-# 11) FONDAMENTAUX (composition, top positions, allocations)
+# 11) FONDAMENTAUX (composition, top positions, allocations) — version robuste
 # =========================================
 import plotly.express as px
+from collections import deque
 
 @st.cache_data(ttl=24*3600, show_spinner=False)
-def eodhd_fundamentals(isin: str) -> Dict[str, Any]:
-    """Récupère les fondamentaux (composition, top positions, allocations) via /fundamentals/{ISIN}."""
+def eodhd_fundamentals_any(isin: str) -> Dict[str, Any]:
+    """
+    Récupère les fondamentaux en testant les candidats symbole (ISIN.EXCHANGE puis ISIN).
+    Retourne le JSON brut (ou {}).
+    """
     candidates = eodhd_symbol_candidates_from_isin(isin)
+    tried = []
     for sym in candidates:
+        tried.append(sym)
         try:
             js = eodhd_get(f"/fundamentals/{sym}")
-            if js:
+            if isinstance(js, dict) and js:
+                js["_debug_tried_symbols"] = tried
                 return js
         except Exception:
             continue
-    return {}
+    return {"_debug_tried_symbols": tried}
+
+# ---------- utilitaires de recherche tolérants ----------
+def _first_list_for_keys(obj: Any, keys: List[str]) -> Optional[List[Dict[str, Any]]]:
+    """
+    Cherche en profondeur et renvoie la 1ère LISTE trouvée dont la clé correspond à l'un des 'keys'.
+    """
+    if not isinstance(obj, (dict, list)):
+        return None
+    q = deque([obj])
+    while q:
+        cur = q.popleft()
+        if isinstance(cur, dict):
+            for k, v in cur.items():
+                kl = str(k).lower()
+                if any(kl == x.lower() for x in keys) and isinstance(v, list) and len(v) > 0:
+                    return v
+                if isinstance(v, (dict, list)):
+                    q.append(v)
+        elif isinstance(cur, list):
+            for it in cur:
+                if isinstance(it, (dict, list)):
+                    q.append(it)
+    return None
+
+def _norm_regions(reg_list: List[Dict[str, Any]]) -> pd.DataFrame:
+    """
+    Normalise différentes variantes pour les régions/pays.
+    Accepte éléments avec champs ('Name'/'Region'/'Country', 'Weight'/'Percentage').
+    """
+    rows = []
+    for it in reg_list:
+        name = it.get("Name") or it.get("Region") or it.get("Country") or it.get("Code")
+        w = it.get("Weight")
+        if w is None:
+            w = it.get("Percentage")
+        if name is not None and w is not None:
+            rows.append({"Name": str(name), "Weight": float(w)})
+    return pd.DataFrame(rows)
+
+def _norm_asset_alloc(lst: List[Dict[str, Any]]) -> pd.DataFrame:
+    rows = []
+    for it in lst:
+        typ = it.get("Type") or it.get("Name") or it.get("AssetType") or it.get("Code")
+        v = it.get("Percentage") or it.get("Weight")
+        if typ is not None and v is not None:
+            rows.append({"Type": str(typ), "Percentage": float(v)})
+    return pd.DataFrame(rows)
+
+def _norm_top_holdings(lst: List[Dict[str, Any]]) -> pd.DataFrame:
+    rows = []
+    for it in lst:
+        nm = it.get("Name") or it.get("Company") or it.get("Holding") or it.get("Code")
+        w = it.get("Weight") or it.get("Percentage")
+        if nm is not None and w is not None:
+            rows.append({"Titre": str(nm), "Poids (%)": float(w)})
+    return pd.DataFrame(rows)
+
+def _keys_snapshot(js: Dict[str, Any]) -> List[str]:
+    """Liste des clés de 1er niveau pour debug lisible."""
+    return sorted(list(js.keys()))
 
 st.header("📊 Composition détaillée des fonds")
 
@@ -447,41 +514,58 @@ if choices:
             st.warning("ISIN manquant pour ce fonds.")
             continue
 
-        data = eodhd_fundamentals(isin)
-        hold = data.get("Holdings") or {}
-        if not hold:
-            st.info("Aucune donnée de composition disponible sur EODHD.")
-            continue
+        js = eodhd_fundamentals_any(isin)  # JSON brut
+        # Recherche tolérante des différentes rubriques :
+        top_raw = _first_list_for_keys(js, ["TopHoldings", "Top_Holdings"])
+        alloc_raw = _first_list_for_keys(js, ["AssetAllocation", "Asset_Allocation", "AssetMix"])
+        sectors_raw = _first_list_for_keys(js, ["Sectors", "SectorWeights", "Sector_Weights"])
+        regions_raw = _first_list_for_keys(js, ["Regions", "RegionWeights", "Region_Weights", "GeographicalAllocation", "CountryWeights", "Country_Weights"])
 
-        cols = st.columns(3)
+        # Normalisations
+        df_top = _norm_top_holdings(top_raw) if top_raw else pd.DataFrame()
+        df_alloc = _norm_asset_alloc(alloc_raw) if alloc_raw else pd.DataFrame()
+        df_regions = _norm_regions(regions_raw) if regions_raw else pd.DataFrame()
+
+        col1, col2, col3 = st.columns(3)
 
         # --- Col 1 : répartition géographique ---
-        regions = hold.get("Regions") or []
-        if regions:
-            df_r = pd.DataFrame(regions)
-            fig_r = px.pie(df_r, names="Name", values="Weight",
-                           title="Répartition géographique (%)",
-                           color_discrete_sequence=px.colors.qualitative.Safe)
-            cols[0].plotly_chart(fig_r, use_container_width=True)
+        if not df_regions.empty:
+            fig_r = px.pie(
+                df_regions, names="Name", values="Weight",
+                title="Répartition géographique (%)"
+            )
+            col1.plotly_chart(fig_r, use_container_width=True)
         else:
-            cols[0].info("Répartition géographique non disponible.")
+            col1.info("Répartition géographique non disponible sur EODHD pour ce fonds.")
 
         # --- Col 2 : classes d’actifs ---
-        alloc = hold.get("AssetAllocation") or []
-        if alloc:
-            df_a = pd.DataFrame(alloc)
-            fig_a = px.pie(df_a, names="Type", values="Percentage",
-                           title="Répartition par classe d’actifs (%)",
-                           color_discrete_sequence=px.colors.qualitative.Pastel)
-            cols[1].plotly_chart(fig_a, use_container_width=True)
+        if not df_alloc.empty:
+            fig_a = px.pie(
+                df_alloc, names="Type", values="Percentage",
+                title="Répartition par classe d’actifs (%)"
+            )
+            col2.plotly_chart(fig_a, use_container_width=True)
         else:
-            cols[1].info("Répartition par classe d’actif non disponible.")
+            col2.info("Répartition par classe d’actifs non disponible sur EODHD pour ce fonds.")
 
         # --- Col 3 : top 10 positions ---
-        top = hold.get("TopHoldings") or []
-        if top:
-            df_t = pd.DataFrame(top)
-            df_t = df_t[["Name","Weight"]].rename(columns={"Name":"Titre","Weight":"Poids (%)"})
-            cols[2].dataframe(df_t.head(10), use_container_width=True, hide_index=True)
+        if not df_top.empty:
+            col3.dataframe(df_top.head(10), use_container_width=True, hide_index=True)
         else:
-            cols[2].info("Top 10 positions non disponibles.")
+            col3.info("Top positions non disponibles sur EODHD pour ce fonds.")
+
+        # --- Debug (affiche les clés trouvées) ---
+        if debug_mode:
+            with st.expander("🔧 Debug fondamentaux", expanded=False):
+                st.write({
+                    "tried_symbols": js.get("_debug_tried_symbols"),
+                    "top_level_keys": _keys_snapshot(js),
+                    "found_sections": {
+                        "TopHoldings": bool(top_raw),
+                        "AssetAllocation": bool(alloc_raw),
+                        "Sectors": bool(sectors_raw),
+                        "Regions/CountryWeights": bool(regions_raw),
+                    }
+                })
+else:
+    st.info("Sélectionne au moins un fonds pour afficher sa composition.")

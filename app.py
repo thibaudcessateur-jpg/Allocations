@@ -2,7 +2,7 @@
 # 01) IMPORTS & SETUP
 # ===============================
 import os
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Tuple
 
 import requests
 import numpy as np
@@ -37,7 +37,7 @@ def Secret_Token(name: str, default: Optional[str] = None) -> str:
 
 
 # ===============================
-# 03) EODHD — CLIENT LÉGER
+# 03) EODHD — CLIENT LÉGER (+ mapping renforcé)
 # ===============================
 def eodhd_base_url() -> str:
     return os.getenv("EODHD_BASE_URL") or st.secrets.get("EODHD_BASE_URL", "https://eodhd.com/api")
@@ -59,28 +59,97 @@ def eodhd_get(path: str, params: Optional[Dict[str, Any]] = None) -> Any:
     return r.json()
 
 @st.cache_data(ttl=24 * 3600, show_spinner=False)
-def eodhd_search_isin(isin: str) -> List[Dict[str, Any]]:
-    """Recherche EODHD pour retrouver le ticker à partir d'un ISIN."""
+def eodhd_search(query: str, limit: int = 20) -> List[Dict[str, Any]]:
+    """
+    Recherche générique EODHD: /search/{query}
+    Retourne toujours une liste de dicts (normalisée).
+    """
     try:
-        data = eodhd_get(f"/search/{isin}", params={"limit": 20})
+        data = eodhd_get(f"/search/{query}", params={"limit": limit})
     except Exception:
         return []
     if isinstance(data, dict) and "data" in data:
-        return data["data"]
+        return data["data"] or []
     return data if isinstance(data, list) else []
 
-def pick_best_ticker_from_search(items: List[Dict[str, Any]], isin: str) -> Optional[str]:
-    """Heuristique de sélection du 'symbol' à partir des résultats de recherche."""
+def _field(d: Dict[str, Any], *names: str) -> Optional[str]:
+    """Renvoie la 1ère clé présente parmi names (insensible à la casse de la 1ère lettre)."""
+    for n in names:
+        if n in d and d[n]:
+            return str(d[n])
+        N = n[0].upper() + n[1:]
+        if N in d and d[N]:
+            return str(d[N])
+    return None
+
+def pick_best_ticker_from_search(items: List[Dict[str, Any]], isin: Optional[str] = None) -> Optional[str]:
+    """
+    Heuristique de sélection:
+      1) match 'isin' strict si dispo
+      2) sinon privilégie un exchange EU
+      3) sinon premier item
+    Ticker = priorité 'code' puis 'symbol' puis 'ticker'/'Ticker'
+    """
     if not items:
         return None
-    for it in items:
-        if str(it.get("isin", "")).upper() == isin.upper():
-            return it.get("code") or it.get("symbol")
-    eu_ex = ("PAR", "XETRA", "MIL", "AMS", "LSE", "VIE", "MAD", "BRU", "LIS", "VTX")
-    eu = [it for it in items if str(it.get("exchange", "")).upper() in eu_ex]
+    if isin:
+        for it in items:
+            if str(_field(it, "isin") or "").upper() == isin.upper():
+                return _field(it, "code", "symbol", "ticker", "Ticker")
+    eu_ex = {"PAR", "XETRA", "MIL", "AMS", "LSE", "VIE", "MAD", "BRU", "LIS", "VTX"}
+    eu = [it for it in items if str(_field(it, "exchange") or "").upper() in eu_ex]
     if eu:
-        return eu[0].get("code") or eu[0].get("symbol")
-    return items[0].get("code") or items[0].get("symbol")
+        return _field(eu[0], "code", "symbol", "ticker", "Ticker")
+    return _field(items[0], "code", "symbol", "ticker", "Ticker")
+
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def eodhd_fundamentals(ticker_or_isin: str) -> Dict[str, Any]:
+    """
+    Fundamentals généraux. EODHD accepte parfois un ISIN directement ici.
+    Utile en fallback pour récupérer un 'Code' ou 'Ticker'.
+    """
+    try:
+        js = eodhd_get(f"/fundamentals/{ticker_or_isin}")
+        return js if isinstance(js, dict) else {}
+    except Exception:
+        return {}
+
+def find_ticker_best_effort(name: str, isin: Optional[str]) -> Tuple[Optional[str], Dict[str, Any]]:
+    """
+    Stratégie robuste pour retrouver le ticker:
+      A) search(ISIN) → pick_best
+      B) fundamentals(ISIN) → 'General'.Code / 'General'.Ticker / Symbol
+      C) search(name) → pick_best (en filtrant par isin si présent)
+    Renvoie (ticker, debug_dict)
+    """
+    debug = {"search_isin": None, "fundamentals_isin": None, "search_name": None}
+
+    # A) via /search/ISIN
+    if isin:
+        items = eodhd_search(isin, limit=25)
+        debug["search_isin"] = items
+        tick = pick_best_ticker_from_search(items, isin=isin)
+        if tick:
+            return tick, debug
+
+    # B) via /fundamentals/ISIN (parfois renvoie General.Code utilisable sur /eod)
+    if isin:
+        f = eodhd_fundamentals(isin)
+        debug["fundamentals_isin"] = f
+        gen = f.get("General") or {}
+        tick = _field(gen, "Code", "Ticker", "Symbol")
+        if tick:
+            return tick, debug
+
+    # C) via /search/name
+    items2 = eodhd_search(name, limit=25)
+    debug["search_name"] = items2
+    # si des items portent le même ISIN dans leurs champs → on prend celui-là
+    if isin:
+        for it in items2:
+            if str(_field(it, "isin") or "").upper() == isin.upper():
+                return _field(it, "code", "symbol", "ticker", "Ticker"), debug
+    return pick_best_ticker_from_search(items2, isin=None), debug
 
 @st.cache_data(ttl=6 * 3600, show_spinner=False)
 def eodhd_prices_daily(ticker: str, days: int = 450) -> pd.DataFrame:
@@ -94,15 +163,6 @@ def eodhd_prices_daily(ticker: str, days: int = 450) -> pd.DataFrame:
     df = df.set_index(dcol).sort_index()
     df = df.tail(days)[["close"]].rename(columns={"close": "Close"})
     return df
-
-@st.cache_data(ttl=6 * 3600, show_spinner=False)
-def eodhd_fundamentals(ticker: str) -> Dict[str, Any]:
-    """Fundamentals généraux (meilleure-effort — varie selon le type d'actif)."""
-    try:
-        js = eodhd_get(f"/fundamentals/{ticker}")
-        return js if isinstance(js, dict) else {}
-    except Exception:
-        return {}
 
 def perf_series(prices: pd.DataFrame) -> Dict[str, Optional[float]]:
     """Perf % (1M/3M/6M/YTD/1Y) sur la base du dernier close. Renvoie None si pas calculable."""
@@ -125,12 +185,11 @@ def perf_series(prices: pd.DataFrame) -> Dict[str, Optional[float]]:
     idx = prices.index
     end = idx[-1]
     try:
-        out["1M"] = pct(end - pd.DateOffset(months=1))
-        out["3M"] = pct(end - pd.DateOffset(months=3))
-        out["6M"] = pct(end - pd.DateOffset(months=6))
-        ytd_start = pd.Timestamp(year=end.year, month=1, day=1, tz=end.tz)
-        out["YTD"] = pct(ytd_start)
-        out["1Y"] = pct(end - pd.DateOffset(years=1))
+        out["1M"]  = pct(end - pd.DateOffset(months=1))
+        out["3M"]  = pct(end - pd.DateOffset(months=3))
+        out["6M"]  = pct(end - pd.DateOffset(months=6))
+        out["YTD"] = pct(pd.Timestamp(year=end.year, month=1, day=1, tz=end.tz))
+        out["1Y"]  = pct(end - pd.DateOffset(years=1))
     except Exception:
         pass
     return out
@@ -174,10 +233,10 @@ UNIVERSE: List[Dict[str, Any]] = [
 
 
 # ===============================
-# 05) TITRES & SIDEBAR (ÉTAT CLÉ)
+# 05) TITRES & SIDEBAR
 # ===============================
 st.title("🦉 Analyse UC — Espace Invest 5 (via EODHD)")
-st.caption("Aucune allocation calculée. Analyse variations et infos techniques via EODHD.")
+st.caption("Aucune allocation calculée. Analyse variations & infos techniques via EODHD.")
 
 with st.sidebar:
     st.header("Clé API EODHD")
@@ -186,10 +245,11 @@ with st.sidebar:
         st.success("Clé EODHD détectée")
     except Exception:
         st.error("Clé EODHD manquante — ajoutez EODHD_API_KEY dans secrets/env.")
+    debug_mode = st.toggle("Mode debug EODHD", value=False, help="Affiche les retours bruts des endpoints.")
 
 
 # ===============================
-# 06) SÉLECTION & PARAMÈTRES
+# 06) SÉLECTION & PARAMS
 # ===============================
 st.subheader("Sélection des fonds à analyser")
 df_univ = pd.DataFrame(UNIVERSE)
@@ -208,20 +268,19 @@ period_days = st.slider("Historique (jours ouvrés)", min_value=120, max_value=7
 # ===============================
 if st.button("🔎 Analyser via EODHD") and choices:
     rows: List[Dict[str, Any]] = []
-    charts: Dict[str, pd.DataFrame] = {}
+    charts: Dict[str, pd.DataFrame] = []
+    debug_dump: Dict[str, Any] = {}
 
     for name in choices:
         row = df_univ.loc[df_univ["name"] == name].iloc[0].to_dict()
         isin = row.get("isin")
-        ticker = None
 
-        if isin:
-            items = eodhd_search_isin(isin)
-            ticker = pick_best_ticker_from_search(items, isin)
+        ticker, dbg = find_ticker_best_effort(name, isin)
+        debug_dump[name] = dbg
 
         prices = eodhd_prices_daily(ticker, days=period_days) if ticker else pd.DataFrame()
         perfs = perf_series(prices)
-        fund = eodhd_fundamentals(ticker) if ticker else {}
+        fund  = eodhd_fundamentals(ticker) if ticker else {}
 
         row.update({
             "ticker": ticker,
@@ -238,8 +297,6 @@ if st.button("🔎 Analyser via EODHD") and choices:
             }
         })
         rows.append(row)
-        charts[name] = prices
-
 
     # ===============================
     # 08) TABLEAU — FORMATAGE SÛR
@@ -291,17 +348,15 @@ if st.button("🔎 Analyser via EODHD") and choices:
 
     st.dataframe(styled, use_container_width=True, hide_index=True)
 
-
     # ===============================
-    # 09) MINI-CHARTS PRIX
+    # 09) DEBUG (optionnel)
     # ===============================
-    st.subheader("Mini-charts (clôtures quotidiennes)")
-    for name in choices:
-        prices = charts.get(name)
-        if prices is None or prices.empty:
-            st.info(f"Pas de données prix pour: {name}")
-            continue
-        st.line_chart(prices, y="Close", height=220, use_container_width=True)
+    if debug_mode:
+        st.subheader("🔍 Debug EODHD")
+        st.caption("Bruts des endpoints utilisés pour le mapping. Utile si un ticker ne remonte pas.")
+        for nm, dbg in debug_dump.items():
+            with st.expander(f"Debug: {nm}", expanded=False):
+                st.write(dbg)
 
 else:
     st.info("Sélectionne au moins un fonds puis clique sur « Analyser via EODHD ».")
@@ -311,4 +366,5 @@ else:
 # 10) FOOTER
 # ===============================
 st.divider()
-st.caption("⚠️ Best-effort mapping ISIN → ticker via /search. Ajuster si besoin. Aucune recommandation, affichage informatif.")
+st.caption("⚠️ Mapping renforcé ISIN/Name → ticker via /search + /fundamentals. "
+           "Si un fond remonte encore à vide, ouvre le debug pour voir les retours EODHD.")

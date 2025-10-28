@@ -419,3 +419,69 @@ else:
 st.divider()
 st.caption("Méthode ISIN → Exchange (via /search) → /eod daily + fallback mensuel. "
            "Perfs: 1M, YTD, 1Y, 3Y, 5Y, 8Y, 10Y. Format monétaire européen.")
+# =========================================
+# 11) FONDAMENTAUX (composition, top positions, allocations)
+# =========================================
+import plotly.express as px
+
+@st.cache_data(ttl=24*3600, show_spinner=False)
+def eodhd_fundamentals(isin: str) -> Dict[str, Any]:
+    """Récupère les fondamentaux (composition, top positions, allocations) via /fundamentals/{ISIN}."""
+    candidates = eodhd_symbol_candidates_from_isin(isin)
+    for sym in candidates:
+        try:
+            js = eodhd_get(f"/fundamentals/{sym}")
+            if js:
+                return js
+        except Exception:
+            continue
+    return {}
+
+st.header("📊 Composition détaillée des fonds")
+
+if choices:
+    for name in choices:
+        st.subheader(f"🔎 {name}")
+        isin = df_univ.loc[df_univ["name"] == name, "isin"].iloc[0]
+        if not isin:
+            st.warning("ISIN manquant pour ce fonds.")
+            continue
+
+        data = eodhd_fundamentals(isin)
+        hold = data.get("Holdings") or {}
+        if not hold:
+            st.info("Aucune donnée de composition disponible sur EODHD.")
+            continue
+
+        cols = st.columns(3)
+
+        # --- Col 1 : répartition géographique ---
+        regions = hold.get("Regions") or []
+        if regions:
+            df_r = pd.DataFrame(regions)
+            fig_r = px.pie(df_r, names="Name", values="Weight",
+                           title="Répartition géographique (%)",
+                           color_discrete_sequence=px.colors.qualitative.Safe)
+            cols[0].plotly_chart(fig_r, use_container_width=True)
+        else:
+            cols[0].info("Répartition géographique non disponible.")
+
+        # --- Col 2 : classes d’actifs ---
+        alloc = hold.get("AssetAllocation") or []
+        if alloc:
+            df_a = pd.DataFrame(alloc)
+            fig_a = px.pie(df_a, names="Type", values="Percentage",
+                           title="Répartition par classe d’actifs (%)",
+                           color_discrete_sequence=px.colors.qualitative.Pastel)
+            cols[1].plotly_chart(fig_a, use_container_width=True)
+        else:
+            cols[1].info("Répartition par classe d’actif non disponible.")
+
+        # --- Col 3 : top 10 positions ---
+        top = hold.get("TopHoldings") or []
+        if top:
+            df_t = pd.DataFrame(top)
+            df_t = df_t[["Name","Weight"]].rename(columns={"Name":"Titre","Weight":"Poids (%)"})
+            cols[2].dataframe(df_t.head(10), use_container_width=True, hide_index=True)
+        else:
+            cols[2].info("Top 10 positions non disponibles.")

@@ -123,7 +123,7 @@ def eodhd_prices_daily_safe(candidates: List[str], days: int = 450) -> Tuple[pd.
             df = df.set_index(dcol).sort_index().tail(days)[["close"]].rename(columns={"close": "Close"})
             if not df.empty:
                 return df, sym, tried, None
-        except requests.HTTPError as he:
+        except requests.HTTPError:
             last_err = f"HTTPError for {sym}"
             continue
         except Exception as e:
@@ -133,8 +133,11 @@ def eodhd_prices_daily_safe(candidates: List[str], days: int = 450) -> Tuple[pd.
     return pd.DataFrame(), None, tried, last_err
 
 def perf_series(prices: pd.DataFrame) -> Dict[str, Optional[float]]:
-    """Perf % (1M/3M/6M/YTD/1Y) à partir du dernier close. None si non calculable."""
-    out = {"1M": None, "3M": None, "6M": None, "YTD": None, "1Y": None}
+    """
+    Perf % (1M / YTD / 1Y / 3Y / 5Y / 8Y) à partir du dernier close.
+    None si non calculable (pas assez d'historique).
+    """
+    out = {"1M": None, "YTD": None, "1Y": None, "3Y": None, "5Y": None, "8Y": None}
     if prices.empty:
         return out
     last = prices["Close"].iloc[-1]
@@ -154,17 +157,18 @@ def perf_series(prices: pd.DataFrame) -> Dict[str, Optional[float]]:
     end = idx[-1]
     try:
         out["1M"]  = pct(end - pd.DateOffset(months=1))
-        out["3M"]  = pct(end - pd.DateOffset(months=3))
-        out["6M"]  = pct(end - pd.DateOffset(months=6))
         out["YTD"] = pct(pd.Timestamp(year=end.year, month=1, day=1, tz=end.tz))
         out["1Y"]  = pct(end - pd.DateOffset(years=1))
+        out["3Y"]  = pct(end - pd.DateOffset(years=3))
+        out["5Y"]  = pct(end - pd.DateOffset(years=5))
+        out["8Y"]  = pct(end - pd.DateOffset(years=8))
     except Exception:
         pass
     return out
 
 
 # =========================================
-# 04) UNIVERS — ESPACE INVEST 5 (foncièrement identique)
+# 04) UNIVERS — ESPACE INVEST 5
 # =========================================
 UNIVERSE: List[Dict[str, Any]] = [
     {"name": "R-co Valor C EUR", "isin": "FR0011253624", "sri": 4, "sfdr": 8, "type": "UC Actions Monde",
@@ -204,7 +208,7 @@ UNIVERSE: List[Dict[str, Any]] = [
 # 05) UI — HEADER & DEBUG
 # =========================================
 st.title("🦉 Analyse fonds — Espace Invest 5 (EODHD, ISIN-only)")
-st.caption("On mappe l’ISIN vers l’Exchange avec /search, puis /eod sur ISIN.EXCHANGE (fallback ISIN).")
+st.caption("ISIN → Exchange (via /search) → /eod: ISIN.EXCHANGE, fallback ISIN. Perfs long terme activées.")
 
 with st.sidebar:
     st.header("Clé API EODHD")
@@ -228,7 +232,7 @@ choices = st.multiselect(
     default=[df_univ["name"].iloc[0]] if not df_univ.empty else [],
 )
 
-period_days = st.slider("Historique (jours ouvrés)", min_value=120, max_value=750, value=450, step=30)
+period_days = st.slider("Historique (jours ouvrés)", min_value=120, max_value=2500, value=1500, step=60)
 
 
 # =========================================
@@ -253,39 +257,57 @@ if st.button("🔎 Analyser via EODHD") and choices:
         row.update({
             "ticker": ok_symbol if ok_symbol else (candidates[0] if candidates else None),
             "Close": close_df["Close"].iloc[-1] if not close_df.empty else None,
-            "Perf 1M %": perfs["1M"], "Perf 3M %": perfs["3M"], "Perf 6M %": perfs["6M"],
-            "Perf YTD %": perfs["YTD"], "Perf 1Y %": perfs["1Y"]
+            "Perf 1M %": perfs["1M"],
+            "Perf YTD %": perfs["YTD"],
+            "Perf 1Y %": perfs["1Y"],
+            "Perf 3Y %": perfs["3Y"],
+            "Perf 5Y %": perfs["5Y"],
+            "Perf 8Y %": perfs["8Y"],
         })
         rows.append(row)
 
     # =========================================
-    # 08) TABLEAU — FORMATAGE SÛR
+    # 08) TABLEAU — FORMATAGE SÛR (EUROPE)
     # =========================================
     st.subheader("Tableau récapitulatif")
 
     view_cols = ["name","isin","ticker","type","sri","sfdr","Close",
-                 "Perf 1M %","Perf 3M %","Perf 6M %","Perf YTD %","Perf 1Y %","notes"]
+                 "Perf 1M %","Perf YTD %","Perf 1Y %","Perf 3Y %","Perf 5Y %","Perf 8Y %","notes"]
     view = pd.DataFrame(rows)[view_cols].copy()
 
     # Colonnes numériques -> coerce
-    num_cols = ["Close","Perf 1M %","Perf 3M %","Perf 6M %","Perf YTD %","Perf 1Y %"]
+    num_cols = ["Close","Perf 1M %","Perf YTD %","Perf 1Y %","Perf 3Y %","Perf 5Y %","Perf 8Y %"]
     for c in num_cols:
         view[c] = pd.to_numeric(view[c], errors="coerce")
 
-    # Formateurs robustes
-    def fmt_money(x):
+    # ---------- formatteurs EU ----------
+    def to_eur(x: float) -> str:
+        """
+        4000.64 -> '4 000,64 €' (format européen)
+        """
         try:
             if x is None or (isinstance(x, float) and np.isnan(x)):
                 return ""
-            return f"{float(x):,.2f}"
+            s = f"{float(x):,.2f}"        # '4,000.64'
+            s = s.replace(",", "X")       # '4X000.64'
+            s = s.replace(".", ",")       # '4X000,64'
+            s = s.replace("X", " ")       # '4 000,64'
+            return f"{s} €"
         except Exception:
             return ""
 
-    def fmt_pct(x):
+    def pct_eu(x: float) -> str:
+        """
+        +12.34 -> '+12,34%' (format européen, signe conservé)
+        """
         try:
             if x is None or (isinstance(x, float) and np.isnan(x)):
                 return ""
-            return f"{float(x):+.2f}%"
+            s = f"{float(x):+.2f}"        # '+12.34'
+            s = s.replace(",", "X")
+            s = s.replace(".", ",")       # '+12,34'
+            s = s.replace("X", " ")
+            return f"{s}%"
         except Exception:
             return ""
 
@@ -295,12 +317,13 @@ if st.button("🔎 Analyser via EODHD") and choices:
             "Close":"Dernier cours","notes":"Notes"
         })
         .style.format({
-            "Dernier cours": fmt_money,
-            "Perf 1M %": fmt_pct,
-            "Perf 3M %": fmt_pct,
-            "Perf 6M %": fmt_pct,
-            "Perf YTD %": fmt_pct,
-            "Perf 1Y %": fmt_pct,
+            "Dernier cours": to_eur,
+            "Perf 1M %": pct_eu,
+            "Perf YTD %": pct_eu,
+            "Perf 1Y %": pct_eu,
+            "Perf 3Y %": pct_eu,
+            "Perf 5Y %": pct_eu,
+            "Perf 8Y %": pct_eu,
         }, na_rep="")
     )
 
@@ -325,4 +348,4 @@ else:
 # =========================================
 st.divider()
 st.caption("Méthode ISIN → Exchange (via /search) → /eod ISIN.EXCHANGE (fallback ISIN). "
-           "Si EODHD expose la VL du fonds, elle remontera ici.")
+           "Perfs: 1M, YTD, 1Y, 3Y, 5Y, 8Y. Format monétaire européen.")

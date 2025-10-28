@@ -419,45 +419,60 @@ else:
 st.divider()
 st.caption("Méthode ISIN → Exchange (via /search) → /eod daily + fallback mensuel. "
            "Perfs: 1M, YTD, 1Y, 3Y, 5Y, 8Y, 10Y. Format monétaire européen.")
+
+
 # =========================================
-# 11) FONDAMENTAUX (composition, top positions, allocations) — version robuste
+# 11) FONDAMENTAUX — extraction robuste (multi-endpoints + filters)
 # =========================================
 import plotly.express as px
 from collections import deque
 
 @st.cache_data(ttl=24*3600, show_spinner=False)
-def eodhd_fundamentals_any(isin: str) -> Dict[str, Any]:
+def _fundamentals_try_all(symbols: List[str]) -> Dict[str, Any]:
     """
-    Récupère les fondamentaux en testant les candidats symbole (ISIN.EXCHANGE puis ISIN).
-    Retourne le JSON brut (ou {}).
+    Tente plusieurs appels Fundamentals pour maximiser les chances :
+      1) /fundamentals/{sym}
+      2) /fundamentals/{sym}?filter=Holdings
+      3) /fundamentals/{sym}?filter=TopHoldings
+      4) /fundamentals/{sym}?filter=ETF_Data.Holdings
+      5) /fundamentals/{sym}?filter=General,Holdings   (plus large)
+    Retourne le premier JSON non vide + un debug.
     """
-    candidates = eodhd_symbol_candidates_from_isin(isin)
     tried = []
-    for sym in candidates:
-        tried.append(sym)
-        try:
-            js = eodhd_get(f"/fundamentals/{sym}")
-            if isinstance(js, dict) and js:
-                js["_debug_tried_symbols"] = tried
-                return js
-        except Exception:
-            continue
-    return {"_debug_tried_symbols": tried}
+    filters = [
+        None,
+        "Holdings",
+        "TopHoldings",
+        "ETF_Data.Holdings",
+        "General,Holdings"
+    ]
+    for sym in symbols:
+        for f in filters:
+            tried.append({"symbol": sym, "filter": f})
+            try:
+                params = {}
+                if f:
+                    params["filter"] = f
+                js = eodhd_get(f"/fundamentals/{sym}", params=params)
+                if isinstance(js, dict) and js:
+                    js["_debug_fund_tried"] = tried
+                    js["_debug_fund_hit"] = {"symbol": sym, "filter": f}
+                    return js
+            except Exception:
+                continue
+    return {"_debug_fund_tried": tried, "_debug_fund_hit": None}
 
-# ---------- utilitaires de recherche tolérants ----------
 def _first_list_for_keys(obj: Any, keys: List[str]) -> Optional[List[Dict[str, Any]]]:
-    """
-    Cherche en profondeur et renvoie la 1ère LISTE trouvée dont la clé correspond à l'un des 'keys'.
-    """
+    """Cherche en profondeur la première liste trouvée sous une des clés fournies."""
     if not isinstance(obj, (dict, list)):
         return None
     q = deque([obj])
+    low_keys = [k.lower() for k in keys]
     while q:
         cur = q.popleft()
         if isinstance(cur, dict):
             for k, v in cur.items():
-                kl = str(k).lower()
-                if any(kl == x.lower() for x in keys) and isinstance(v, list) and len(v) > 0:
+                if str(k).lower() in low_keys and isinstance(v, list) and v:
                     return v
                 if isinstance(v, (dict, list)):
                     q.append(v)
@@ -468,16 +483,10 @@ def _first_list_for_keys(obj: Any, keys: List[str]) -> Optional[List[Dict[str, A
     return None
 
 def _norm_regions(reg_list: List[Dict[str, Any]]) -> pd.DataFrame:
-    """
-    Normalise différentes variantes pour les régions/pays.
-    Accepte éléments avec champs ('Name'/'Region'/'Country', 'Weight'/'Percentage').
-    """
     rows = []
     for it in reg_list:
         name = it.get("Name") or it.get("Region") or it.get("Country") or it.get("Code")
-        w = it.get("Weight")
-        if w is None:
-            w = it.get("Percentage")
+        w = it.get("Weight") if it.get("Weight") is not None else it.get("Percentage")
         if name is not None and w is not None:
             rows.append({"Name": str(name), "Weight": float(w)})
     return pd.DataFrame(rows)
@@ -486,7 +495,7 @@ def _norm_asset_alloc(lst: List[Dict[str, Any]]) -> pd.DataFrame:
     rows = []
     for it in lst:
         typ = it.get("Type") or it.get("Name") or it.get("AssetType") or it.get("Code")
-        v = it.get("Percentage") or it.get("Weight")
+        v = it.get("Percentage") if it.get("Percentage") is not None else it.get("Weight")
         if typ is not None and v is not None:
             rows.append({"Type": str(typ), "Percentage": float(v)})
     return pd.DataFrame(rows)
@@ -495,14 +504,13 @@ def _norm_top_holdings(lst: List[Dict[str, Any]]) -> pd.DataFrame:
     rows = []
     for it in lst:
         nm = it.get("Name") or it.get("Company") or it.get("Holding") or it.get("Code")
-        w = it.get("Weight") or it.get("Percentage")
+        w = it.get("Weight") if it.get("Weight") is not None else it.get("Percentage")
         if nm is not None and w is not None:
             rows.append({"Titre": str(nm), "Poids (%)": float(w)})
     return pd.DataFrame(rows)
 
-def _keys_snapshot(js: Dict[str, Any]) -> List[str]:
-    """Liste des clés de 1er niveau pour debug lisible."""
-    return sorted(list(js.keys()))
+def _keys1(js: Dict[str, Any]) -> List[str]:
+    return sorted([k for k in js.keys() if not k.startswith("_debug")])
 
 st.header("📊 Composition détaillée des fonds")
 
@@ -514,58 +522,65 @@ if choices:
             st.warning("ISIN manquant pour ce fonds.")
             continue
 
-        js = eodhd_fundamentals_any(isin)  # JSON brut
-        # Recherche tolérante des différentes rubriques :
-        top_raw = _first_list_for_keys(js, ["TopHoldings", "Top_Holdings"])
-        alloc_raw = _first_list_for_keys(js, ["AssetAllocation", "Asset_Allocation", "AssetMix"])
-        sectors_raw = _first_list_for_keys(js, ["Sectors", "SectorWeights", "Sector_Weights"])
-        regions_raw = _first_list_for_keys(js, ["Regions", "RegionWeights", "Region_Weights", "GeographicalAllocation", "CountryWeights", "Country_Weights"])
+        # 1) Déduction des symboles candidats (ISIN.EXCHANGE puis ISIN)
+        candidates = eodhd_symbol_candidates_from_isin(isin)
 
-        # Normalisations
+        # 2) Fundamentals (multi-filters)
+        js = _fundamentals_try_all(candidates)
+
+        # 3) Recherche tolérante des sections (on scrute plusieurs variantes)
+        top_raw = _first_list_for_keys(js, [
+            "TopHoldings", "Top_Holdings", "Top10Holdings", "HoldingsTop", "Holdings_Top"
+        ])
+        alloc_raw = _first_list_for_keys(js, [
+            "AssetAllocation", "Asset_Allocation", "AssetMix", "Allocation", "Allocations"
+        ])
+        regions_raw = _first_list_for_keys(js, [
+            "Regions", "RegionWeights", "Region_Weights",
+            "GeographicalAllocation", "CountryWeights", "Country_Weights",
+            "Geography", "Geographical", "Countries"
+        ])
+
         df_top = _norm_top_holdings(top_raw) if top_raw else pd.DataFrame()
         df_alloc = _norm_asset_alloc(alloc_raw) if alloc_raw else pd.DataFrame()
         df_regions = _norm_regions(regions_raw) if regions_raw else pd.DataFrame()
 
-        col1, col2, col3 = st.columns(3)
+        c1, c2, c3 = st.columns(3)
 
-        # --- Col 1 : répartition géographique ---
+        # --- Col 1 : géographie ---
         if not df_regions.empty:
-            fig_r = px.pie(
-                df_regions, names="Name", values="Weight",
-                title="Répartition géographique (%)"
-            )
-            col1.plotly_chart(fig_r, use_container_width=True)
+            fig_r = px.pie(df_regions, names="Name", values="Weight", title="Répartition géographique (%)")
+            c1.plotly_chart(fig_r, use_container_width=True)
         else:
-            col1.info("Répartition géographique non disponible sur EODHD pour ce fonds.")
+            c1.info("Répartition géographique non disponible dans la réponse Fundamentals.")
 
-        # --- Col 2 : classes d’actifs ---
+        # --- Col 2 : classes d'actifs ---
         if not df_alloc.empty:
-            fig_a = px.pie(
-                df_alloc, names="Type", values="Percentage",
-                title="Répartition par classe d’actifs (%)"
-            )
-            col2.plotly_chart(fig_a, use_container_width=True)
+            fig_a = px.pie(df_alloc, names="Type", values="Percentage", title="Répartition par classe d’actifs (%)")
+            c2.plotly_chart(fig_a, use_container_width=True)
         else:
-            col2.info("Répartition par classe d’actifs non disponible sur EODHD pour ce fonds.")
+            c2.info("Répartition par classe d’actifs non disponible dans la réponse Fundamentals.")
 
-        # --- Col 3 : top 10 positions ---
+        # --- Col 3 : Top 10 ---
         if not df_top.empty:
-            col3.dataframe(df_top.head(10), use_container_width=True, hide_index=True)
+            c3.dataframe(df_top.head(10), use_container_width=True, hide_index=True)
         else:
-            col3.info("Top positions non disponibles sur EODHD pour ce fonds.")
+            c3.info("Top positions non disponibles dans la réponse Fundamentals.")
 
-        # --- Debug (affiche les clés trouvées) ---
+        # --- Debug utile si rien ne remonte ---
         if debug_mode:
-            with st.expander("🔧 Debug fondamentaux", expanded=False):
+            with st.expander("🔧 Debug Fundamentals (EODHD)", expanded=False):
                 st.write({
-                    "tried_symbols": js.get("_debug_tried_symbols"),
-                    "top_level_keys": _keys_snapshot(js),
-                    "found_sections": {
+                    "candidates": candidates,
+                    "hit": js.get("_debug_fund_hit"),
+                    "tried": js.get("_debug_fund_tried"),
+                    "top_level_keys": _keys1(js),
+                    "has_sections": {
                         "TopHoldings": bool(top_raw),
                         "AssetAllocation": bool(alloc_raw),
-                        "Sectors": bool(sectors_raw),
-                        "Regions/CountryWeights": bool(regions_raw),
-                    }
+                        "Regions/Countries": bool(regions_raw),
+                    },
+                    "sample_json_preview": {k: js[k] for k in list(js.keys())[:5] if not k.startswith("_debug")}
                 })
 else:
     st.info("Sélectionne au moins un fonds pour afficher sa composition.")

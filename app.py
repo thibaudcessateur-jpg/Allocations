@@ -134,10 +134,10 @@ def eodhd_prices_daily_safe(candidates: List[str], days: int = 450) -> Tuple[pd.
 
 def perf_series(prices: pd.DataFrame) -> Dict[str, Optional[float]]:
     """
-    Perf % (1M / YTD / 1Y / 3Y / 5Y / 8Y) à partir du dernier close.
+    Perf % (1M / YTD / 1Y / 3Y / 5Y / 10Y) à partir du dernier close.
     None si non calculable (pas assez d'historique).
     """
-    out = {"1M": None, "YTD": None, "1Y": None, "3Y": None, "5Y": None, "8Y": None}
+    out = {"1M": None, "YTD": None, "1Y": None, "3Y": None, "5Y": None, "10Y": None}
     if prices.empty:
         return out
     last = prices["Close"].iloc[-1]

@@ -161,7 +161,7 @@ def perf_series(prices: pd.DataFrame) -> Dict[str, Optional[float]]:
         out["1Y"]  = pct(end - pd.DateOffset(years=1))
         out["3Y"]  = pct(end - pd.DateOffset(years=3))
         out["5Y"]  = pct(end - pd.DateOffset(years=5))
-        out["8Y"]  = pct(end - pd.DateOffset(years=8))
+        out["10Y"]  = pct(end - pd.DateOffset(years=10))
     except Exception:
         pass
     return out

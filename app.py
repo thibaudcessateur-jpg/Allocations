@@ -1,39 +1,44 @@
+# ===============================
+# 01) IMPORTS & SETUP
+# ===============================
 import os
 from typing import Optional, List, Dict, Any
-from datetime import date, timedelta
 
 import requests
+import numpy as np
 import pandas as pd
 import streamlit as st
 from dotenv import load_dotenv
 
-# ----------------- Setup -----------------
 load_dotenv()
 st.set_page_config(page_title="Allocation CGP — Analyse UC (EODHD)", page_icon="🦉", layout="wide")
 
-# ---------- Secrets helper ----------
+
+# ===============================
+# 02) SECRET TOKEN HELPER
+# ===============================
 def Secret_Token(name: str, default: Optional[str] = None) -> str:
     """
-    Retrieve a secret/token from environment (preferred) or st.secrets.
-    Raises a clear error if not found and no default provided.
+    Récupère un secret depuis l'environnement (prioritaire) ou st.secrets.
+    Lève une erreur si absent et pas de valeur par défaut fournie.
     """
-    # 1) OS env has priority
     v = os.getenv(name)
     if v and v.strip():
         return v.strip()
-    # 2) Streamlit secrets
     try:
         v = st.secrets.get(name)  # type: ignore[attr-defined]
         if v and str(v).strip():
             return str(v).strip()
     except Exception:
         pass
-    # 3) Fallback / error
     if default is not None:
         return default
     raise RuntimeError(f"Secret '{name}' is missing. Provide it via environment or st.secrets.")
 
-# ---------- EODHD client (simple) ----------
+
+# ===============================
+# 03) EODHD — CLIENT LÉGER
+# ===============================
 def eodhd_base_url() -> str:
     return os.getenv("EODHD_BASE_URL") or st.secrets.get("EODHD_BASE_URL", "https://eodhd.com/api")
 
@@ -46,59 +51,53 @@ def eodhd_params(extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         params.update(extra)
     return params
 
-@st.cache_data(ttl=6*3600, show_spinner=False)
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
 def eodhd_get(path: str, params: Optional[Dict[str, Any]] = None) -> Any:
     url = f"{eodhd_base_url().rstrip('/')}{path}"
     r = requests.get(url, params=eodhd_params(params or {}), headers=eodhd_headers(), timeout=25)
     r.raise_for_status()
     return r.json()
 
-# Map ISIN -> ticker(s) via /search
-@st.cache_data(ttl=24*3600, show_spinner=False)
+@st.cache_data(ttl=24 * 3600, show_spinner=False)
 def eodhd_search_isin(isin: str) -> List[Dict[str, Any]]:
-    # EODHD: /search/{query}
-    # on renvoie la liste brute, on filtrera côté code
+    """Recherche EODHD pour retrouver le ticker à partir d'un ISIN."""
     try:
         data = eodhd_get(f"/search/{isin}", params={"limit": 20})
     except Exception:
         return []
-    # data est typiquement une liste de dicts : symbol, name, exchange, code, isin...
     if isinstance(data, dict) and "data" in data:
         return data["data"]
     return data if isinstance(data, list) else []
 
 def pick_best_ticker_from_search(items: List[Dict[str, Any]], isin: str) -> Optional[str]:
-    # Heuristique : match direct sur champ 'isin' si dispo, sinon premier symbol coté en Europe (préférence LU/FR/IE/LU…)
+    """Heuristique de sélection du 'symbol' à partir des résultats de recherche."""
     if not items:
         return None
-    # 1) match strict isin
     for it in items:
         if str(it.get("isin", "")).upper() == isin.upper():
             return it.get("code") or it.get("symbol")
-    # 2) sinon privilégier exchanges EU
     eu_ex = ("PAR", "XETRA", "MIL", "AMS", "LSE", "VIE", "MAD", "BRU", "LIS", "VTX")
     eu = [it for it in items if str(it.get("exchange", "")).upper() in eu_ex]
     if eu:
         return eu[0].get("code") or eu[0].get("symbol")
-    # 3) fallback: premier élément
     return items[0].get("code") or items[0].get("symbol")
 
-@st.cache_data(ttl=6*3600, show_spinner=False)
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
 def eodhd_prices_daily(ticker: str, days: int = 450) -> pd.DataFrame:
-    # /eod/{ticker}?period=d
+    """Séries de clôtures quotidiennes /eod/{ticker}?period=d"""
     js = eodhd_get(f"/eod/{ticker}", params={"period": "d"})
     df = pd.DataFrame(js)
     if df.empty or "close" not in df.columns:
         return pd.DataFrame()
-    # 'date' ou 'Date' selon contexte
     dcol = "date" if "date" in df.columns else "Date"
     df[dcol] = pd.to_datetime(df[dcol])
     df = df.set_index(dcol).sort_index()
     df = df.tail(days)[["close"]].rename(columns={"close": "Close"})
     return df
 
-@st.cache_data(ttl=6*3600, show_spinner=False)
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
 def eodhd_fundamentals(ticker: str) -> Dict[str, Any]:
+    """Fundamentals généraux (meilleure-effort — varie selon le type d'actif)."""
     try:
         js = eodhd_get(f"/fundamentals/{ticker}")
         return js if isinstance(js, dict) else {}
@@ -106,32 +105,29 @@ def eodhd_fundamentals(ticker: str) -> Dict[str, Any]:
         return {}
 
 def perf_series(prices: pd.DataFrame) -> Dict[str, Optional[float]]:
-    """Compute simple perf % for 1M/3M/6M/YTD/1Y based on last close."""
+    """Perf % (1M/3M/6M/YTD/1Y) sur la base du dernier close. Renvoie None si pas calculable."""
     out = {"1M": None, "3M": None, "6M": None, "YTD": None, "1Y": None}
     if prices.empty:
         return out
     last = prices["Close"].iloc[-1]
-    if last <= 0: 
+    if last is None or last <= 0:
         return out
 
     def pct(dt_from: pd.Timestamp) -> Optional[float]:
-        # nearest index before/at dt_from
         s = prices.loc[:dt_from]
         if s.empty:
             return None
         base = s["Close"].iloc[-1]
-        if base <= 0:
+        if base is None or base <= 0:
             return None
-        return (last/base - 1.0) * 100.0
+        return (last / base - 1.0) * 100.0
 
     idx = prices.index
     end = idx[-1]
-    # helper dates
     try:
         out["1M"] = pct(end - pd.DateOffset(months=1))
         out["3M"] = pct(end - pd.DateOffset(months=3))
         out["6M"] = pct(end - pd.DateOffset(months=6))
-        # YTD: since Jan 1 of current year
         ytd_start = pd.Timestamp(year=end.year, month=1, day=1, tz=end.tz)
         out["YTD"] = pct(ytd_start)
         out["1Y"] = pct(end - pd.DateOffset(years=1))
@@ -139,7 +135,10 @@ def perf_series(prices: pd.DataFrame) -> Dict[str, Optional[float]]:
         pass
     return out
 
-# ---------- Univers Espace Invest 5 ----------
+
+# ===============================
+# 04) UNIVERS — ESPACE INVEST 5
+# ===============================
 UNIVERSE: List[Dict[str, Any]] = [
     {"name": "R-co Valor C EUR", "isin": "FR0011253624", "sri": 4, "sfdr": 8, "type": "UC Actions Monde",
      "vl": False, "vlp": False, "transferts_programmes_eligibles": True, "notes": ""},
@@ -173,30 +172,43 @@ UNIVERSE: List[Dict[str, Any]] = [
      "vl": False, "vlp": False, "transferts_programmes_eligibles": True, "notes": ""},
 ]
 
-# ----------------- UI -----------------
+
+# ===============================
+# 05) TITRES & SIDEBAR (ÉTAT CLÉ)
+# ===============================
 st.title("🦉 Analyse UC — Espace Invest 5 (via EODHD)")
-st.caption("Aucune allocation calculée. Analyse variations et techniques depuis EODHD.")
+st.caption("Aucune allocation calculée. Analyse variations et infos techniques via EODHD.")
 
 with st.sidebar:
     st.header("Clé API EODHD")
     try:
         _ = Secret_Token("EODHD_API_KEY")
         st.success("Clé EODHD détectée")
-    except Exception as e:
+    except Exception:
         st.error("Clé EODHD manquante — ajoutez EODHD_API_KEY dans secrets/env.")
 
+
+# ===============================
+# 06) SÉLECTION & PARAMÈTRES
+# ===============================
 st.subheader("Sélection des fonds à analyser")
 df_univ = pd.DataFrame(UNIVERSE)
+
 choices = st.multiselect(
     "Fonds",
     options=df_univ["name"].tolist(),
     default=[df_univ["name"].iloc[0]] if not df_univ.empty else [],
 )
+
 period_days = st.slider("Historique (jours ouvrés)", min_value=120, max_value=750, value=450, step=30)
 
+
+# ===============================
+# 07) ACTION — ANALYSE EODHD
+# ===============================
 if st.button("🔎 Analyser via EODHD") and choices:
-    rows = []
-    charts = {}
+    rows: List[Dict[str, Any]] = []
+    charts: Dict[str, pd.DataFrame] = {}
 
     for name in choices:
         row = df_univ.loc[df_univ["name"] == name].iloc[0].to_dict()
@@ -207,11 +219,8 @@ if st.button("🔎 Analyser via EODHD") and choices:
             items = eodhd_search_isin(isin)
             ticker = pick_best_ticker_from_search(items, isin)
 
-        # Fetch prices + perf
         prices = eodhd_prices_daily(ticker, days=period_days) if ticker else pd.DataFrame()
         perfs = perf_series(prices)
-
-        # Fundamentals (best effort)
         fund = eodhd_fundamentals(ticker) if ticker else {}
 
         row.update({
@@ -231,35 +240,75 @@ if st.button("🔎 Analyser via EODHD") and choices:
         rows.append(row)
         charts[name] = prices
 
-    if rows:
-        view_cols = ["name","isin","ticker","type","sri","sfdr","Close","Perf 1M %","Perf 3M %","Perf 6M %","Perf YTD %","Perf 1Y %","notes"]
-        view = pd.DataFrame(rows)[view_cols]
-        st.subheader("Tableau récapitulatif")
-        st.dataframe(
-            view.rename(columns={
-                "name":"Nom","isin":"ISIN","type":"Type","sri":"SRI","sfdr":"SFDR",
-                "Close":"Dernier cours","notes":"Notes"
-            }).style.format({
-                "Close": "{:,.2f}",
-                "Perf 1M %": "{:+.2f}%",
-                "Perf 3M %": "{:+.2f}%",
-                "Perf 6M %": "{:+.2f}%",
-                "Perf YTD %": "{:+.2f}%",
-                "Perf 1Y %": "{:+.2f}%",
-            }),
-            use_container_width=True,
-            hide_index=True
-        )
 
-        st.subheader("Mini-charts (clôtures quotidiennes)")
-        for name in choices:
-            prices = charts.get(name)
-            if prices is None or prices.empty:
-                st.info(f"Pas de données prix pour: {name}")
-                continue
-            st.line_chart(prices, x=None, y="Close", height=220, use_container_width=True)
+    # ===============================
+    # 08) TABLEAU — FORMATAGE SÛR
+    # ===============================
+    st.subheader("Tableau récapitulatif")
+
+    view_cols = [
+        "name", "isin", "ticker", "type", "sri", "sfdr", "Close",
+        "Perf 1M %", "Perf 3M %", "Perf 6M %", "Perf YTD %", "Perf 1Y %", "notes"
+    ]
+    view = pd.DataFrame(rows)[view_cols].copy()
+
+    # Colonnes numériques -> coerce
+    num_cols = ["Close", "Perf 1M %", "Perf 3M %", "Perf 6M %", "Perf YTD %", "Perf 1Y %"]
+    for c in num_cols:
+        view[c] = pd.to_numeric(view[c], errors="coerce")
+
+    # Formateurs robustes
+    def fmt_money(x):
+        try:
+            if x is None or (isinstance(x, float) and np.isnan(x)):
+                return ""
+            return f"{float(x):,.2f}"
+        except Exception:
+            return ""
+
+    def fmt_pct(x):
+        try:
+            if x is None or (isinstance(x, float) and np.isnan(x)):
+                return ""
+            return f"{float(x):+.2f}%"
+        except Exception:
+            return ""
+
+    styled = (
+        view.rename(columns={
+            "name": "Nom", "isin": "ISIN", "type": "Type", "sri": "SRI", "sfdr": "SFDR",
+            "Close": "Dernier cours", "notes": "Notes"
+        })
+        .style.format({
+            "Dernier cours": fmt_money,
+            "Perf 1M %": fmt_pct,
+            "Perf 3M %": fmt_pct,
+            "Perf 6M %": fmt_pct,
+            "Perf YTD %": fmt_pct,
+            "Perf 1Y %": fmt_pct,
+        }, na_rep="")
+    )
+
+    st.dataframe(styled, use_container_width=True, hide_index=True)
+
+
+    # ===============================
+    # 09) MINI-CHARTS PRIX
+    # ===============================
+    st.subheader("Mini-charts (clôtures quotidiennes)")
+    for name in choices:
+        prices = charts.get(name)
+        if prices is None or prices.empty:
+            st.info(f"Pas de données prix pour: {name}")
+            continue
+        st.line_chart(prices, y="Close", height=220, use_container_width=True)
+
 else:
     st.info("Sélectionne au moins un fonds puis clique sur « Analyser via EODHD ».")
 
+
+# ===============================
+# 10) FOOTER
+# ===============================
 st.divider()
 st.caption("⚠️ Best-effort mapping ISIN → ticker via /search. Ajuster si besoin. Aucune recommandation, affichage informatif.")

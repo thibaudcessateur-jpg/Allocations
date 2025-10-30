@@ -420,8 +420,44 @@ st.divider()
 st.caption("Méthode ISIN → Exchange (via /search) → /eod daily + fallback mensuel. "
            "Perfs: 1M, YTD, 1Y, 3Y, 5Y, 8Y, 10Y. Format monétaire européen.")
 
+
+
+
+
 # =========================================
-# 12) INDICATEURS QUANTITATIFS — EODHD (corrélation, vol, Sharpe, Beta, R², etc.)
+# 12) UNIVERSE + BENCHMARKS (EODHD)  ✅
+#     - Associe chaque fonds à SON benchmark réel
+#     - Mappe chaque benchmark vers un ou plusieurs ISINs (pondérés)
+#       (tu peux ajuster les ISINs selon tes préférences produits)
+# =========================================
+
+UNIVERSE = [
+    {"name": "R-co Valor C EUR",                    "isin": "FR0011253624", "type": "Fonds Actions Monde",     "benchmark": "MSCI World Index"},
+    {"name": "Vivalor International",               "isin": "FR0014001LS1", "type": "Fonds Actions Monde",     "benchmark": "MSCI World Index"},
+    {"name": "COMGEST Monde C",                     "isin": "FR0000284689", "type": "Fonds Actions Monde",     "benchmark": "MSCI World Index"},
+    {"name": "Echiquier World Equity Growth",       "isin": "FR0010859769", "type": "Fonds Actions Monde",     "benchmark": "MSCI ACWI Index"},
+    {"name": "Franklin Mutual Global Discovery",    "isin": "LU0211333298", "type": "Fonds Actions Monde",     "benchmark": "MSCI World Value Index"},
+    {"name": "CARMIGNAC INVESTISSEMENT A EUR",      "isin": "FR0010148981", "type": "Fonds Actions Monde",     "benchmark": "MSCI ACWI Index"},
+    {"name": "Pictet Global Megatrend Selection P", "isin": "LU0386882277", "type": "Fonds Thématique Monde",  "benchmark": "MSCI World Index"},
+    {"name": "CARMIGNAC PATRIMOINE",                "isin": "FR0010135103", "type": "Diversifié Patrimonial",  "benchmark": "50% MSCI World / 50% Euro Aggregate Bond"},
+]
+
+# --- Benchmarks -> ISIN(s) ---
+# NOTE: vérifie/ajuste les ISIN ci-dessous selon les ETF que TU veux utiliser comme proxy :
+# - MSCI World Index  -> iShares Core MSCI World UCITS ETF (IWDA)        ISIN: IE00B4L5Y983
+# - MSCI ACWI Index   -> iShares MSCI ACWI UCITS ETF (SSAC)              ISIN: IE00B6R52259
+# - MSCI World Value  -> iShares Edge MSCI World Value Factor UCITS ETF  ISIN: IE00BP3QZB59
+# - Euro Aggregate    -> iShares Core Euro Aggregate Bond UCITS ETF      ISIN: IE00B3DKXQ41
+BENCHMARKS_ISIN = {
+    "MSCI World Index": "IE00B4L5Y983",
+    "MSCI ACWI Index": "IE00B6R52259",
+    "MSCI World Value Index": "IE00BP3QZB59",
+    "Euro Aggregate Bond": "IE00B3DKXQ41",
+    "50% MSCI World / 50% Euro Aggregate Bond": [("IE00B4L5Y983", 0.5), ("IE00B3DKXQ41", 0.5)],
+}
+
+# =========================================
+# 12) INDICATEURS QUANTITATIFS — EODHD (avec vrais benchmarks)  ✅
 # =========================================
 import numpy as np
 import pandas as pd
@@ -430,13 +466,7 @@ import plotly.express as px
 TRADING_DAYS = 252
 
 def _get_close_series_by_name(name: str, tail_days: int = 2500) -> pd.Series:
-    """
-    Récupère la série de clôture (Series) d'un fonds/ETF sélectionné (par 'name' de l'UNIVERSE)
-    en s'appuyant sur EODHD:
-      - eodhd_symbol_candidates_from_isin(isin)
-      - eodhd_prices_safe(candidates, period='d', tail_days=...)
-    Retour: pd.Series indexée par date (UTC-naive), name = symbole retenu.
-    """
+    """Série prix (Close) d'un fonds sélectionné (via ISIN -> candidats -> eodhd_prices_safe)."""
     row = df_univ.loc[df_univ["name"] == name]
     if row.empty:
         return pd.Series(dtype=float)
@@ -452,46 +482,78 @@ def _get_close_series_by_name(name: str, tail_days: int = 2500) -> pd.Series:
     s.name = ok_sym or name
     return s
 
+def _get_close_series_by_isin(isin: str, tail_days: int = 2500, name: str | None = None) -> pd.Series:
+    """Série prix (Close) via un ISIN (utile pour les benchmarks)."""
+    candidates = eodhd_symbol_candidates_from_isin(isin)
+    df, ok_sym, _, _ = eodhd_prices_safe(candidates, period="d", tail_days=tail_days)
+    if df.empty or "Close" not in df.columns:
+        return pd.Series(dtype=float)
+    s = df["Close"].copy()
+    s.name = name or ok_sym or isin
+    return s
+
+def get_benchmark_prices(bench_label: str, tail_days: int = 2500) -> pd.Series:
+    """
+    Prix du benchmark:
+      - Si bench_label est un libellé simple (clé de BENCHMARKS_ISIN -> ISIN str) : prend cet ETF proxy.
+      - Si bench_label est un panier (liste [(ISIN, poids), ...]) : construit un indice composite base=1.
+    Retour: Series 'Close' (proxy benchmark) nommée bench_label.
+    """
+    item = BENCHMARKS_ISIN.get(bench_label)
+    if not item:
+        # Permet de mapper des libellés "composites" personnalisés
+        if bench_label == "50% MSCI World / 50% Euro Aggregate Bond":
+            item = BENCHMARKS_ISIN["50% MSCI World / 50% Euro Aggregate Bond"]
+        else:
+            st.warning(f"Benchmark '{bench_label}' introuvable dans BENCHMARKS_ISIN.")
+            return pd.Series(dtype=float)
+
+    if isinstance(item, str):
+        s = _get_close_series_by_isin(item, tail_days=tail_days, name=bench_label)
+        return s
+
+    # Panier pondéré
+    parts = []
+    for isin, w in item:
+        si = _get_close_series_by_isin(isin, tail_days=tail_days, name=None)
+        if not si.empty:
+            # normalise à 1 au début pour pouvoir sommer pondéré
+            si = si / si.iloc[0]
+            parts.append((si, float(w)))
+    if not parts:
+        return pd.Series(dtype=float)
+    idx = parts[0][0].index
+    composite = sum(w * si.reindex(idx).fillna(method="ffill") for si, w in parts)
+    composite.name = bench_label
+    return composite
+
 def _to_returns(price_df: pd.DataFrame) -> pd.DataFrame:
-    """Rendements simples quotidiens (pct_change)."""
     return price_df.pct_change().dropna(how="all")
 
 def _annualized_return(ret: pd.Series) -> float:
-    """Perf annualisée à partir des ret. quotidiennes."""
-    if ret.empty:
-        return np.nan
+    if ret.empty: return np.nan
     mean_daily = ret.mean()
     return (1 + mean_daily) ** TRADING_DAYS - 1
 
 def _annualized_vol(ret: pd.Series) -> float:
-    if ret.empty:
-        return np.nan
+    if ret.empty: return np.nan
     return ret.std(ddof=0) * np.sqrt(TRADING_DAYS)
 
 def _downside_dev(ret: pd.Series, rf_daily: float = 0.0) -> float:
-    """Écart-type des ret < rf (downside), non annualisé."""
-    if ret.empty:
-        return 0.0
+    if ret.empty: return 0.0
     dd = ret[ret < rf_daily] - rf_daily
-    if dd.empty:
-        return 0.0
+    if dd.empty: return 0.0
     return dd.std(ddof=0)
 
 def _max_drawdown(price: pd.Series) -> float:
-    """Max drawdown en niveau (% négatif)."""
-    if price.empty:
-        return np.nan
+    if price.empty: return np.nan
     cummax = price.cummax()
     dd = price / cummax - 1.0
     return float(dd.min()) if not dd.empty else np.nan
 
 def _beta_alpha_r2(ret_fund: pd.Series, ret_bench: pd.Series) -> tuple[float, float, float]:
-    """
-    Beta/Alpha (quotidien) + R² (corr²) par covariance/variance.
-    Alpha renvoyé au pas quotidien (non annualisé).
-    """
     aligned = pd.concat([ret_fund, ret_bench], axis=1, join="inner").dropna()
-    if aligned.shape[0] < 30:
+    if aligned.shape[0] < 60:
         return np.nan, np.nan, np.nan
     rf = aligned.iloc[:, 0]
     rb = aligned.iloc[:, 1]
@@ -506,8 +568,7 @@ def _beta_alpha_r2(ret_fund: pd.Series, ret_bench: pd.Series) -> tuple[float, fl
 
 def _tracking_error(ret_fund: pd.Series, ret_bench: pd.Series) -> float:
     diff = (ret_fund - ret_bench).dropna()
-    if diff.empty:
-        return np.nan
+    if diff.empty: return np.nan
     return diff.std(ddof=0) * np.sqrt(TRADING_DAYS)
 
 def _information_ratio(ret_fund: pd.Series, ret_bench: pd.Series) -> float:
@@ -515,243 +576,208 @@ def _information_ratio(ret_fund: pd.Series, ret_bench: pd.Series) -> float:
     te = _tracking_error(ret_fund, ret_bench)
     return ann_excess / te if te and te > 0 else np.nan
 
-st.header("📐 Indicateurs quantitatifs (basés sur les prix EOD EODHD)")
+st.header("📐 Indicateurs quantitatifs (EODHD) — vs benchmark officiel de chaque fonds")
 
 if choices:
-    # --- Paramètres quant ---
-    colq1, colq2, colq3 = st.columns(3)
+    # --- Paramètres ---
+    colq1, colq2 = st.columns(2)
     with colq1:
-        bench_name = st.selectbox("Benchmark (pour Beta / R² / TE / IR)", options=choices, index=0)
+        rf_annual_pct = st.number_input("Taux sans risque annualisé (%)", value=0.00, step=0.10, format="%.2f")
     with colq2:
-        rf_annual_pct = st.number_input("Taux sans risque annualisé (%)", value=0.0, step=0.10, format="%.2f")
-    with colq3:
         tail_days_q = st.slider("Fenêtre historique (jours ouvrés)", min_value=252, max_value=2500, value=1500, step=63)
+    rf_daily = (1 + rf_annual_pct/100.0) ** (1 / TRADING_DAYS) - 1
 
-    rf_daily = (1 + rf_annual_pct / 100.0) ** (1 / TRADING_DAYS) - 1
-
-    # --- Téléchargement prix (EODHD) & alignement
+    # --- Prix EOD fonds sélectionnés
     price_map: dict[str, pd.Series] = {}
     for nm in choices:
         s = _get_close_series_by_name(nm, tail_days=tail_days_q)
         if not s.empty:
             price_map[nm] = s
+    if len(price_map) < 1:
+        st.warning("⚠️ Aucune série de prix disponible.")
+        st.stop()
 
-    if len(price_map) < 2:
-        st.warning("⚠️ Sélectionne au moins 2 fonds/ETF pour calculer corrélations et comparaisons.")
-    else:
-        prices = pd.concat(price_map, axis=1).dropna(how="all")
-        # Conserver l'ordre d'affichage des 'choices'
-        prices = prices.reindex(columns=[c for c in choices if c in prices.columns])
-        rets = _to_returns(prices)
+    prices = pd.concat(price_map, axis=1).dropna(how="all")
+    prices = prices.reindex(columns=[c for c in choices if c in prices.columns])
+    rets = _to_returns(prices)
 
-        # --- Matrice de corrélation
-        st.subheader("🔗 Corrélation (quotidienne)")
-        corr = rets.corr()
+    # --- Corrélation (entre les fonds) + lecture rapide
+    st.subheader("🔗 Corrélation (quotidienne)")
+    corr = rets.corr()
+
+    def _corr_summary(corr_df: pd.DataFrame) -> dict:
+        pairs = []
+        cols = corr_df.columns.tolist()
+        for i in range(len(cols)):
+            for j in range(i+1, len(cols)):
+                pairs.append((cols[i], cols[j], float(corr_df.iloc[i, j])))
+        if not pairs:
+            return {"avg": np.nan, "min": None, "max": None}
+        avg = float(np.mean([p[2] for p in pairs]))
+        min_pair = min(pairs, key=lambda x: x[2])
+        max_pair = max(pairs, key=lambda x: x[2])
+        return {"avg": avg, "min": min_pair, "max": max_pair}
+
+    def _label_corr(v: float) -> str:
+        if np.isnan(v): return "n/a"
+        if v < 0.0:   return "négative (diversifiante)"
+        if v < 0.30:  return "faible (très diversifiante)"
+        if v < 0.70:  return "modérée"
+        return "forte (peu diversifiante)"
+
+    cs = _corr_summary(corr)
+    left, right = st.columns([1,1])
+    with left:
         st.dataframe(corr.style.format("{:.2f}"), use_container_width=True, hide_index=True)
-        fig_corr = px.imshow(corr, text_auto=True, aspect="auto", title="Matrice de corrélation")
-        st.plotly_chart(fig_corr, use_container_width=True)
-
-        # --- Benchmark (retours)
-        if bench_name not in rets.columns:
-            st.error("Benchmark introuvable dans les retours calculés.")
-        else:
-            bench_ret = rets[bench_name].dropna()
-
-            # --- Tableau des indicateurs
-            rows = []
-            for nm in rets.columns:
-                r = rets[nm].dropna()
-                if r.empty:
-                    continue
-                ann_ret = _annualized_return(r)
-                ann_vol = _annualized_vol(r)
-                sharpe = (ann_ret - rf_annual_pct / 100.0) / ann_vol if ann_vol and ann_vol > 0 else np.nan
-                dd = _downside_dev(r, rf_daily=rf_daily)
-                sortino = (ann_ret - rf_annual_pct / 100.0) / (dd * np.sqrt(TRADING_DAYS)) if dd and dd > 0 else np.nan
-                mdd = _max_drawdown(prices[nm].dropna())
-                calmar = ann_ret / abs(mdd) if mdd and mdd < 0 else np.nan
-
-                beta = alpha_d = r2 = te = ir = np.nan
-                if nm != bench_name and not bench_ret.empty:
-                    beta, alpha_d, r2 = _beta_alpha_r2(r, bench_ret)
-                    te = _tracking_error(r, bench_ret)
-                    ir = _information_ratio(r, bench_ret)
-
-                rows.append({
-                    "Fonds": nm,
-                    "Perf ann. %": ann_ret * 100.0,
-                    "Vol ann. %": ann_vol * 100.0,
-                    "Sharpe": sharpe,
-                    "Sortino": sortino,
-                    "Max DD %": mdd * 100.0 if pd.notna(mdd) else np.nan,
-                    "Calmar": calmar,
-                    "Beta (vs bench)": beta,
-                    "R² (vs bench)": r2,
-                    "Tracking error %": te * 100.0 if pd.notna(te) else np.nan,
-                    "Information ratio": ir,
-                })
-
-                   # --- Matrice de corrélation
-        st.subheader("🔗 Corrélation (quotidienne)")
-        corr = rets.corr()
-
-        # Résumé lisible de la corrélation
-        def _corr_summary(corr_df: pd.DataFrame) -> dict:
-            c = corr_df.copy()
-            # on ne garde que le triangle supérieur sans diagonale
-            mask = np.triu(np.ones(c.shape), k=1).astype(bool)
-            pairs = []
-            cols = c.columns.tolist()
-            for i in range(len(cols)):
-                for j in range(i+1, len(cols)):
-                    pairs.append((cols[i], cols[j], float(c.iloc[i, j])))
-            if not pairs:
-                return {"avg": np.nan, "min": None, "max": None}
-            avg = float(np.mean([p[2] for p in pairs]))
-            min_pair = min(pairs, key=lambda x: x[2])
-            max_pair = max(pairs, key=lambda x: x[2])
-            return {"avg": avg, "min": min_pair, "max": max_pair}
-
-        cs = _corr_summary(corr)
-        # Interprétation simple
-        def _label_corr(v: float) -> str:
-            if np.isnan(v): return "n/a"
-            if v < 0.0:       return "négative (diversifiante)"
-            if v < 0.30:      return "faible (très diversifiante)"
-            if v < 0.70:      return "modérée"
-            return "forte (peu diversifiante)"
-
-        left, right = st.columns([1,1])
-        with left:
-            st.dataframe(corr.style.format("{:.2f}"), use_container_width=True, hide_index=True)
-        with right:
-            st.markdown("### 🧭 Lecture rapide")
-            if cs["min"] and cs["max"]:
-                fmin1, fmin2, vmin = cs["min"]
-                fmax1, fmax2, vmax = cs["max"]
-                st.markdown(
-                    f"- **Paire la moins corrélée** : **{fmin1} / {fmin2}** → {vmin:.2f} → {_label_corr(vmin)} ✅\n"
-                    f"- **Paire la plus corrélée** : **{fmax1} / {fmax2}** → {vmax:.2f} → {_label_corr(vmax)}\n"
-                    f"- **Corrélation moyenne du panier** : {cs['avg']:.2f} → {_label_corr(cs['avg'])}"
-                )
-                if vmin < 0.30:
-                    st.success("👉 Au moins une paire faiblement corrélée : **bonne diversification**.")
-                if vmax > 0.70:
-                    st.warning("⚠️ Une paire très corrélée : **redondance** possible.")
-            else:
-                st.info("Sélectionne au moins 2 fonds pour analyser la corrélation.")
-
-        # --- Tableau des indicateurs
-        rows = []
-        for nm in rets.columns:
-            r = rets[nm].dropna()
-            if r.empty:
-                continue
-            ann_ret = _annualized_return(r)
-            ann_vol = _annualized_vol(r)
-            sharpe = (ann_ret - rf_annual_pct / 100.0) / ann_vol if ann_vol and ann_vol > 0 else np.nan
-            dd = _downside_dev(r, rf_daily=rf_daily)
-            sortino = (ann_ret - rf_annual_pct / 100.0) / (dd * np.sqrt(TRADING_DAYS)) if dd and dd > 0 else np.nan
-            mdd = _max_drawdown(prices[nm].dropna())
-            calmar = ann_ret / abs(mdd) if mdd and mdd < 0 else np.nan
-
-            beta = alpha_d = r2 = te = ir = np.nan
-            if nm != bench_name and not bench_ret.empty:
-                beta, alpha_d, r2 = _beta_alpha_r2(r, bench_ret)
-                te = _tracking_error(r, bench_ret)
-                ir = _information_ratio(r, bench_ret)
-
-            # -------- Lecture pédagogique (badges) --------
-            def badge_sharpe(x):
-                if np.isnan(x): return "—"
-                if x >= 2:  return "🟢 excellent (≥2)"
-                if x >= 1:  return "🟡 correct (≥1)"
-                return "🔴 faible (<1)"
-            def badge_beta(x):
-                if np.isnan(x): return "—"
-                if x < 0.7:    return "🟢 défensif (<0,7)"
-                if x <= 1.2:   return "🟡 proche marché (~1)"
-                return "🔴 agressif (>1,2)"
-            def badge_r2(x):
-                if np.isnan(x): return "—"
-                if x >= 0.80:  return "🔴 très corrélé au bench (≥0,80)"
-                if x >= 0.50:  return "🟡 corrélation modérée"
-                return "🟢 faible corrélation (diversifiant)"
-            def badge_mdd(x):
-                if np.isnan(x): return "—"
-                if x > -15/100:   return "🟢 drawdown contenu"
-                if x > -30/100:   return "🟡 drawdown moyen"
-                return "🔴 drawdown élevé"
-
-            rows.append({
-                "Fonds": nm,
-                "Perf ann. %": ann_ret*100.0,
-                "Vol ann. %": ann_vol*100.0,
-                "Sharpe": sharpe,
-                "Sortino": sortino,
-                "Max DD %": mdd*100.0 if pd.notna(mdd) else np.nan,
-                "Calmar": calmar,
-                "Beta (vs bench)": beta,
-                "R² (vs bench)": r2,
-                "Tracking error %": te*100.0 if pd.notna(te) else np.nan,
-                "Information ratio": ir,
-                # Lectures
-                "Lecture Sharpe": badge_sharpe(sharpe),
-                "Lecture Beta": badge_beta(beta),
-                "Lecture R²": badge_r2(r2),
-                "Lecture Drawdown": badge_mdd(mdd),
-            })
-
-        df_metrics = pd.DataFrame(rows)
-
-        # --- Formatage + mise en couleur douce
-        st.subheader("📊 Indicateurs annualisés — **avec lecture rapide**")
-        fmt = {
-            "Perf ann. %": "{:.2f}", "Vol ann. %": "{:.2f}", "Sharpe": "{:.2f}", "Sortino": "{:.2f}",
-            "Max DD %": "{:.2f}", "Calmar": "{:.2f}", "Beta (vs bench)": "{:.2f}",
-            "R² (vs bench)": "{:.2f}", "Tracking error %": "{:.2f}", "Information ratio": "{:.2f}",
-        }
-
-        def _highlight_cells(val, col):
-            try:
-                v = float(val)
-            except:
-                return ""
-            if col == "Sharpe":
-                return "background-color: #d1fae5" if v >= 2 else ("background-color: #fef9c3" if v >= 1 else "background-color: #fee2e2")
-            if col == "Max DD %":
-                return "background-color: #d1fae5" if v > -15 else ("background-color: #fef9c3" if v > -30 else "background-color: #fee2e2")
-            if col == "Beta (vs bench)":
-                return "background-color: #d1fae5" if v < 0.7 else ("background-color: #fef9c3" if v <= 1.2 else "background-color: #fee2e2")
-            if col == "R² (vs bench)":
-                return "background-color: #d1fae5" if v < 0.5 else ("background-color: #fef9c3" if v < 0.8 else "background-color: #fee2e2")
-            return ""
-
-        sty = df_metrics.style.format(fmt, na_rep="")\
-            .apply(lambda s: [_highlight_cells(v, s.name) for v in s], axis=0, subset=["Sharpe","Max DD %","Beta (vs bench)","R² (vs bench)"])
-
-        st.dataframe(sty, use_container_width=True, hide_index=True)
-
-        # --- Rolling correlation (optionnel)
-        with st.expander("📈 Rolling correlation (126 jours) vs benchmark"):
-            win = 126
-            roll_df = pd.DataFrame({
-                nm: rets[nm].rolling(win).corr(bench_ret) for nm in rets.columns if nm != bench_name
-            }).dropna(how="all")
-            if not roll_df.empty:
-                fig_roll = px.line(roll_df, title=f"Rolling corr {win} jours vs {bench_name}")
-                st.plotly_chart(fig_roll, use_container_width=True)
-            else:
-                st.info("Historique insuffisant pour la rolling correlation.")
-
-        # --- Glossaire express
-        with st.expander("ℹ️ Glossaire (ultra-court)"):
+    with right:
+        st.markdown("### 🧭 Lecture rapide")
+        if cs["min"] and cs["max"]:
+            fmin1, fmin2, vmin = cs["min"]
+            fmax1, fmax2, vmax = cs["max"]
             st.markdown(
-                "- **Sharpe** (>1 bien, >2 excellent) : rendement par unité de risque total.\n"
-                "- **Sortino** : comme Sharpe mais ne pénalise que les baisses.\n"
-                "- **Max Drawdown** : pire baisse historique (plus c'est proche de 0 %, mieux c'est).\n"
-                "- **Beta** (~1 = comme le bench ; <0,7 défensif ; >1,2 agressif).\n"
-                "- **R²** (proximité au bench) : <0,5 = diversifiant ; >0,8 = suit fortement le bench.\n"
-                "- **Tracking Error** : écart-type au bench (bas = suit de près).\n"
-                "- **Information Ratio** : surperformance ajustée du TE (>0,5 bien, >0,75 très bien)."
+                f"- **Paire la moins corrélée** : **{fmin1} / {fmin2}** → {vmin:.2f} → {_label_corr(vmin)} ✅\n"
+                f"- **Paire la plus corrélée** : **{fmax1} / {fmax2}** → {vmax:.2f} → {_label_corr(vmax)}\n"
+                f"- **Corrélation moyenne du panier** : {cs['avg']:.2f} → {_label_corr(cs['avg'])}"
             )
+            if vmin < 0.30:
+                st.success("👉 Au moins une paire faiblement corrélée : **bonne diversification**.")
+            if vmax > 0.70:
+                st.warning("⚠️ Une paire très corrélée : **redondance** possible.")
+        else:
+            st.info("Sélectionne au moins 2 fonds pour analyser la corrélation.")
+
+    # --- Tableau indicateurs (vs benchmark propre à CHAQUE fonds)
+    st.subheader("📊 Indicateurs annualisés — vs benchmark du fonds")
+    rows = []
+    for nm in rets.columns:
+        r = rets[nm].dropna()
+        if r.empty:
+            continue
+
+        # Benchmark label & prix
+        bench_label = df_univ.loc[df_univ["name"] == nm, "benchmark"].iloc[0]
+        b_price = get_benchmark_prices(bench_label, tail_days=tail_days_q)
+        if b_price.empty:
+            # si le libellé composite n'est pas dans le dict, essaye de découper
+            if "50%" in bench_label and "World" in bench_label and "Aggregate" in bench_label:
+                b_price = get_benchmark_prices("50% MSCI World / 50% Euro Aggregate Bond", tail_days=tail_days_q)
+        b_ret = _to_returns(pd.DataFrame({bench_label: b_price}))[bench_label] if not b_price.empty else pd.Series(dtype=float)
+
+        ann_ret = _annualized_return(r)
+        ann_vol = _annualized_vol(r)
+        sharpe = (ann_ret - rf_annual_pct/100.0) / ann_vol if ann_vol and ann_vol > 0 else np.nan
+        dd = _downside_dev(r, rf_daily=rf_daily)
+        sortino = (ann_ret - rf_annual_pct/100.0) / (dd * np.sqrt(TRADING_DAYS)) if dd and dd > 0 else np.nan
+        mdd = _max_drawdown(prices[nm].dropna())
+        calmar = ann_ret / abs(mdd) if mdd and mdd < 0 else np.nan
+
+        beta = alpha_d = r2 = te = ir = np.nan
+        if not b_ret.empty:
+            beta, alpha_d, r2 = _beta_alpha_r2(r, b_ret)
+            te = _tracking_error(r, b_ret)
+            ir = _information_ratio(r, b_ret)
+
+        # badges pédagogiques
+        def badge_sharpe(x):
+            if np.isnan(x): return "—"
+            if x >= 2:  return "🟢 excellent (≥2)"
+            if x >= 1:  return "🟡 correct (≥1)"
+            return "🔴 faible (<1)"
+        def badge_beta(x):
+            if np.isnan(x): return "—"
+            if x < 0.7:    return "🟢 défensif (<0,7)"
+            if x <= 1.2:   return "🟡 proche marché (~1)"
+            return "🔴 agressif (>1,2)"
+        def badge_r2(x):
+            if np.isnan(x): return "—"
+            if x >= 0.80:  return "🔴 très corrélé au bench (≥0,80)"
+            if x >= 0.50:  return "🟡 corrélation modérée"
+            return "🟢 faible corrélation (diversifiant)"
+        def badge_mdd(x):
+            if np.isnan(x): return "—"
+            if x > -15/100:   return "🟢 drawdown contenu"
+            if x > -30/100:   return "🟡 drawdown moyen"
+            return "🔴 drawdown élevé"
+
+        rows.append({
+            "Fonds": nm,
+            "Benchmark": bench_label,
+            "Perf ann. %": ann_ret*100.0,
+            "Vol ann. %": ann_vol*100.0,
+            "Sharpe": sharpe,
+            "Sortino": sortino,
+            "Max DD %": mdd*100.0 if pd.notna(mdd) else np.nan,
+            "Calmar": calmar,
+            "Beta vs bench": beta,
+            "R² vs bench": r2,
+            "Tracking error %": te*100.0 if pd.notna(te) else np.nan,
+            "Information ratio": ir,
+            # lectures
+            "Lecture Sharpe": badge_sharpe(sharpe),
+            "Lecture Beta": badge_beta(beta),
+            "Lecture R²": badge_r2(r2),
+            "Lecture Drawdown": badge_mdd(mdd),
+        })
+
+    df_metrics = pd.DataFrame(rows)
+
+    # format + couleurs
+    fmt = {
+        "Perf ann. %": "{:.2f}", "Vol ann. %": "{:.2f}", "Sharpe": "{:.2f}", "Sortino": "{:.2f}",
+        "Max DD %": "{:.2f}", "Calmar": "{:.2f}", "Beta vs bench": "{:.2f}",
+        "R² vs bench": "{:.2f}", "Tracking error %": "{:.2f}", "Information ratio": "{:.2f}",
+    }
+    def _hl(val, col):
+        try: v = float(val)
+        except: return ""
+        if col == "Sharpe":
+            return "background-color: #d1fae5" if v >= 2 else ("background-color: #fef9c3" if v >= 1 else "background-color: #fee2e2")
+        if col == "Max DD %":
+            return "background-color: #d1fae5" if v > -15 else ("background-color: #fef9c3" if v > -30 else "background-color: #fee2e2")
+        if col == "Beta vs bench":
+            return "background-color: #d1fae5" if v < 0.7 else ("background-color: #fef9c3" if v <= 1.2 else "background-color: #fee2e2")
+        if col == "R² vs bench":
+            return "background-color: #d1fae5" if v < 0.5 else ("background-color: #fef9c3" if v < 0.8 else "background-color: #fee2e2")
+        return ""
+
+    st.dataframe(
+        df_metrics.style.format(fmt, na_rep="")
+                  .apply(lambda s: [_hl(v, s.name) for v in s], axis=0,
+                         subset=["Sharpe","Max DD %","Beta vs bench","R² vs bench"]),
+        use_container_width=True, hide_index=True
+    )
+
+    # Rolling corr vs benchmark propre à chaque fonds (option)
+    with st.expander("📈 Rolling corr (126 jours) vs benchmark du fonds"):
+        win = 126
+        plots = []
+        for nm in rets.columns:
+            bench_label = df_univ.loc[df_univ["name"] == nm, "benchmark"].iloc[0]
+            b_price = get_benchmark_prices(bench_label, tail_days=tail_days_q)
+            if b_price.empty or nm not in rets.columns:
+                continue
+            b_ret = _to_returns(pd.DataFrame({bench_label: b_price}))[bench_label]
+            r = rets[nm].dropna()
+            rc = r.rolling(win).corr(b_ret)
+            if rc.dropna().empty:
+                continue
+            plots.append(pd.DataFrame({f"{nm} vs {bench_label}": rc}))
+        if plots:
+            fig_rc = px.line(pd.concat(plots, axis=1), title=f"Rolling corr {win} jours vs benchmarks")
+            st.plotly_chart(fig_rc, use_container_width=True)
+        else:
+            st.info("Historique insuffisant pour la rolling corr.")
+else:
+    st.info("Sélectionne des fonds/ETF puis lance l’analyse pour afficher les indicateurs.")
+
+# --- Glossaire express (inchangé)
+with st.expander("ℹ️ Glossaire (ultra-court)"):
+    st.markdown(
+        "- **Sharpe** (>1 bien, >2 excellent) : rendement par unité de risque total.\n"
+        "- **Sortino** : comme Sharpe mais ne pénalise que les baisses.\n"
+        "- **Max Drawdown** : pire baisse historique (plus c'est proche de 0 %, mieux c'est).\n"
+        "- **Beta** (~1 = comme le bench ; <0,7 défensif ; >1,2 agressif).\n"
+        "- **R²** (proximité au bench) : <0,5 = diversifiant ; >0,8 = suit fortement le bench.\n"
+        "- **Tracking Error** : écart-type au bench (bas = suit de près).\n"
+        "- **Information Ratio** : surperformance ajustée du TE (>0,5 bien, >0,75 très bien)."
+    )

@@ -420,9 +420,8 @@ st.divider()
 st.caption("Méthode ISIN → Exchange (via /search) → /eod daily + fallback mensuel. "
            "Perfs: 1M, YTD, 1Y, 3Y, 5Y, 8Y, 10Y. Format monétaire européen.")
 
-
 # =========================================
-# 12) INDICATEURS QUANTITATIFS (EODHD)
+# 12) INDICATEURS QUANTITATIFS — EODHD (corrélation, vol, Sharpe, Beta, R², etc.)
 # =========================================
 import numpy as np
 import pandas as pd
@@ -432,179 +431,187 @@ TRADING_DAYS = 252
 
 def _get_close_series_by_name(name: str, tail_days: int = 2500) -> pd.Series:
     """
-    Récupère la série de clôture (pd.Series) pour un 'name' de l'UNIVERSE
-    en s'appuyant sur les helpers EODHD déjà présents :
+    Récupère la série de clôture (Series) d'un fonds/ETF sélectionné (par 'name' de l'UNIVERSE)
+    en s'appuyant sur EODHD:
       - eodhd_symbol_candidates_from_isin(isin)
-      - eodhd_prices_daily_safe(candidates, days=...)
-    Renvoie une Series indexée par date (UTC-naive), name = short symbol ou nom.
+      - eodhd_prices_safe(candidates, period='d', tail_days=...)
+    Retour: pd.Series indexée par date (UTC-naive), name = symbole retenu.
     """
-    row = df_univ.loc[df_univ["name"] == name].iloc[0].to_dict()
-    isin = row.get("isin")
+    row = df_univ.loc[df_univ["name"] == name]
+    if row.empty:
+        return pd.Series(dtype=float)
+    isin = row.iloc[0].get("isin")
     if not isin:
         return pd.Series(dtype=float)
 
-    cands = eodhd_symbol_candidates_from_isin(isin)
-    df, ok_sym, _, _ = eodhd_prices_daily_safe(cands, days=tail_days)
-    if df.empty:
+    candidates = eodhd_symbol_candidates_from_isin(isin)
+    df, ok_sym, _, _ = eodhd_prices_safe(candidates, period="d", tail_days=tail_days)
+    if df.empty or "Close" not in df.columns:
         return pd.Series(dtype=float)
     s = df["Close"].copy()
     s.name = ok_sym or name
     return s
 
-def to_returns(price_df: pd.DataFrame) -> pd.DataFrame:
-    """Log-returns ou simples returns ? Ici returns simples pour ratios usuels."""
+def _to_returns(price_df: pd.DataFrame) -> pd.DataFrame:
+    """Rendements simples quotidiens (pct_change)."""
     return price_df.pct_change().dropna(how="all")
 
-def annualized_return(ret: pd.Series) -> float:
-    """Perf annualisée à partir de ret quotidiennes."""
+def _annualized_return(ret: pd.Series) -> float:
+    """Perf annualisée à partir des ret. quotidiennes."""
+    if ret.empty:
+        return np.nan
     mean_daily = ret.mean()
     return (1 + mean_daily) ** TRADING_DAYS - 1
 
-def annualized_vol(ret: pd.Series) -> float:
+def _annualized_vol(ret: pd.Series) -> float:
+    if ret.empty:
+        return np.nan
     return ret.std(ddof=0) * np.sqrt(TRADING_DAYS)
 
-def downside_dev(ret: pd.Series, rf_daily: float = 0.0) -> float:
+def _downside_dev(ret: pd.Series, rf_daily: float = 0.0) -> float:
     """Écart-type des ret < rf (downside), non annualisé."""
+    if ret.empty:
+        return 0.0
     dd = ret[ret < rf_daily] - rf_daily
     if dd.empty:
         return 0.0
     return dd.std(ddof=0)
 
-def max_drawdown(price: pd.Series) -> float:
-    """Max drawdown en % (négatif)."""
+def _max_drawdown(price: pd.Series) -> float:
+    """Max drawdown en niveau (% négatif)."""
+    if price.empty:
+        return np.nan
     cummax = price.cummax()
     dd = price / cummax - 1.0
     return float(dd.min()) if not dd.empty else np.nan
 
-def beta_alpha_r2(ret_fund: pd.Series, ret_bench: pd.Series) -> tuple[float, float, float]:
-    """Beta/Alpha (quotidien) + R^2 (corr^2)."""
+def _beta_alpha_r2(ret_fund: pd.Series, ret_bench: pd.Series) -> tuple[float, float, float]:
+    """
+    Beta/Alpha (quotidien) + R² (corr²) par covariance/variance.
+    Alpha renvoyé au pas quotidien (non annualisé).
+    """
     aligned = pd.concat([ret_fund, ret_bench], axis=1, join="inner").dropna()
     if aligned.shape[0] < 30:
         return np.nan, np.nan, np.nan
-    rf = aligned.iloc[:,0]; rb = aligned.iloc[:,1]
+    rf = aligned.iloc[:, 0]
+    rb = aligned.iloc[:, 1]
     var_b = rb.var(ddof=0)
-    cov_fb = np.cov(rf, rb, ddof=0)[0,1]
-    if var_b == 0:
+    if var_b == 0 or np.isnan(var_b):
         return np.nan, np.nan, np.nan
+    cov_fb = np.cov(rf, rb, ddof=0)[0, 1]
     beta = cov_fb / var_b
     alpha_daily = (rf - beta * rb).mean()
-    r2 = np.corrcoef(rf, rb)[0,1] ** 2
-    return float(beta), float(alpha_daily), float(r2)
+    r2 = float(np.corrcoef(rf, rb)[0, 1] ** 2)
+    return float(beta), float(alpha_daily), r2
 
-def tracking_error(ret_fund: pd.Series, ret_bench: pd.Series) -> float:
+def _tracking_error(ret_fund: pd.Series, ret_bench: pd.Series) -> float:
     diff = (ret_fund - ret_bench).dropna()
-    return diff.std(ddof=0) * np.sqrt(TRADING_DAYS) if not diff.empty else np.nan
+    if diff.empty:
+        return np.nan
+    return diff.std(ddof=0) * np.sqrt(TRADING_DAYS)
 
-def information_ratio(ret_fund: pd.Series, ret_bench: pd.Series) -> float:
-    ann_excess = annualized_return(ret_fund) - annualized_return(ret_bench)
-    te = tracking_error(ret_fund, ret_bench)
+def _information_ratio(ret_fund: pd.Series, ret_bench: pd.Series) -> float:
+    ann_excess = _annualized_return(ret_fund) - _annualized_return(ret_bench)
+    te = _tracking_error(ret_fund, ret_bench)
     return ann_excess / te if te and te > 0 else np.nan
 
-st.header("📐 Indicateurs quantitatifs (prix EOD EODHD)")
+st.header("📐 Indicateurs quantitatifs (basés sur les prix EOD EODHD)")
 
 if choices:
-    # --- Sélecteurs quant ---
+    # --- Paramètres quant ---
     colq1, colq2, colq3 = st.columns(3)
     with colq1:
-        bench_name = st.selectbox("Benchmark (pour Beta / R² / TE / IR)",
-                                  options=choices, index=0)
+        bench_name = st.selectbox("Benchmark (pour Beta / R² / TE / IR)", options=choices, index=0)
     with colq2:
-        rf_annual_pct = st.number_input("Taux sans risque annualisé (%)", value=0.0, step=0.1)
+        rf_annual_pct = st.number_input("Taux sans risque annualisé (%)", value=0.0, step=0.10, format="%.2f")
     with colq3:
-        tail_days_q = st.slider("Fenêtre historique (jours ouvrés)", 252, 2500, 1500, 63)
+        tail_days_q = st.slider("Fenêtre historique (jours ouvrés)", min_value=252, max_value=2500, value=1500, step=63)
 
-    rf_daily = (1 + rf_annual_pct/100.0) ** (1/ TRADING_DAYS) - 1
+    rf_daily = (1 + rf_annual_pct / 100.0) ** (1 / TRADING_DAYS) - 1
 
-    # --- Télécharge prix & aligne
-    price_map = {}
+    # --- Téléchargement prix (EODHD) & alignement
+    price_map: dict[str, pd.Series] = {}
     for nm in choices:
         s = _get_close_series_by_name(nm, tail_days=tail_days_q)
         if not s.empty:
             price_map[nm] = s
 
     if len(price_map) < 2:
-        st.warning("Il faut au moins 2 séries de prix pour corrélations et comparaisons.")
+        st.warning("⚠️ Sélectionne au moins 2 fonds/ETF pour calculer corrélations et comparaisons.")
     else:
-        prices = pd.concat(price_map, axis=1)  # Multi-column DF
-        prices.columns = choices  # ordre visuel
-        prices = prices.dropna(how="all")
-        rets = to_returns(prices)
+        prices = pd.concat(price_map, axis=1).dropna(how="all")
+        # Conserver l'ordre d'affichage des 'choices'
+        prices = prices.reindex(columns=[c for c in choices if c in prices.columns])
+        rets = _to_returns(prices)
 
         # --- Matrice de corrélation
-        corr = rets.corr()
         st.subheader("🔗 Corrélation (quotidienne)")
-        st.dataframe(corr.style.format("{:.2f}"), use_container_width=True)
+        corr = rets.corr()
+        st.dataframe(corr.style.format("{:.2f}"), use_container_width=True, hide_index=True)
         fig_corr = px.imshow(corr, text_auto=True, aspect="auto", title="Matrice de corrélation")
         st.plotly_chart(fig_corr, use_container_width=True)
 
-        # --- Benchmark ret
-        bench_ret = rets[bench_name].dropna()
+        # --- Benchmark (retours)
+        if bench_name not in rets.columns:
+            st.error("Benchmark introuvable dans les retours calculés.")
+        else:
+            bench_ret = rets[bench_name].dropna()
 
-        # --- Tableau récap indicateurs
-        rows = []
-        for nm in choices:
-            r = rets[nm].dropna()
-            if r.empty:
-                continue
-            ann_ret = annualized_return(r)
-            ann_vol = annualized_vol(r)
-            sharpe = (ann_ret - rf_annual_pct/100.0) / ann_vol if ann_vol > 0 else np.nan
-            dd = downside_dev(r, rf_daily=rf_daily)
-            sortino = (ann_ret - rf_annual_pct/100.0) / (dd * np.sqrt(TRADING_DAYS)) if dd and dd > 0 else np.nan
-            mdd = max_drawdown(prices[nm].dropna())
-            calmar = ann_ret / abs(mdd) if mdd < 0 else np.nan
+            # --- Tableau des indicateurs
+            rows = []
+            for nm in rets.columns:
+                r = rets[nm].dropna()
+                if r.empty:
+                    continue
+                ann_ret = _annualized_return(r)
+                ann_vol = _annualized_vol(r)
+                sharpe = (ann_ret - rf_annual_pct / 100.0) / ann_vol if ann_vol and ann_vol > 0 else np.nan
+                dd = _downside_dev(r, rf_daily=rf_daily)
+                sortino = (ann_ret - rf_annual_pct / 100.0) / (dd * np.sqrt(TRADING_DAYS)) if dd and dd > 0 else np.nan
+                mdd = _max_drawdown(prices[nm].dropna())
+                calmar = ann_ret / abs(mdd) if mdd and mdd < 0 else np.nan
 
-            beta = alpha_d = r2 = te = ir = np.nan
-            if nm != bench_name and not bench_ret.empty:
-                beta, alpha_d, r2 = beta_alpha_r2(r, bench_ret)
-                te = tracking_error(r, bench_ret)
-                ir = information_ratio(r, bench_ret)
+                beta = alpha_d = r2 = te = ir = np.nan
+                if nm != bench_name and not bench_ret.empty:
+                    beta, alpha_d, r2 = _beta_alpha_r2(r, bench_ret)
+                    te = _tracking_error(r, bench_ret)
+                    ir = _information_ratio(r, bench_ret)
 
-            rows.append({
-                "Fonds": nm,
-                "Perf ann. %": ann_ret*100,
-                "Vol ann. %": ann_vol*100,
-                "Sharpe": sharpe,
-                "Sortino": sortino,
-                "Max DD %": mdd*100,
-                "Calmar": calmar,
-                "Beta (vs bench)": beta,
-                "R² (vs bench)": r2,
-                "Tracking error %": te*100 if pd.notna(te) else np.nan,
-                "Info ratio": ir,
-            })
+                rows.append({
+                    "Fonds": nm,
+                    "Perf ann. %": ann_ret * 100.0,
+                    "Vol ann. %": ann_vol * 100.0,
+                    "Sharpe": sharpe,
+                    "Sortino": sortino,
+                    "Max DD %": mdd * 100.0 if pd.notna(mdd) else np.nan,
+                    "Calmar": calmar,
+                    "Beta (vs bench)": beta,
+                    "R² (vs bench)": r2,
+                    "Tracking error %": te * 100.0 if pd.notna(te) else np.nan,
+                    "Information ratio": ir,
+                })
 
-        df_metrics = pd.DataFrame(rows)
+            df_metrics = pd.DataFrame(rows)
 
-        # format
-        pct_cols = ["Perf ann. %","Vol ann. %","Max DD %","Tracking error %"]
-        df_metrics[pct_cols] = df_metrics[pct_cols].apply(pd.to_numeric, errors="coerce")
-        sty = df_metrics.style.format({
-            "Perf ann. %": "{:.2f}",
-            "Vol ann. %": "{:.2f}",
-            "Sharpe": "{:.2f}",
-            "Sortino": "{:.2f}",
-            "Max DD %": "{:.2f}",
-            "Calmar": "{:.2f}",
-            "Beta (vs bench)": "{:.2f}",
-            "R² (vs bench)": "{:.2f}",
-            "Tracking error %": "{:.2f}",
-            "Info ratio": "{:.2f}",
-        }, na_rep="")
+            # --- Formatage
+            fmt = {
+                "Perf ann. %": "{:.2f}", "Vol ann. %": "{:.2f}", "Sharpe": "{:.2f}", "Sortino": "{:.2f}",
+                "Max DD %": "{:.2f}", "Calmar": "{:.2f}", "Beta (vs bench)": "{:.2f}",
+                "R² (vs bench)": "{:.2f}", "Tracking error %": "{:.2f}", "Information ratio": "{:.2f}",
+            }
+            st.subheader("📊 Indicateurs annualisés")
+            st.dataframe(df_metrics.style.format(fmt, na_rep=""), use_container_width=True, hide_index=True)
 
-        st.subheader("📊 Tableau des indicateurs (annualisés)")
-        st.dataframe(sty, use_container_width=True, hide_index=True)
-
-        # --- Rolling correlation (optionnel)
-        with st.expander("📈 Rolling correlation (126j) vs benchmark"):
-            win = 126
-            if bench_name in rets.columns:
+            # --- Rolling correlation (optionnel)
+            with st.expander("📈 Rolling correlation (126 jours) vs benchmark"):
+                win = 126
                 roll_df = pd.DataFrame({
                     nm: rets[nm].rolling(win).corr(bench_ret) for nm in rets.columns if nm != bench_name
-                })
-                fig_roll = px.line(roll_df, title=f"Rolling corr {win} jours vs {bench_name}")
-                st.plotly_chart(fig_roll, use_container_width=True)
-            else:
-                st.info("Benchmark introuvable dans les retours.")
+                }).dropna(how="all")
+                if not roll_df.empty:
+                    fig_roll = px.line(roll_df, title=f"Rolling corr {win} jours vs {bench_name}")
+                    st.plotly_chart(fig_roll, use_container_width=True)
+                else:
+                    st.info("Historique insuffisant pour la rolling correlation.")
 else:
-    st.info("Sélectionne des fonds dans le sélecteur au-dessus pour calculer les indicateurs.")
+    st.info("Sélectionne des fonds/ETF puis lance l’analyse pour afficher les indicateurs.")

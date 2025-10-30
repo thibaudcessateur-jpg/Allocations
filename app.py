@@ -591,27 +591,167 @@ if choices:
                     "Information ratio": ir,
                 })
 
-            df_metrics = pd.DataFrame(rows)
+                   # --- Matrice de corrélation
+        st.subheader("🔗 Corrélation (quotidienne)")
+        corr = rets.corr()
 
-            # --- Formatage
-            fmt = {
-                "Perf ann. %": "{:.2f}", "Vol ann. %": "{:.2f}", "Sharpe": "{:.2f}", "Sortino": "{:.2f}",
-                "Max DD %": "{:.2f}", "Calmar": "{:.2f}", "Beta (vs bench)": "{:.2f}",
-                "R² (vs bench)": "{:.2f}", "Tracking error %": "{:.2f}", "Information ratio": "{:.2f}",
-            }
-            st.subheader("📊 Indicateurs annualisés")
-            st.dataframe(df_metrics.style.format(fmt, na_rep=""), use_container_width=True, hide_index=True)
+        # Résumé lisible de la corrélation
+        def _corr_summary(corr_df: pd.DataFrame) -> dict:
+            c = corr_df.copy()
+            # on ne garde que le triangle supérieur sans diagonale
+            mask = np.triu(np.ones(c.shape), k=1).astype(bool)
+            pairs = []
+            cols = c.columns.tolist()
+            for i in range(len(cols)):
+                for j in range(i+1, len(cols)):
+                    pairs.append((cols[i], cols[j], float(c.iloc[i, j])))
+            if not pairs:
+                return {"avg": np.nan, "min": None, "max": None}
+            avg = float(np.mean([p[2] for p in pairs]))
+            min_pair = min(pairs, key=lambda x: x[2])
+            max_pair = max(pairs, key=lambda x: x[2])
+            return {"avg": avg, "min": min_pair, "max": max_pair}
 
-            # --- Rolling correlation (optionnel)
-            with st.expander("📈 Rolling correlation (126 jours) vs benchmark"):
-                win = 126
-                roll_df = pd.DataFrame({
-                    nm: rets[nm].rolling(win).corr(bench_ret) for nm in rets.columns if nm != bench_name
-                }).dropna(how="all")
-                if not roll_df.empty:
-                    fig_roll = px.line(roll_df, title=f"Rolling corr {win} jours vs {bench_name}")
-                    st.plotly_chart(fig_roll, use_container_width=True)
-                else:
-                    st.info("Historique insuffisant pour la rolling correlation.")
-else:
-    st.info("Sélectionne des fonds/ETF puis lance l’analyse pour afficher les indicateurs.")
+        cs = _corr_summary(corr)
+        # Interprétation simple
+        def _label_corr(v: float) -> str:
+            if np.isnan(v): return "n/a"
+            if v < 0.0:       return "négative (diversifiante)"
+            if v < 0.30:      return "faible (très diversifiante)"
+            if v < 0.70:      return "modérée"
+            return "forte (peu diversifiante)"
+
+        left, right = st.columns([1,1])
+        with left:
+            st.dataframe(corr.style.format("{:.2f}"), use_container_width=True, hide_index=True)
+        with right:
+            st.markdown("### 🧭 Lecture rapide")
+            if cs["min"] and cs["max"]:
+                fmin1, fmin2, vmin = cs["min"]
+                fmax1, fmax2, vmax = cs["max"]
+                st.markdown(
+                    f"- **Paire la moins corrélée** : **{fmin1} / {fmin2}** → {vmin:.2f} → {_label_corr(vmin)} ✅\n"
+                    f"- **Paire la plus corrélée** : **{fmax1} / {fmax2}** → {vmax:.2f} → {_label_corr(vmax)}\n"
+                    f"- **Corrélation moyenne du panier** : {cs['avg']:.2f} → {_label_corr(cs['avg'])}"
+                )
+                if vmin < 0.30:
+                    st.success("👉 Au moins une paire faiblement corrélée : **bonne diversification**.")
+                if vmax > 0.70:
+                    st.warning("⚠️ Une paire très corrélée : **redondance** possible.")
+            else:
+                st.info("Sélectionne au moins 2 fonds pour analyser la corrélation.")
+
+        # --- Tableau des indicateurs
+        rows = []
+        for nm in rets.columns:
+            r = rets[nm].dropna()
+            if r.empty:
+                continue
+            ann_ret = _annualized_return(r)
+            ann_vol = _annualized_vol(r)
+            sharpe = (ann_ret - rf_annual_pct / 100.0) / ann_vol if ann_vol and ann_vol > 0 else np.nan
+            dd = _downside_dev(r, rf_daily=rf_daily)
+            sortino = (ann_ret - rf_annual_pct / 100.0) / (dd * np.sqrt(TRADING_DAYS)) if dd and dd > 0 else np.nan
+            mdd = _max_drawdown(prices[nm].dropna())
+            calmar = ann_ret / abs(mdd) if mdd and mdd < 0 else np.nan
+
+            beta = alpha_d = r2 = te = ir = np.nan
+            if nm != bench_name and not bench_ret.empty:
+                beta, alpha_d, r2 = _beta_alpha_r2(r, bench_ret)
+                te = _tracking_error(r, bench_ret)
+                ir = _information_ratio(r, bench_ret)
+
+            # -------- Lecture pédagogique (badges) --------
+            def badge_sharpe(x):
+                if np.isnan(x): return "—"
+                if x >= 2:  return "🟢 excellent (≥2)"
+                if x >= 1:  return "🟡 correct (≥1)"
+                return "🔴 faible (<1)"
+            def badge_beta(x):
+                if np.isnan(x): return "—"
+                if x < 0.7:    return "🟢 défensif (<0,7)"
+                if x <= 1.2:   return "🟡 proche marché (~1)"
+                return "🔴 agressif (>1,2)"
+            def badge_r2(x):
+                if np.isnan(x): return "—"
+                if x >= 0.80:  return "🔴 très corrélé au bench (≥0,80)"
+                if x >= 0.50:  return "🟡 corrélation modérée"
+                return "🟢 faible corrélation (diversifiant)"
+            def badge_mdd(x):
+                if np.isnan(x): return "—"
+                if x > -15/100:   return "🟢 drawdown contenu"
+                if x > -30/100:   return "🟡 drawdown moyen"
+                return "🔴 drawdown élevé"
+
+            rows.append({
+                "Fonds": nm,
+                "Perf ann. %": ann_ret*100.0,
+                "Vol ann. %": ann_vol*100.0,
+                "Sharpe": sharpe,
+                "Sortino": sortino,
+                "Max DD %": mdd*100.0 if pd.notna(mdd) else np.nan,
+                "Calmar": calmar,
+                "Beta (vs bench)": beta,
+                "R² (vs bench)": r2,
+                "Tracking error %": te*100.0 if pd.notna(te) else np.nan,
+                "Information ratio": ir,
+                # Lectures
+                "Lecture Sharpe": badge_sharpe(sharpe),
+                "Lecture Beta": badge_beta(beta),
+                "Lecture R²": badge_r2(r2),
+                "Lecture Drawdown": badge_mdd(mdd),
+            })
+
+        df_metrics = pd.DataFrame(rows)
+
+        # --- Formatage + mise en couleur douce
+        st.subheader("📊 Indicateurs annualisés — **avec lecture rapide**")
+        fmt = {
+            "Perf ann. %": "{:.2f}", "Vol ann. %": "{:.2f}", "Sharpe": "{:.2f}", "Sortino": "{:.2f}",
+            "Max DD %": "{:.2f}", "Calmar": "{:.2f}", "Beta (vs bench)": "{:.2f}",
+            "R² (vs bench)": "{:.2f}", "Tracking error %": "{:.2f}", "Information ratio": "{:.2f}",
+        }
+
+        def _highlight_cells(val, col):
+            try:
+                v = float(val)
+            except:
+                return ""
+            if col == "Sharpe":
+                return "background-color: #d1fae5" if v >= 2 else ("background-color: #fef9c3" if v >= 1 else "background-color: #fee2e2")
+            if col == "Max DD %":
+                return "background-color: #d1fae5" if v > -15 else ("background-color: #fef9c3" if v > -30 else "background-color: #fee2e2")
+            if col == "Beta (vs bench)":
+                return "background-color: #d1fae5" if v < 0.7 else ("background-color: #fef9c3" if v <= 1.2 else "background-color: #fee2e2")
+            if col == "R² (vs bench)":
+                return "background-color: #d1fae5" if v < 0.5 else ("background-color: #fef9c3" if v < 0.8 else "background-color: #fee2e2")
+            return ""
+
+        sty = df_metrics.style.format(fmt, na_rep="")\
+            .apply(lambda s: [_highlight_cells(v, s.name) for v in s], axis=0, subset=["Sharpe","Max DD %","Beta (vs bench)","R² (vs bench)"])
+
+        st.dataframe(sty, use_container_width=True, hide_index=True)
+
+        # --- Rolling correlation (optionnel)
+        with st.expander("📈 Rolling correlation (126 jours) vs benchmark"):
+            win = 126
+            roll_df = pd.DataFrame({
+                nm: rets[nm].rolling(win).corr(bench_ret) for nm in rets.columns if nm != bench_name
+            }).dropna(how="all")
+            if not roll_df.empty:
+                fig_roll = px.line(roll_df, title=f"Rolling corr {win} jours vs {bench_name}")
+                st.plotly_chart(fig_roll, use_container_width=True)
+            else:
+                st.info("Historique insuffisant pour la rolling correlation.")
+
+        # --- Glossaire express
+        with st.expander("ℹ️ Glossaire (ultra-court)"):
+            st.markdown(
+                "- **Sharpe** (>1 bien, >2 excellent) : rendement par unité de risque total.\n"
+                "- **Sortino** : comme Sharpe mais ne pénalise que les baisses.\n"
+                "- **Max Drawdown** : pire baisse historique (plus c'est proche de 0 %, mieux c'est).\n"
+                "- **Beta** (~1 = comme le bench ; <0,7 défensif ; >1,2 agressif).\n"
+                "- **R²** (proximité au bench) : <0,5 = diversifiant ; >0,8 = suit fortement le bench.\n"
+                "- **Tracking Error** : écart-type au bench (bas = suit de près).\n"
+                "- **Information Ratio** : surperformance ajustée du TE (>0,5 bien, >0,75 très bien)."
+            )

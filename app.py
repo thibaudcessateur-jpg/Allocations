@@ -422,165 +422,189 @@ st.caption("Méthode ISIN → Exchange (via /search) → /eod daily + fallback m
 
 
 # =========================================
-# 11) FONDAMENTAUX — extraction robuste (multi-endpoints + filters)
+# 12) INDICATEURS QUANTITATIFS (EODHD)
 # =========================================
+import numpy as np
+import pandas as pd
 import plotly.express as px
-from collections import deque
 
-@st.cache_data(ttl=24*3600, show_spinner=False)
-def _fundamentals_try_all(symbols: List[str]) -> Dict[str, Any]:
+TRADING_DAYS = 252
+
+def _get_close_series_by_name(name: str, tail_days: int = 2500) -> pd.Series:
     """
-    Tente plusieurs appels Fundamentals pour maximiser les chances :
-      1) /fundamentals/{sym}
-      2) /fundamentals/{sym}?filter=Holdings
-      3) /fundamentals/{sym}?filter=TopHoldings
-      4) /fundamentals/{sym}?filter=ETF_Data.Holdings
-      5) /fundamentals/{sym}?filter=General,Holdings   (plus large)
-    Retourne le premier JSON non vide + un debug.
+    Récupère la série de clôture (pd.Series) pour un 'name' de l'UNIVERSE
+    en s'appuyant sur les helpers EODHD déjà présents :
+      - eodhd_symbol_candidates_from_isin(isin)
+      - eodhd_prices_daily_safe(candidates, days=...)
+    Renvoie une Series indexée par date (UTC-naive), name = short symbol ou nom.
     """
-    tried = []
-    filters = [
-        None,
-        "Holdings",
-        "TopHoldings",
-        "ETF_Data.Holdings",
-        "General,Holdings"
-    ]
-    for sym in symbols:
-        for f in filters:
-            tried.append({"symbol": sym, "filter": f})
-            try:
-                params = {}
-                if f:
-                    params["filter"] = f
-                js = eodhd_get(f"/fundamentals/{sym}", params=params)
-                if isinstance(js, dict) and js:
-                    js["_debug_fund_tried"] = tried
-                    js["_debug_fund_hit"] = {"symbol": sym, "filter": f}
-                    return js
-            except Exception:
-                continue
-    return {"_debug_fund_tried": tried, "_debug_fund_hit": None}
+    row = df_univ.loc[df_univ["name"] == name].iloc[0].to_dict()
+    isin = row.get("isin")
+    if not isin:
+        return pd.Series(dtype=float)
 
-def _first_list_for_keys(obj: Any, keys: List[str]) -> Optional[List[Dict[str, Any]]]:
-    """Cherche en profondeur la première liste trouvée sous une des clés fournies."""
-    if not isinstance(obj, (dict, list)):
-        return None
-    q = deque([obj])
-    low_keys = [k.lower() for k in keys]
-    while q:
-        cur = q.popleft()
-        if isinstance(cur, dict):
-            for k, v in cur.items():
-                if str(k).lower() in low_keys and isinstance(v, list) and v:
-                    return v
-                if isinstance(v, (dict, list)):
-                    q.append(v)
-        elif isinstance(cur, list):
-            for it in cur:
-                if isinstance(it, (dict, list)):
-                    q.append(it)
-    return None
+    cands = eodhd_symbol_candidates_from_isin(isin)
+    df, ok_sym, _, _ = eodhd_prices_daily_safe(cands, days=tail_days)
+    if df.empty:
+        return pd.Series(dtype=float)
+    s = df["Close"].copy()
+    s.name = ok_sym or name
+    return s
 
-def _norm_regions(reg_list: List[Dict[str, Any]]) -> pd.DataFrame:
-    rows = []
-    for it in reg_list:
-        name = it.get("Name") or it.get("Region") or it.get("Country") or it.get("Code")
-        w = it.get("Weight") if it.get("Weight") is not None else it.get("Percentage")
-        if name is not None and w is not None:
-            rows.append({"Name": str(name), "Weight": float(w)})
-    return pd.DataFrame(rows)
+def to_returns(price_df: pd.DataFrame) -> pd.DataFrame:
+    """Log-returns ou simples returns ? Ici returns simples pour ratios usuels."""
+    return price_df.pct_change().dropna(how="all")
 
-def _norm_asset_alloc(lst: List[Dict[str, Any]]) -> pd.DataFrame:
-    rows = []
-    for it in lst:
-        typ = it.get("Type") or it.get("Name") or it.get("AssetType") or it.get("Code")
-        v = it.get("Percentage") if it.get("Percentage") is not None else it.get("Weight")
-        if typ is not None and v is not None:
-            rows.append({"Type": str(typ), "Percentage": float(v)})
-    return pd.DataFrame(rows)
+def annualized_return(ret: pd.Series) -> float:
+    """Perf annualisée à partir de ret quotidiennes."""
+    mean_daily = ret.mean()
+    return (1 + mean_daily) ** TRADING_DAYS - 1
 
-def _norm_top_holdings(lst: List[Dict[str, Any]]) -> pd.DataFrame:
-    rows = []
-    for it in lst:
-        nm = it.get("Name") or it.get("Company") or it.get("Holding") or it.get("Code")
-        w = it.get("Weight") if it.get("Weight") is not None else it.get("Percentage")
-        if nm is not None and w is not None:
-            rows.append({"Titre": str(nm), "Poids (%)": float(w)})
-    return pd.DataFrame(rows)
+def annualized_vol(ret: pd.Series) -> float:
+    return ret.std(ddof=0) * np.sqrt(TRADING_DAYS)
 
-def _keys1(js: Dict[str, Any]) -> List[str]:
-    return sorted([k for k in js.keys() if not k.startswith("_debug")])
+def downside_dev(ret: pd.Series, rf_daily: float = 0.0) -> float:
+    """Écart-type des ret < rf (downside), non annualisé."""
+    dd = ret[ret < rf_daily] - rf_daily
+    if dd.empty:
+        return 0.0
+    return dd.std(ddof=0)
 
-st.header("📊 Composition détaillée des fonds")
+def max_drawdown(price: pd.Series) -> float:
+    """Max drawdown en % (négatif)."""
+    cummax = price.cummax()
+    dd = price / cummax - 1.0
+    return float(dd.min()) if not dd.empty else np.nan
+
+def beta_alpha_r2(ret_fund: pd.Series, ret_bench: pd.Series) -> tuple[float, float, float]:
+    """Beta/Alpha (quotidien) + R^2 (corr^2)."""
+    aligned = pd.concat([ret_fund, ret_bench], axis=1, join="inner").dropna()
+    if aligned.shape[0] < 30:
+        return np.nan, np.nan, np.nan
+    rf = aligned.iloc[:,0]; rb = aligned.iloc[:,1]
+    var_b = rb.var(ddof=0)
+    cov_fb = np.cov(rf, rb, ddof=0)[0,1]
+    if var_b == 0:
+        return np.nan, np.nan, np.nan
+    beta = cov_fb / var_b
+    alpha_daily = (rf - beta * rb).mean()
+    r2 = np.corrcoef(rf, rb)[0,1] ** 2
+    return float(beta), float(alpha_daily), float(r2)
+
+def tracking_error(ret_fund: pd.Series, ret_bench: pd.Series) -> float:
+    diff = (ret_fund - ret_bench).dropna()
+    return diff.std(ddof=0) * np.sqrt(TRADING_DAYS) if not diff.empty else np.nan
+
+def information_ratio(ret_fund: pd.Series, ret_bench: pd.Series) -> float:
+    ann_excess = annualized_return(ret_fund) - annualized_return(ret_bench)
+    te = tracking_error(ret_fund, ret_bench)
+    return ann_excess / te if te and te > 0 else np.nan
+
+st.header("📐 Indicateurs quantitatifs (prix EOD EODHD)")
 
 if choices:
-    for name in choices:
-        st.subheader(f"🔎 {name}")
-        isin = df_univ.loc[df_univ["name"] == name, "isin"].iloc[0]
-        if not isin:
-            st.warning("ISIN manquant pour ce fonds.")
-            continue
+    # --- Sélecteurs quant ---
+    colq1, colq2, colq3 = st.columns(3)
+    with colq1:
+        bench_name = st.selectbox("Benchmark (pour Beta / R² / TE / IR)",
+                                  options=choices, index=0)
+    with colq2:
+        rf_annual_pct = st.number_input("Taux sans risque annualisé (%)", value=0.0, step=0.1)
+    with colq3:
+        tail_days_q = st.slider("Fenêtre historique (jours ouvrés)", 252, 2500, 1500, 63)
 
-        # 1) Déduction des symboles candidats (ISIN.EXCHANGE puis ISIN)
-        candidates = eodhd_symbol_candidates_from_isin(isin)
+    rf_daily = (1 + rf_annual_pct/100.0) ** (1/ TRADING_DAYS) - 1
 
-        # 2) Fundamentals (multi-filters)
-        js = _fundamentals_try_all(candidates)
+    # --- Télécharge prix & aligne
+    price_map = {}
+    for nm in choices:
+        s = _get_close_series_by_name(nm, tail_days=tail_days_q)
+        if not s.empty:
+            price_map[nm] = s
 
-        # 3) Recherche tolérante des sections (on scrute plusieurs variantes)
-        top_raw = _first_list_for_keys(js, [
-            "TopHoldings", "Top_Holdings", "Top10Holdings", "HoldingsTop", "Holdings_Top"
-        ])
-        alloc_raw = _first_list_for_keys(js, [
-            "AssetAllocation", "Asset_Allocation", "AssetMix", "Allocation", "Allocations"
-        ])
-        regions_raw = _first_list_for_keys(js, [
-            "Regions", "RegionWeights", "Region_Weights",
-            "GeographicalAllocation", "CountryWeights", "Country_Weights",
-            "Geography", "Geographical", "Countries"
-        ])
+    if len(price_map) < 2:
+        st.warning("Il faut au moins 2 séries de prix pour corrélations et comparaisons.")
+    else:
+        prices = pd.concat(price_map, axis=1)  # Multi-column DF
+        prices.columns = choices  # ordre visuel
+        prices = prices.dropna(how="all")
+        rets = to_returns(prices)
 
-        df_top = _norm_top_holdings(top_raw) if top_raw else pd.DataFrame()
-        df_alloc = _norm_asset_alloc(alloc_raw) if alloc_raw else pd.DataFrame()
-        df_regions = _norm_regions(regions_raw) if regions_raw else pd.DataFrame()
+        # --- Matrice de corrélation
+        corr = rets.corr()
+        st.subheader("🔗 Corrélation (quotidienne)")
+        st.dataframe(corr.style.format("{:.2f}"), use_container_width=True)
+        fig_corr = px.imshow(corr, text_auto=True, aspect="auto", title="Matrice de corrélation")
+        st.plotly_chart(fig_corr, use_container_width=True)
 
-        c1, c2, c3 = st.columns(3)
+        # --- Benchmark ret
+        bench_ret = rets[bench_name].dropna()
 
-        # --- Col 1 : géographie ---
-        if not df_regions.empty:
-            fig_r = px.pie(df_regions, names="Name", values="Weight", title="Répartition géographique (%)")
-            c1.plotly_chart(fig_r, use_container_width=True)
-        else:
-            c1.info("Répartition géographique non disponible dans la réponse Fundamentals.")
+        # --- Tableau récap indicateurs
+        rows = []
+        for nm in choices:
+            r = rets[nm].dropna()
+            if r.empty:
+                continue
+            ann_ret = annualized_return(r)
+            ann_vol = annualized_vol(r)
+            sharpe = (ann_ret - rf_annual_pct/100.0) / ann_vol if ann_vol > 0 else np.nan
+            dd = downside_dev(r, rf_daily=rf_daily)
+            sortino = (ann_ret - rf_annual_pct/100.0) / (dd * np.sqrt(TRADING_DAYS)) if dd and dd > 0 else np.nan
+            mdd = max_drawdown(prices[nm].dropna())
+            calmar = ann_ret / abs(mdd) if mdd < 0 else np.nan
 
-        # --- Col 2 : classes d'actifs ---
-        if not df_alloc.empty:
-            fig_a = px.pie(df_alloc, names="Type", values="Percentage", title="Répartition par classe d’actifs (%)")
-            c2.plotly_chart(fig_a, use_container_width=True)
-        else:
-            c2.info("Répartition par classe d’actifs non disponible dans la réponse Fundamentals.")
+            beta = alpha_d = r2 = te = ir = np.nan
+            if nm != bench_name and not bench_ret.empty:
+                beta, alpha_d, r2 = beta_alpha_r2(r, bench_ret)
+                te = tracking_error(r, bench_ret)
+                ir = information_ratio(r, bench_ret)
 
-        # --- Col 3 : Top 10 ---
-        if not df_top.empty:
-            c3.dataframe(df_top.head(10), use_container_width=True, hide_index=True)
-        else:
-            c3.info("Top positions non disponibles dans la réponse Fundamentals.")
+            rows.append({
+                "Fonds": nm,
+                "Perf ann. %": ann_ret*100,
+                "Vol ann. %": ann_vol*100,
+                "Sharpe": sharpe,
+                "Sortino": sortino,
+                "Max DD %": mdd*100,
+                "Calmar": calmar,
+                "Beta (vs bench)": beta,
+                "R² (vs bench)": r2,
+                "Tracking error %": te*100 if pd.notna(te) else np.nan,
+                "Info ratio": ir,
+            })
 
-        # --- Debug utile si rien ne remonte ---
-        if debug_mode:
-            with st.expander("🔧 Debug Fundamentals (EODHD)", expanded=False):
-                st.write({
-                    "candidates": candidates,
-                    "hit": js.get("_debug_fund_hit"),
-                    "tried": js.get("_debug_fund_tried"),
-                    "top_level_keys": _keys1(js),
-                    "has_sections": {
-                        "TopHoldings": bool(top_raw),
-                        "AssetAllocation": bool(alloc_raw),
-                        "Regions/Countries": bool(regions_raw),
-                    },
-                    "sample_json_preview": {k: js[k] for k in list(js.keys())[:5] if not k.startswith("_debug")}
+        df_metrics = pd.DataFrame(rows)
+
+        # format
+        pct_cols = ["Perf ann. %","Vol ann. %","Max DD %","Tracking error %"]
+        df_metrics[pct_cols] = df_metrics[pct_cols].apply(pd.to_numeric, errors="coerce")
+        sty = df_metrics.style.format({
+            "Perf ann. %": "{:.2f}",
+            "Vol ann. %": "{:.2f}",
+            "Sharpe": "{:.2f}",
+            "Sortino": "{:.2f}",
+            "Max DD %": "{:.2f}",
+            "Calmar": "{:.2f}",
+            "Beta (vs bench)": "{:.2f}",
+            "R² (vs bench)": "{:.2f}",
+            "Tracking error %": "{:.2f}",
+            "Info ratio": "{:.2f}",
+        }, na_rep="")
+
+        st.subheader("📊 Tableau des indicateurs (annualisés)")
+        st.dataframe(sty, use_container_width=True, hide_index=True)
+
+        # --- Rolling correlation (optionnel)
+        with st.expander("📈 Rolling correlation (126j) vs benchmark"):
+            win = 126
+            if bench_name in rets.columns:
+                roll_df = pd.DataFrame({
+                    nm: rets[nm].rolling(win).corr(bench_ret) for nm in rets.columns if nm != bench_name
                 })
+                fig_roll = px.line(roll_df, title=f"Rolling corr {win} jours vs {bench_name}")
+                st.plotly_chart(fig_roll, use_container_width=True)
+            else:
+                st.info("Benchmark introuvable dans les retours.")
 else:
-    st.info("Sélectionne au moins un fonds pour afficher sa composition.")
+    st.info("Sélectionne des fonds dans le sélecteur au-dessus pour calculer les indicateurs.")

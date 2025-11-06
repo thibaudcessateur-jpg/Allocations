@@ -1,5 +1,5 @@
 # =========================================
-# app.py — Comparateur Portefeuilles CGP (focus ISIN, UI cartes)
+# app.py — Comparateur Portefeuilles CGP (focus ISIN, récupération VL robuste)
 # =========================================
 import os, re, math, requests
 from datetime import date
@@ -44,7 +44,7 @@ def to_pct(x: float) -> str:
 
 # =========================================
 # 2) EODHD CLIENT (recherche & prix)
-#     -> Stratégie "Valeris-like": ISIN-first
+#     -> Stratégie "Valeris-like": ISIN-first + fallbacks VL
 # =========================================
 EODHD_BASE = "https://eodhd.com/api"
 
@@ -82,11 +82,10 @@ def _eod_ok(sym: str) -> bool:
 def resolve_symbol(q: str) -> Optional[str]:
     """
     Résolution centrée ISIN (approche Valeris) :
-      1) Si ISIN: tester directement .EUFUND, .FUND, .USFUND (dans cet ordre).
-      2) Si échec: /search(ISIN), ne garder QUE les résultats dont l'ISIN == q.
-         - priorité aux exchanges {EUFUND, FUND, USFUND} (et on teste ISIN.EXCH puis Code).
-      3) Si nom: /search(nom), même logique (mais on vérifie que l'ISIN du résultat est bien formé).
-      4) Dernier recours pour ISIN: tenter quelques places actions (.PA, .AS, .MI, .DE, .LSE).
+      1) ISIN -> tester .EUFUND, .FUND, .USFUND
+      2) /search(ISIN) — ne garder que l’ISIN exact, priorité {EUFUND, FUND, USFUND}, tester ISIN.EXCH puis Code
+      3) Nom -> /search(nom), même logique (ISIN propre si dispo sinon Code)
+      4) Dernier recours ISIN -> suffixes actions EU (.PA, .AS, .MI, .DE, .LSE)
     """
     q = (q or "").strip()
     if not q:
@@ -100,13 +99,11 @@ def resolve_symbol(q: str) -> Optional[str]:
             if _eod_ok(cand):
                 return cand
 
-        # ---- 2) Recherche stricte sur ISIN exact
+        # ---- 2) Recherche stricte ISIN exact
         res = eod_search(base)
         if res:
             preferred = ["EUFUND", "FUND", "USFUND"]
-            # ne garder que les lignes dont l'ISIN == base
             exact = [it for it in res if str(it.get("ISIN", "")).upper() == base]
-            # d'abord essayer ISIN.EXCH pour EUFUND/FUND/USFUND
             for exch in preferred:
                 for it in exact:
                     ex = str(it.get("Exchange", "")).upper()
@@ -117,24 +114,21 @@ def resolve_symbol(q: str) -> Optional[str]:
                         code = str(it.get("Code", "")).strip()
                         if code and _eod_ok(code):
                             return code
-            # sinon: tout exact -> tenter Code valide
             for it in exact:
                 code = str(it.get("Code", "")).strip()
                 if code and _eod_ok(code):
                     return code
 
-        # ---- 4) Dernier recours : places EU actions
         for suf in [".PA", ".AS", ".MI", ".DE", ".LSE"]:
             cand = f"{base}{suf}"
             if _eod_ok(cand):
                 return cand
         return None
 
-    # ---- 3) Nom (on tente d'abord d'attraper un ISIN propre)
+    # ---- 3) Nom
     res = eod_search(q)
     if res:
         preferred = ["EUFUND", "FUND", "USFUND"]
-        # tenter EUFUND/FUND/USFUND avec l'ISIN renvoyé
         for exch in preferred:
             for it in res:
                 ex = str(it.get("Exchange", "")).upper()
@@ -144,38 +138,119 @@ def resolve_symbol(q: str) -> Optional[str]:
                         cand = f"{isin}.{ex}"
                         if _eod_ok(cand):
                             return cand
-        # sinon tenter Code valide
         for it in res:
             code = str(it.get("Code", "")).strip()
             if code and _eod_ok(code):
                 return code
     return None
 
-@st.cache_data(ttl=3*3600, show_spinner=False)
-def eod_prices(symbol: str, from_dt: Optional[str] = None) -> pd.DataFrame:
-    params = {"period": "d"}
-    if from_dt:
-        params["from"] = from_dt
-    js = eodhd_get(f"/eod/{symbol}", params=params)
-    df = pd.DataFrame(js)
-    if df.empty:
-        return pd.DataFrame()
-    df["date"] = pd.to_datetime(df["date"])
-    df = df.set_index("date").sort_index()
-    df["close"] = pd.to_numeric(df["close"], errors="coerce")
-    return df[["close"]].rename(columns={"close": "Close"})
+# ------- Récupération de VL: super fallback
+PREFERRED_FUND_EXCH = [".EUFUND", ".FUND", ".USFUND"]
+ALT_EQUITY_EXCH = [".PA", ".AS", ".MI", ".DE", ".LSE"]
 
-def get_close_on(df: pd.DataFrame, dt: pd.Timestamp) -> Optional[float]:
-    if df.empty:
+@st.cache_data(ttl=3*3600, show_spinner=False)
+def eod_prices_any(symbol_or_isin: str, start_dt: Optional[pd.Timestamp] = None) -> Tuple[pd.DataFrame, str, str]:
+    """
+    Retourne (df_prices, symbol_used, note)
+    df_prices: colonnes ['Close'] indexées par date
+    Stratégie:
+      1) Si 'symbol_or_isin' a déjà un suffixe -> /eod sans 'from', puis avec 'from'
+      2) Si c'est un ISIN sans suffixe -> tester .EUFUND/.FUND/.USFUND (sans from, puis avec)
+      3) Sinon essayer suffixes actions EU
+      4) Si toujours vide: fallback au dernier prix depuis /search, série d'un point
+    """
+    q = (symbol_or_isin or "").strip().upper()
+    note = ""
+
+    def _fetch(sym: str, from_dt: Optional[str]) -> pd.DataFrame:
+        params = {"period": "d"}
+        if from_dt:
+            params["from"] = from_dt
+        js = eodhd_get(f"/eod/{sym}", params=params)
+        df = pd.DataFrame(js)
+        if df.empty:
+            return pd.DataFrame()
+        df["date"] = pd.to_datetime(df["date"])
+        df = df.set_index("date").sort_index()
+        df["close"] = pd.to_numeric(df["close"], errors="coerce")
+        return df[["close"]].rename(columns={"close": "Close"})
+
+    # Helper: try sequence no-from then from
+    def _try_with_without_from(sym: str, from_ts: Optional[pd.Timestamp]) -> Optional[pd.DataFrame]:
+        # 1) no from
+        df = _fetch(sym, None)
+        if not df.empty:
+            # si from_ts fourni, on coupe localement
+            if from_ts is not None:
+                df = df.loc[df.index >= from_ts]
+            if not df.empty:
+                return df
+        # 2) with from
+        f = from_ts.strftime("%Y-%m-%d") if from_ts is not None else None
+        df = _fetch(sym, f)
+        if not df.empty:
+            return df
         return None
-    if dt in df.index:
-        v = df.loc[dt, "Close"]
-        return float(v) if pd.notna(v) else None
-    before = df.loc[df.index <= dt]
-    if before.empty:
-        return None
-    v = before["Close"].iloc[-1]
-    return float(v) if pd.notna(v) else None
+
+    # Detect if already a symbol with suffix
+    if "." in q and not _looks_like_isin(q.split(".")[0]):
+        df = _try_with_without_from(q, start_dt)
+        if df is not None:
+            return df, q, note
+
+    # If it looks like ISIN without suffix, try fund exchanges
+    base = q.split(".")[0]
+    if _looks_like_isin(base):
+        # 1) Prefer resolved symbol (if exists)
+        sym_res = resolve_symbol(base)
+        if sym_res:
+            df = _try_with_without_from(sym_res, start_dt)
+            if df is not None:
+                return df, sym_res, note
+
+        # 2) Try direct preferred fund exchanges
+        for suf in PREFERRED_FUND_EXCH:
+            sym = f"{base}{suf}"
+            df = _try_with_without_from(sym, start_dt)
+            if df is not None:
+                return df, sym, note
+
+        # 3) Try alt equity exchanges
+        for suf in ALT_EQUITY_EXCH:
+            sym = f"{base}{suf}"
+            df = _try_with_without_from(sym, start_dt)
+            if df is not None:
+                return df, sym, note
+
+    # 4) Fallback: last close from /search -> single-point series
+    srch = eod_search(base if _looks_like_isin(base) else q)
+    last_px, last_dt = None, None
+    if srch:
+        # essaye de trouver le bon item (priorité à ISIN exact si dispo)
+        choices = srch
+        if _looks_like_isin(base):
+            choices = [it for it in srch if str(it.get("ISIN", "")).upper() == base] or srch
+        it0 = choices[0]
+        last_px = it0.get("previousClose")
+        last_dt = it0.get("previousCloseDate")
+    if last_px is not None:
+        try:
+            last_px = float(last_px)
+            last_dt = pd.to_datetime(last_dt).normalize() if last_dt else TODAY
+            df = pd.DataFrame({"Close": [last_px]}, index=[last_dt])
+            note = "⚠️ Historique VL indisponible via /eod — utilisation du dernier cours renvoyé par /search."
+            used = resolve_symbol(base) or base
+            return df, used, note
+        except Exception:
+            pass
+
+    # Rien trouvé
+    return pd.DataFrame(), q, "⚠️ Aucune VL récupérée (symbole introuvable ou non couvert par l’API EODHD)."
+
+# Wrapper de confort
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_price_series_any(symbol_or_isin: str, from_dt: Optional[pd.Timestamp]) -> Tuple[pd.DataFrame, str, str]:
+    return eod_prices_any(symbol_or_isin, from_dt)
 
 
 # =========================================
@@ -213,7 +288,7 @@ UNIVERSE_GENERALI = [
     {"name": "CLARTAN Valeurs C", "isin": "LU1100076550", "type": "Actions Europe"},
     {"name": "CARMIGNAC Patrimoine", "isin": "FR0010135103", "type": "Diversifié patrimonial"},
     {"name": "SYCOYIELD 2030 RC", "isin": "FR001400MCQ6", "type": "Obligataire échéance"},
-    {"name": "R-Co Target 2029 HY", "isin": "FR001400AWH8", "type": "Obligataire haut rendement"},  # à confirmer si besoin
+    {"name": "R-Co Target 2029 HY", "isin": "FR001400AWH8", "type": "Obligataire haut rendement"},  # à confirmer
 ]
 UNI_OPTIONS = ["— Saisie libre —"] + [f"{r['name']} — {r['isin']}" for r in UNIVERSE_GENERALI]
 
@@ -222,9 +297,8 @@ UNI_OPTIONS = ["— Saisie libre —"] + [f"{r['name']} — {r['isin']}" for r i
 # 5) UI — Constructeur de portefeuilles (cartes)
 # =========================================
 st.title("🟣 Comparer deux portefeuilles (Client vs Vous)")
-st.caption("Saisie **propre** : ISIN seul accepté, touche **Entrée** valide. Les prix sont chargés depuis EODHD.")
+st.caption("ISIN seul accepté, touche **Entrée** valide. VL récupérées avec fallback multi-exchanges.")
 
-# état
 for key in ["A_lines", "B_lines"]:
     if key not in st.session_state:
         st.session_state[key] = []  # {name, isin, qty, buy_date, buy_px_opt}
@@ -233,19 +307,6 @@ def _parse_float(x: Any) -> Optional[float]:
     if x in (None, "", "—"): return None
     try: return float(str(x).replace(",", "."))
     except: return None
-
-def _resolve_line_symbol(line: Dict[str, Any]) -> Optional[str]:
-    isin = str(line.get("isin", "") or "").strip().upper()
-    name = str(line.get("name", "") or "").strip()
-    if isin:
-        sym = resolve_symbol(isin)
-        if sym:
-            return sym
-    if name:
-        sym = resolve_symbol(name)
-        if sym:
-            return sym
-    return None
 
 def _line_card(line: Dict[str, Any], idx: int, port_key: str):
     col1, col2, col3, col4, col5 = st.columns([3,2,1.4,1.6,0.8])
@@ -259,9 +320,8 @@ def _line_card(line: Dict[str, Any], idx: int, port_key: str):
         st.markdown("Prix achat")
         st.markdown(f"{to_eur(line.get('buy_px_opt')) if line.get('buy_px_opt') else '—'}")
     with col4:
-        sym = _resolve_line_symbol(line) or "—"
-        st.caption("Symbole EODHD")
-        st.code(sym)
+        st.caption("Symbole utilisé")
+        st.code(line.get("sym_used", "—"))
     with col5:
         if st.button("🗑️", key=f"del_{port_key}_{idx}", help="Supprimer cette ligne"):
             st.session_state[port_key].pop(idx)
@@ -283,14 +343,13 @@ def _add_line_ui(port_key: str, title: str):
         with c4:
             px_opt = st.text_input("Prix d’achat (optionnel)", value="", key=f"{port_key}_px")
 
-        # Saisie libre -> Nom et/ou ISIN
         if sel != "— Saisie libre —":
             name, isin = sel.split(" — ")
             name = name.strip()
             isin = isin.strip().upper()
         else:
-            name = st.text_input("Nom du fonds / Instrument (facultatif si ISIN saisi)", key=f"{port_key}_name").strip()
-            isin = st.text_input("ISIN (recommandé, peut suffire seul)", key=f"{port_key}_isin").strip().upper()
+            name = st.text_input("Nom du fonds / Instrument (facultatif)", key=f"{port_key}_name").strip()
+            isin = st.text_input("ISIN (recommandé)", key=f"{port_key}_isin").strip().upper()
 
         submitted = st.form_submit_button("➕ Ajouter la ligne", type="primary")
 
@@ -306,10 +365,13 @@ def _add_line_ui(port_key: str, title: str):
         except Exception:
             buy_px_opt = None
 
-        probe_line = {"name": name, "isin": isin}
-        sym = _resolve_line_symbol(probe_line)
-        if not sym:
-            st.error("Introuvable : essaye l’**ISIN exact**. On teste automatiquement .EUFUND, .FUND et .USFUND.")
+        # On charge DIRECT la série (avec multi-fallback) pour valider tout de suite
+        from_ts = pd.Timestamp(dt)
+        dfp, sym_used, note = load_price_series_any(isin or name, from_ts)
+
+        if dfp.empty:
+            st.error("Impossible de récupérer des VL via EODHD pour ce fonds.")
+            st.info("Astuce: vérifie l’ISIN exact. L’app teste .EUFUND, .FUND, .USFUND et quelques places actions.")
             st.stop()
 
         line = {
@@ -318,15 +380,20 @@ def _add_line_ui(port_key: str, title: str):
             "qty": float(qty),
             "buy_date": pd.Timestamp(dt),
             "buy_px_opt": buy_px_opt,
+            "sym_used": sym_used,
+            "note": note,
         }
         st.session_state[port_key].append(line)
-        st.success(f"Ligne ajoutée ({sym}).")
+        st.success(f"Ligne ajoutée ({sym_used}).")
+        if note:
+            st.caption(note)
 
-    # Cartes
     if st.session_state[port_key]:
         st.markdown("#### Lignes du portefeuille")
         for i, ln in enumerate(st.session_state[port_key]):
             _line_card(ln, i, port_key)
+            if ln.get("note"):
+                st.caption(ln["note"])
     else:
         st.info("Aucune ligne pour l’instant.")
 
@@ -343,8 +410,22 @@ with tabB:
 # 6) CALCUL DES PERFORMANCES
 # =========================================
 @st.cache_data(ttl=3600, show_spinner=False)
-def load_price_series_cached(symbol: str, from_dt: str) -> pd.DataFrame:
-    return eod_prices(symbol, from_dt=from_dt)
+def get_series_for_line(line: Dict[str, Any]) -> pd.DataFrame:
+    # Recharge la série avec les mêmes fallbacks, coupe à la date d'achat
+    dfp, _, _ = load_price_series_any(line.get("isin") or line.get("name"), pd.Timestamp(line["buy_date"]))
+    return dfp
+
+def get_close_on(df: pd.DataFrame, dt: pd.Timestamp) -> Optional[float]:
+    if df.empty:
+        return None
+    if dt in df.index:
+        v = df.loc[dt, "Close"]
+        return float(v) if pd.notna(v) else None
+    before = df.loc[df.index <= dt]
+    if before.empty:
+        return None
+    v = before["Close"].iloc[-1]
+    return float(v) if pd.notna(v) else None
 
 def compute_portfolio_from_lines(lines: List[Dict[str, Any]], label: str) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     rows = []
@@ -358,21 +439,12 @@ def compute_portfolio_from_lines(lines: List[Dict[str, Any]], label: str) -> Tup
         qty  = float(ln.get("qty", 0.0))
         d_buy: pd.Timestamp = ln.get("buy_date")
         px_buy_opt = ln.get("buy_px_opt")
+        sym_used = ln.get("sym_used", "—")
 
         if (not name and not isin) or qty <= 0 or d_buy is None:
             continue
 
-        sym = resolve_symbol(isin) if isin else resolve_symbol(name)
-        if not sym:
-            rows.append({
-                "Fonds": name or "—", "ISIN": isin or "—", "Symbole": "—",
-                "Quantité": qty, "Date achat": d_buy.date(), "Prix achat": px_buy_opt if px_buy_opt else "—",
-                "Dernier cours": "ND", "Investi €": np.nan, "Valeur actuelle €": np.nan, "P&L €": np.nan,
-                "Perf % depuis achat": np.nan
-            })
-            continue
-
-        dfp = load_price_series_cached(sym, d_buy.strftime("%Y-%m-%d"))
+        dfp = get_series_for_line(ln)
         last_close = dfp["Close"].iloc[-1] if not dfp.empty else np.nan
 
         if px_buy_opt is None:
@@ -391,7 +463,7 @@ def compute_portfolio_from_lines(lines: List[Dict[str, Any]], label: str) -> Tup
         rows.append({
             "Fonds": name or "—",
             "ISIN": isin or "—",
-            "Symbole": sym,
+            "Symbole": sym_used,
             "Quantité": qty,
             "Date achat": d_buy.date(),
             "Prix achat": px_buy if pd.notna(px_buy) else "—",
@@ -520,17 +592,17 @@ else:
 
 
 # =========================================
-# 8) (Optionnel) Debug recherche, utile si un ISIN ne passe pas
+# 8) Debug (optionnel)
 # =========================================
-with st.expander("🔧 Debug recherche EODHD (optionnel)"):
+with st.expander("🔧 Debug EODHD (optionnel)"):
     test_q = st.text_input("Tester une recherche (ISIN ou nom)")
     if test_q:
         st.write("Résultat /search :", eod_search(test_q))
-        sym = resolve_symbol(test_q)
-        st.write("Symbole résolu :", sym)
-        if sym:
-            try:
-                df_dbg = eod_prices(sym)
-                st.dataframe(df_dbg.tail(3))
-            except Exception as e:
-                st.error(f"EOD error: {e}")
+        df_dbg, sym_dbg, note_dbg = load_price_series_any(test_q, None)
+        st.write("Symbole testé :", sym_dbg)
+        if note_dbg:
+            st.caption(note_dbg)
+        if not df_dbg.empty:
+            st.dataframe(df_dbg.tail(5))
+        else:
+            st.warning("Aucune VL trouvée.")

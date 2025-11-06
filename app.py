@@ -1,19 +1,359 @@
 # =========================================
-# 08) PORTEFEUILLE DE RÉFÉRENCE (poids, date d'investissement, VLP)
-#     - Universe Generali (core + défensifs)
-#     - Poids (0% possible)
-#     - Date d’investissement initial
-#     - VLP mensuels optionnels (montant, période)
-#     - Perf & XIRR basés sur VL (EODHD)
+# 00) APP CONFIG
 # =========================================
+import os, re, math, json, requests, calendar
+from datetime import datetime, date
+from typing import Optional, List, Dict, Any, Tuple
 
 import numpy as np
 import pandas as pd
+import streamlit as st
 import plotly.express as px
-from datetime import date, datetime
-import calendar
 
-# --- Universe Generali (core + défensifs)
+st.set_page_config(page_title="Comparateur de Portefeuilles — CGP", page_icon="🦉", layout="wide")
+TODAY = pd.Timestamp.today().normalize()
+TRADING_DAYS = 252
+
+
+# =========================================
+# 01) HELPERS GÉNÉRAUX
+# =========================================
+def Secret_Token(name: str) -> str:
+    v = os.getenv(name) or str(st.secrets.get(name, "")).strip()  # type: ignore[attr-defined]
+    if not v:
+        raise RuntimeError(f"Secret manquant: {name}")
+    return v
+
+def to_eur(x: float) -> str:
+    try:
+        if x is None or (isinstance(x, float) and (math.isnan(x) or math.isinf(x))):
+            return ""
+        s = f"{float(x):,.2f}".replace(",", "X").replace(".", ",").replace("X", " ")
+        return f"{s} €"
+    except Exception:
+        return ""
+
+def to_pct(x: float) -> str:
+    try:
+        if x is None or (isinstance(x, float) and (math.isnan(x) or math.isinf(x))):
+            return ""
+        s = f"{float(x):+.2f}".replace(",", "X").replace(".", ",").replace("X", " ")
+        return f"{s}%"
+    except Exception:
+        return ""
+
+
+# =========================================
+# 02) EODHD CLIENT (prix quotidiens / VL)
+# =========================================
+EODHD_BASE = "https://eodhd.com/api"
+
+def eodhd_get(path: str, params: Optional[Dict[str, Any]] = None) -> Any:
+    url = f"{EODHD_BASE.rstrip('/')}{path}"
+    p = {"api_token": Secret_Token("EODHD_API_KEY"), "fmt": "json"}
+    if params:
+        p.update(params)
+    r = requests.get(url, params=p, timeout=25)
+    r.raise_for_status()
+    js = r.json()
+    if isinstance(js, str) and js.lower().startswith("error"):
+        raise requests.HTTPError(js)
+    return js
+
+@st.cache_data(ttl=6*3600, show_spinner=False)
+def eod_search(query: str) -> List[Dict[str, Any]]:
+    try:
+        js = eodhd_get(f"/search/{query.upper()}", params={})
+        return js if isinstance(js, list) else []
+    except Exception:
+        return []
+
+def _looks_like_isin(s: str) -> bool:
+    return bool(re.fullmatch(r"[A-Z]{2}[A-Z0-9]{9}[0-9]", s.strip().upper()))
+
+@st.cache_data(ttl=24*3600, show_spinner=False)
+def resolve_symbol(q: str) -> Optional[str]:
+    """
+    Résout un ISIN / nom vers un symbole EODHD.
+    - Si ISIN et Exchange EUFUND => retourne "ISIN.EUFUND" (fonds/OPCVM)
+    - Sinon renvoie le 'Code' trouvé, ou tente des suffixes boursiers courants.
+    """
+    q = q.strip()
+    if _looks_like_isin(q):
+        res = eod_search(q)
+        if res:
+            for it in res:
+                if str(it.get("Exchange", "")).upper() == "EUFUND":
+                    return f"{q}.EUFUND"
+            code = res[0].get("Code")
+            if code:
+                return str(code)
+        for suf in [".EUFUND", ".PA", ".AS", ".MI", ".DE", ".LSE"]:
+            try_sym = f"{q}{suf}"
+            try:
+                js = eodhd_get(f"/eod/{try_sym}", params={"period": "d"})
+                if isinstance(js, list) and js:
+                    return try_sym
+            except Exception:
+                continue
+        return None
+    else:
+        res = eod_search(q)
+        if res:
+            code = res[0].get("Code")
+            if code:
+                if str(res[0].get("Exchange", "")).upper() == "EUFUND":
+                    isin = res[0].get("ISIN")
+                    if isinstance(isin, str) and _looks_like_isin(isin):
+                        return f"{isin}.EUFUND"
+                return str(code)
+    return None
+
+@st.cache_data(ttl=3*3600, show_spinner=False)
+def eod_prices(symbol: str, from_dt: Optional[str] = None) -> pd.DataFrame:
+    params = {"period": "d"}
+    if from_dt:
+        params["from"] = from_dt
+    js = eodhd_get(f"/eod/{symbol}", params=params)
+    df = pd.DataFrame(js)
+    if df.empty:
+        return pd.DataFrame()
+    df["date"] = pd.to_datetime(df["date"])
+    df = df.set_index("date").sort_index()
+    df["close"] = pd.to_numeric(df["close"], errors="coerce")
+    return df[["close"]].rename(columns={"close": "Close"})
+
+def get_close_on(df: pd.DataFrame, dt: pd.Timestamp) -> Optional[float]:
+    if df.empty:
+        return None
+    if dt in df.index:
+        v = df.loc[dt, "Close"]
+        return float(v) if pd.notna(v) else None
+    before = df.loc[df.index <= dt]
+    if before.empty:
+        return None
+    v = before["Close"].iloc[-1]
+    return float(v) if pd.notna(v) else None
+
+
+# =========================================
+# 03) FINANCE — XIRR (money-weighted)
+# =========================================
+def xnpv(rate: float, cash_flows: List[Tuple[pd.Timestamp, float]]) -> float:
+    t0 = cash_flows[0][0]
+    return sum(cf / ((1 + rate) ** ((t - t0).days / 365.2425)) for t, cf in cash_flows)
+
+def xirr(cash_flows: List[Tuple[pd.Timestamp, float]], guess: float = 0.1) -> Optional[float]:
+    if not cash_flows or len(cash_flows) < 2:
+        return None
+    low, high = -0.9999, 10.0
+    for _ in range(100):
+        mid = (low + high) / 2
+        val = xnpv(mid, cash_flows)
+        if abs(val) < 1e-6:
+            return mid
+        val_low = xnpv(low, cash_flows)
+        if val_low * val < 0:
+            high = mid
+        else:
+            low = mid
+    return None
+
+
+# =========================================
+# 04) UI — COMPARATEUR A vs B (saisie)
+# =========================================
+st.title("🟣 Comparateur de Portefeuilles")
+st.caption("Comparez A (client) vs B (vous). Dates et prix d’achat pris en compte.")
+
+def parse_date(s: str) -> Optional[pd.Timestamp]:
+    s = str(s).strip()
+    if not s:
+        return None
+    try:
+        return pd.Timestamp(s)
+    except Exception:
+        return None
+
+def parse_float(s: Any) -> Optional[float]:
+    if s is None or s == "":
+        return None
+    try:
+        return float(str(s).replace(",", "."))
+    except Exception:
+        return None
+
+defaultA = pd.DataFrame([
+    {"Instrument (ISIN ou Nom)": "FR0011253624", "Quantité": 10, "Date d’achat (YYYY-MM-DD)": "2023-09-15", "Prix d’achat (optionnel)": ""},
+    {"Instrument (ISIN ou Nom)": "IE00B4L5Y983", "Quantité": 5,  "Date d’achat (YYYY-MM-DD)": "2024-02-01", "Prix d’achat (optionnel)": ""},
+])
+defaultB = pd.DataFrame([
+    {"Instrument (ISIN ou Nom)": "FR0010148981", "Quantité": 8, "Date d’achat (YYYY-MM-DD)": "2023-11-10", "Prix d’achat (optionnel)": ""},
+    {"Instrument (ISIN ou Nom)": "IE00B6R52259", "Quantité": 4, "Date d’achat (YYYY-MM-DD)": "2024-03-20", "Prix d’achat (optionnel)": ""},
+])
+
+cA, cB = st.columns(2)
+with cA:
+    st.subheader("Portefeuille A (client)")
+    dfA = st.data_editor(defaultA, num_rows="dynamic", use_container_width=True)
+with cB:
+    st.subheader("Portefeuille B (vous)")
+    dfB = st.data_editor(defaultB, num_rows="dynamic", use_container_width=True)
+
+run_ab = st.button("📊 Comparer A vs B", type="primary")
+
+
+# =========================================
+# 05) CALCUL — PAR PORTEFEUILLE
+# =========================================
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_price_series_cached(symbol: str, from_dt: str) -> pd.DataFrame:
+    return eod_prices(symbol, from_dt=from_dt)
+
+def compute_portfolio(df_input: pd.DataFrame, label: str) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    rows = []
+    cash_flows: List[Tuple[pd.Timestamp, float]] = []
+    min_buy_dt: Optional[pd.Timestamp] = None
+    total_investi, total_valeur = 0.0, 0.0
+
+    for _, row in df_input.iterrows():
+        instr = str(row.get("Instrument (ISIN ou Nom)", "")).strip()
+        qty = parse_float(row.get("Quantité", 0))
+        d_buy = parse_date(row.get("Date d’achat (YYYY-MM-DD)", ""))
+        px_buy_opt = parse_float(row.get("Prix d’achat (optionnel)", ""))
+
+        if not instr or not qty or qty <= 0 or not d_buy:
+            continue
+
+        sym = resolve_symbol(instr)
+        if not sym:
+            rows.append({"Instrument": instr, "Symbole": "—", "Quantité": qty, "Date achat": d_buy.date(),
+                         "Prix achat": px_buy_opt if px_buy_opt else "—", "Dernier cours": "ND",
+                         "Investi €": np.nan, "Valeur actuelle €": np.nan, "P&L €": np.nan,
+                         "Perf % depuis achat": np.nan})
+            continue
+
+        dfp = load_price_series_cached(sym, d_buy.strftime("%Y-%m-%d"))
+        last_close = dfp["Close"].iloc[-1] if not dfp.empty else np.nan
+
+        if px_buy_opt is None:
+            px_buy = get_close_on(dfp, d_buy)
+            if px_buy is None:
+                after = dfp.loc[dfp.index >= d_buy]
+                px_buy = float(after["Close"].iloc[0]) if not after.empty else np.nan
+        else:
+            px_buy = px_buy_opt
+
+        investi = float(qty) * float(px_buy) if pd.notna(px_buy) else np.nan
+        valeur = float(qty) * float(last_close) if pd.notna(last_close) else np.nan
+        pl_eur = valeur - investi if (pd.notna(valeur) and pd.notna(investi)) else np.nan
+        perf_pct = (valeur / investi - 1.0) * 100.0 if (pd.notna(valeur) and pd.notna(investi) and investi != 0) else np.nan
+
+        rows.append({
+            "Instrument": instr, "Symbole": sym, "Quantité": qty, "Date achat": d_buy.date(),
+            "Prix achat": px_buy if pd.notna(px_buy) else "—", "Dernier cours": last_close if pd.notna(last_close) else "ND",
+            "Investi €": investi, "Valeur actuelle €": valeur, "P&L €": pl_eur, "Perf % depuis achat": perf_pct
+        })
+
+        if pd.notna(investi):
+            total_investi += investi
+            cash_flows.append((d_buy, -investi))
+            if (min_buy_dt is None) or (d_buy < min_buy_dt):
+                min_buy_dt = d_buy
+        if pd.notna(valeur):
+            total_valeur += valeur
+
+    if total_valeur > 0 and cash_flows:
+        cash_flows.append((TODAY, total_valeur))
+
+    df_lines = pd.DataFrame(rows)
+    perf_simple = (total_valeur / total_investi - 1.0) if total_investi > 0 else np.nan
+    irr = xirr(cash_flows) if cash_flows else None
+    agg = {
+        "label": label,
+        "investi_total": total_investi,
+        "valeur_totale": total_valeur,
+        "pl_total": total_valeur - total_investi if total_investi > 0 else np.nan,
+        "perf_simple_pct": perf_simple * 100.0 if pd.notna(perf_simple) else np.nan,
+        "xirr_pct": irr * 100.0 if irr is not None else np.nan,
+        "min_buy_dt": min_buy_dt.date() if min_buy_dt else None,
+    }
+    return df_lines, agg
+
+
+# =========================================
+# 06) RUN — A vs B
+# =========================================
+if run_ab:
+    st.divider()
+    st.subheader("Résultats A vs B")
+
+    ca, cb = st.columns(2)
+    with ca:
+        st.markdown("### 📁 Portefeuille A (client)")
+        dfA_lines, aggA = compute_portfolio(dfA, "Portefeuille A")
+        st.dataframe(
+            dfA_lines.style.format({
+                "Prix achat": to_eur, "Dernier cours": to_eur,
+                "Investi €": to_eur, "Valeur actuelle €": to_eur,
+                "P&L €": to_eur, "Perf % depuis achat": "{:.2f}%"
+            }, na_rep=""),
+            use_container_width=True, hide_index=True
+        )
+        st.write(
+            f"- **Investi** : {to_eur(aggA['investi_total'])}  "
+            f"- **Valeur** : {to_eur(aggA['valeur_totale'])}  "
+            f"- **P&L** : {to_eur(aggA['pl_total'])}  "
+            f"- **Perf simple** : {to_pct(aggA['perf_simple_pct'])}  "
+            f"- **XIRR** : {to_pct(aggA['xirr_pct'])}  "
+            f"- **Depuis** : {aggA['min_buy_dt']}"
+        )
+
+    with cb:
+        st.markdown("### 🟣 Portefeuille B (vous)")
+        dfB_lines, aggB = compute_portfolio(dfB, "Portefeuille B")
+        st.dataframe(
+            dfB_lines.style.format({
+                "Prix achat": to_eur, "Dernier cours": to_eur,
+                "Investi €": to_eur, "Valeur actuelle €": to_eur,
+                "P&L €": to_eur, "Perf % depuis achat": "{:.2f}%"
+            }, na_rep=""),
+            use_container_width=True, hide_index=True
+        )
+        st.write(
+            f"- **Investi** : {to_eur(aggB['investi_total'])}  "
+            f"- **Valeur** : {to_eur(aggB['valeur_totale'])}  "
+            f"- **P&L** : {to_eur(aggB['pl_total'])}  "
+            f"- **Perf simple** : {to_pct(aggB['perf_simple_pct'])}  "
+            f"- **XIRR** : {to_pct(aggB['xirr_pct'])}  "
+            f"- **Depuis** : {aggB['min_buy_dt']}"
+        )
+
+    st.markdown("### ⚖️ Comparatif synthétique")
+    comp = pd.DataFrame([
+        {"Portefeuille": "A (client)", "Investi €": aggA["investi_total"], "Valeur €": aggA["valeur_totale"],
+         "P&L €": aggA["pl_total"], "Perf simple %": aggA["perf_simple_pct"], "XIRR %": aggA["xirr_pct"]},
+        {"Portefeuille": "B (vous)",   "Investi €": aggB["investi_total"], "Valeur €": aggB["valeur_totale"],
+         "P&L €": aggB["pl_total"], "Perf simple %": aggB["perf_simple_pct"], "XIRR %": aggB["xirr_pct"]},
+    ])
+    st.dataframe(
+        comp.style.format({
+            "Investi €": to_eur, "Valeur €": to_eur, "P&L €": to_eur,
+            "Perf simple %": "{:.2f}%", "XIRR %": "{:.2f}%"
+        }, na_rep=""),
+        use_container_width=True, hide_index=True
+    )
+
+    fig = px.bar(comp, x="Portefeuille", y="Valeur €", text="Valeur €", title="Valeur actuelle par portefeuille")
+    st.plotly_chart(fig, use_container_width=True)
+
+
+# =========================================
+# 07) PORTFEUILLE DE RÉFÉRENCE (Generali)
+# =========================================
+st.divider()
+st.header("🟣 Portefeuille de référence — Generali (Core + Défensifs)")
+
 UNIVERSE_GENERALI = [
     {"name": "R-co Valor C EUR", "isin": "FR0011253624", "type": "Actions Monde"},
     {"name": "Vivalor International", "isin": "FR0014001LS1", "type": "Actions Monde"},
@@ -22,44 +362,39 @@ UNIVERSE_GENERALI = [
     {"name": "CLARTAN Valeurs C", "isin": "LU1100076550", "type": "Actions Europe"},
     {"name": "CARMIGNAC Patrimoine", "isin": "FR0010135103", "type": "Diversifié patrimonial"},
     {"name": "SYCOYIELD 2030 RC", "isin": "FR001400MCQ6", "type": "Obligataire échéance"},
-    {"name": "R-Co Target 2029 HY", "isin": "FR001400AWH8", "type": "Obligataire haut rendement"},
+    {"name": "R-Co Target 2029 HY", "isin": "FR001400AWH8", "type": "Obligataire haut rendement"},  # confirme ISIN
     {"name": "Fonds en euros Generali", "isin": None, "type": "Fonds Euro"},
 ]
 DF_UNI = pd.DataFrame(UNIVERSE_GENERALI)
 
-st.header("🟣 Portefeuille de référence (Generali Espace Invest 5)")
-
-# --- Table des poids (éditable)
 _w_init = pd.DataFrame(
     [{"Fonds": r["name"], "ISIN": r["isin"], "Type": r["type"], "Poids %": 0.0} for r in UNIVERSE_GENERALI]
 )
-st.markdown("Saisis les **poids (%)** par fonds (0% possible). La somme sera **normalisée** automatiquement.")
+st.markdown("Saisis les **poids (%)** (0% possible) — la somme sera **normalisée**.")
 df_weights = st.data_editor(_w_init, use_container_width=True, num_rows="fixed")
 df_weights["Poids %"] = pd.to_numeric(df_weights["Poids %"], errors="coerce").fillna(0.0)
 
-# --- Paramètres d'investissement
-colA, colB, colC = st.columns(3)
-with colA:
-    initial_date = st.date_input("Date d’investissement initial", value=date(2024, 1, 2))
-with colB:
-    initial_amount = st.number_input("Montant initial (€)", min_value=0.0, value=10000.0, step=500.0, format="%.2f")
-with colC:
-    euro_rate = st.number_input("Rendement annuel du Fonds € (si inclus) (%)", min_value=0.0, value=2.00, step=0.10, format="%.2f")
+c1, c2, c3 = st.columns(3)
+with c1:
+    ref_initial_date = st.date_input("Date d’investissement initial", value=date(2024, 1, 2))
+with c2:
+    ref_initial_amount = st.number_input("Montant initial (€)", min_value=0.0, value=10000.0, step=500.0, format="%.2f")
+with c3:
+    euro_rate = st.number_input("Rendement annuel Fonds € (%)", min_value=0.0, value=2.00, step=0.10, format="%.2f")
 
 st.markdown("### Versements Libres Programmés (VLP) — *optionnels*")
-col1, col2, col3, col4 = st.columns(4)
-with col1:
+d1, d2, d3, d4 = st.columns(4)
+with d1:
     vlp_enable = st.checkbox("Activer VLP mensuels", value=False)
-with col2:
+with d2:
     vlp_amount = st.number_input("Montant VLP mensuel (€)", min_value=0.0, value=300.0, step=50.0, format="%.2f", disabled=not vlp_enable)
-with col3:
-    vlp_start = st.date_input("Début VLP", value=initial_date, disabled=not vlp_enable)
-with col4:
+with d3:
+    vlp_start = st.date_input("Début VLP", value=ref_initial_date, disabled=not vlp_enable)
+with d4:
     vlp_end = st.date_input("Fin VLP", value=date.today(), disabled=not vlp_enable)
 
 run_ref = st.button("🚀 Calculer la performance du portefeuille de référence", type="primary")
 
-# --- Utils dates / contributions
 def month_end(dt: date) -> date:
     last_day = calendar.monthrange(dt.year, dt.month)[1]
     return date(dt.year, dt.month, last_day)
@@ -67,11 +402,11 @@ def month_end(dt: date) -> date:
 def monthly_schedule(start: date, end: date) -> list[date]:
     if end < start:
         return []
+    # Avance mois par mois (sécurisé jour<=28)
     d = date(start.year, start.month, min(start.day, 28))
     out = []
     while d <= end:
         out.append(month_end(d))
-        # incrément mois +1
         y = d.year + (d.month // 12)
         m = 1 if d.month == 12 else d.month + 1
         d = date(y, m, min(d.day, 28))
@@ -80,7 +415,6 @@ def monthly_schedule(start: date, end: date) -> list[date]:
 def to_ts(d: date) -> pd.Timestamp:
     return pd.Timestamp(d)
 
-# --- Série synthétique pour Fonds Euro (croissance lissée à euro_rate)
 @st.cache_data(ttl=6*3600, show_spinner=False)
 def euro_fund_series(start_dt: date, end_dt: date, annual_rate: float) -> pd.Series:
     idx = pd.bdate_range(start=to_ts(start_dt), end=to_ts(end_dt), freq="B")
@@ -89,30 +423,24 @@ def euro_fund_series(start_dt: date, end_dt: date, annual_rate: float) -> pd.Ser
     daily_rate = (1 + annual_rate/100.0) ** (1/252) - 1
     vals = (1 + daily_rate) ** np.arange(len(idx))
     s = pd.Series(vals, index=idx, name="Fonds € (synthetic)")
-    # Échelle en "prix": base 100 au départ pour cohérence (sera ramené via prix)
     return s * 100.0
 
-# --- Prix EODHD d'un fonds (via ISIN ou nom)
 @st.cache_data(ttl=6*3600, show_spinner=False)
 def load_price_series_generic(isin: str | None, name: str, from_dt: date) -> pd.Series:
     if isin:
         sym = resolve_symbol(isin)
     else:
-        # Fonds euro (pas d’ISIN) -> série synthétique (ajustée ensuite)
         sym = None
-
     if sym:
         dfp = eod_prices(sym, from_dt.strftime("%Y-%m-%d"))
         if not dfp.empty:
             s = dfp["Close"].copy()
             s.name = name
             return s
-    # fallback fonds euro synthétique (si name == fonds euro)
     if isin is None and "Fonds en euros" in name:
         return euro_fund_series(from_dt, date.today(), euro_rate).rename(name)
     return pd.Series(dtype=float)
 
-# --- Simulation achats (lump sum + VLP) -> parts, valeur dans le temps
 def simulate_reference_portfolio(dfw: pd.DataFrame,
                                  initial_dt: date,
                                  initial_amt: float,
@@ -120,20 +448,18 @@ def simulate_reference_portfolio(dfw: pd.DataFrame,
                                  vlp_amt: float,
                                  vlp_dt_start: date,
                                  vlp_dt_end: date) -> dict:
-    # 1) Nettoyage & normalisation des poids
     dfw = dfw.copy()
     dfw["Poids %"] = pd.to_numeric(dfw["Poids %"], errors="coerce").fillna(0.0)
     total = dfw["Poids %"].sum()
     if total <= 0:
         st.error("Tous les poids sont à 0%. Mets au moins un poids > 0.")
         return {}
-    dfw["poids_n"] = dfw["Poids %"] / total  # normalisation 100% même si saisie != 100
+    dfw["poids_n"] = dfw["Poids %"] / total
 
-    # 2) Charger les séries de prix (depuis initial_dt)
     series_map: dict[str, pd.Series] = {}
     not_found = []
     for _, r in dfw.iterrows():
-        if r["poids_n"] <= 0: 
+        if r["poids_n"] <= 0:
             continue
         s = load_price_series_generic(r["ISIN"], r["Fonds"], initial_dt)
         if s.empty:
@@ -147,18 +473,14 @@ def simulate_reference_portfolio(dfw: pd.DataFrame,
         st.error("Aucune VL disponible pour les fonds sélectionnés.")
         return {}
 
-    # 3) Index commun (toutes les dates ouvrées observées)
     prices = pd.concat(series_map, axis=1).sort_index().ffill()
-    # Restreindre à [initial_dt, today]
     prices = prices.loc[prices.index >= to_ts(initial_dt)]
     if prices.empty:
         st.error("Pas de données de VL après la date d’investissement.")
         return {}
 
-    # 4) Calendrier des contributions
     cashflows: list[tuple[pd.Timestamp, float]] = []
     contribs: list[tuple[pd.Timestamp, float]] = []
-    # - Lump sum initial (date exacte, si non-trading -> on prendra la 1ère VL >= date)
     cashflows.append((to_ts(initial_dt), -float(initial_amt)))
     contribs.append((to_ts(initial_dt), float(initial_amt)))
 
@@ -170,13 +492,8 @@ def simulate_reference_portfolio(dfw: pd.DataFrame,
             cashflows.append((ts, -float(vlp_amt)))
             contribs.append((ts, float(vlp_amt)))
 
-    # 5) Simulation par parts
-    # Parts par fonds
     parts = {f: 0.0 for f in prices.columns}
-    # Historique valeur portefeuille
-    port_values = []
 
-    # fonction prix à une date: dernière VL <= d sinon 1ère >= d
     def px_on(fund: str, dts: pd.Timestamp) -> float | None:
         s = prices[fund]
         if dts in s.index:
@@ -190,9 +507,7 @@ def simulate_reference_portfolio(dfw: pd.DataFrame,
             return float(aft.iloc[0])
         return None
 
-    # Achats aux dates de contribution
     for ts, amt in contribs:
-        # Répartition selon poids_n AUJOURD’HUI (statique)
         for _, r in dfw.iterrows():
             if r["poids_n"] <= 0:
                 continue
@@ -204,23 +519,20 @@ def simulate_reference_portfolio(dfw: pd.DataFrame,
                 continue
             parts[fund] += (amt * r["poids_n"]) / px
 
-    # Valeur quotidienne (sur index des VL)
+    vals = []
     for dts in prices.index:
         val = 0.0
         for f in prices.columns:
             px = prices.loc[dts, f]
-            if pd.isna(px): 
+            if pd.isna(px):
                 continue
             val += parts.get(f, 0.0) * float(px)
-        port_values.append((dts, val))
+        vals.append((dts, val))
+    df_val = pd.DataFrame(vals, columns=["Date", "Valeur"]).set_index("Date")
 
-    df_val = pd.DataFrame(port_values, columns=["Date", "Valeur"]).set_index("Date")
     total_investi = -sum(cf for _, cf in cashflows if cf < 0)
     final_val = float(df_val["Valeur"].iloc[-1])
-
-    # XIRR (annualisé)
-    cf_for_xirr = cashflows + [(df_val.index[-1], final_val)]
-    irr = xirr(cf_for_xirr)
+    irr = xirr(cashflows + [(df_val.index[-1], final_val)])
 
     out = {
         "prices": prices,
@@ -231,31 +543,26 @@ def simulate_reference_portfolio(dfw: pd.DataFrame,
         "perf_pct": (final_val / total_investi - 1.0) * 100.0 if total_investi > 0 else np.nan,
         "xirr_pct": (irr * 100.0) if irr is not None else np.nan,
         "parts": parts,
-        "cashflows": cashflows,
     }
     return out
 
 if run_ref:
     res = simulate_reference_portfolio(
-        df_weights, initial_date, initial_amount,
+        df_weights, ref_initial_date, ref_initial_amount,
         vlp_enable, vlp_amount, vlp_start, vlp_end
     )
     if res:
-        st.subheader("📈 Performance du portefeuille de référence")
-        # courbe valeur
-        fig = px.line(res["values"].reset_index(), x="Date", y="Valeur", title="Valeur du portefeuille (VL agrégées)")
+        st.subheader("📈 Valeur du portefeuille (VL agrégées)")
+        fig = px.line(res["values"].reset_index(), x="Date", y="Valeur", title="Portefeuille de référence (valeur)")
         st.plotly_chart(fig, use_container_width=True)
 
-        # métriques
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("Investi total", to_eur(res["investi"]))
         c2.metric("Valeur actuelle", to_eur(res["final"]))
         c3.metric("P&L", to_eur(res["pl"]))
         c4.metric("Perf depuis origine", f"{res['perf_pct']:.2f}%")
-
         st.markdown(f"**XIRR (annualisé)** : {'' if pd.isna(res['xirr_pct']) else f'{res['xirr_pct']:.2f}%'}")
 
-        # tableau parts + dernier prix
         last_date = res["values"].index[-1]
         last_px = res["prices"].loc[last_date]
         tbl = []
@@ -264,17 +571,14 @@ if run_ref:
             px = float(last_px.get(f, np.nan))
             val = qty * px if pd.notna(px) else np.nan
             tbl.append({"Fonds": f, "Parts détenues": qty, "Dernier prix": px, "Valeur €": val})
-        df_pos = pd.DataFrame(tbl)
         st.subheader("📄 Détail positions (estimées)")
         st.dataframe(
-            df_pos.style.format({"Parts détenues": "{:.4f}", "Dernier prix": to_eur, "Valeur €": to_eur}, na_rep=""),
+            pd.DataFrame(tbl).style.format({"Parts détenues": "{:.4f}", "Dernier prix": to_eur, "Valeur €": to_eur}, na_rep=""),
             use_container_width=True, hide_index=True
         )
 
-        # base 100 comparée (portefeuille vs somme pondérée prix)
-        base = res["values"].copy()
-        base100 = base / base.iloc[0] * 100.0
+        base100 = res["values"] / res["values"].iloc[0] * 100.0
         st.subheader("📊 Performance base 100")
-        st.line_chart(base100.rename(columns={"Valeur": "Portefeuille (base 100)"}))
+        st.line_chart(base100.rename(columns={"Valeur": "Référence (base 100)"}))
 else:
-    st.info("Remplis les poids, la date d’investissement (et VLP si besoin), puis clique **Calculer**.")
+    st.info("Remplis les poids, la date (et VLP si besoin), puis clique **Calculer**.")

@@ -6,7 +6,8 @@
 # - Courbes d'évolution (valeur quotidienne)
 # - Versements mensuels & ponctuel, affectation paramétrable
 # - FIX: quantités initiales ajoutées le JOUR EFFECTIF d’achat
-# - Bloc "Et si c’était avec nous ?" (delta valeur & XIRR)
+# - Ajout des dates sur "Investi" et "Prix achat"
+# - Encadré clair "Si c’était avec nous" (gain € + surperf %/an)
 # =========================================
 import os, re, math, requests, calendar
 from datetime import date
@@ -35,6 +36,12 @@ def to_eur(x: float) -> str:
         return f"{s} €"
     except Exception:
         return ""
+
+def fmt_date(d: pd.Timestamp | date | None) -> str:
+    if d is None: return ""
+    if isinstance(d, date) and not isinstance(d, pd.Timestamp):
+        d = pd.Timestamp(d)
+    return d.strftime("%d/%m/%Y")
 
 # ---------- EODHD client ----------
 EODHD_BASE = "https://eodhd.com/api"
@@ -224,11 +231,11 @@ def _get_close_on(df: pd.DataFrame, dt: pd.Timestamp) -> Optional[float]:
 
 def _month_end(d: pd.Timestamp) -> pd.Timestamp:
     last_day = calendar.monthrange(d.year, d.month)[1]
-    return pd.Timestamp(year=d.year, month=d.month, day=last_day)
+    return pd.Timestamp(year=d.year, month=d.month, day=day)
 
 def _month_schedule(start_dt: pd.Timestamp, end_dt: pd.Timestamp) -> List[pd.Timestamp]:
     dates=[]; cur=pd.Timestamp(year=start_dt.year, month=start_dt.month, day=start_dt.day)
-    cur = min(cur, _month_end(cur))
+    cur = min(cur, pd.Timestamp(year=cur.year, month=cur.month, day=calendar.monthrange(cur.year, cur.month)[1]))
     while cur<=end_dt:
         dates.append(cur)
         y = cur.year + (cur.month//12)
@@ -309,9 +316,11 @@ def _line_card(line: Dict[str,Any], idx:int, port_key:str):
             st.code(line.get("sym_used","—"))
         with c1:
             st.markdown(f"Investi\n\n**{to_eur(line.get('amount',0.0))}**")
+            st.caption(f"le {fmt_date(line.get('buy_date'))}")
             st.caption(f"Quantité : {line.get('qty_calc'):.6f}")
         with c2:
             st.markdown(f"Prix achat\n\n**{to_eur(line.get('buy_px'))}**")
+            st.caption(f"le {fmt_date(line.get('buy_date'))}")
             if line.get("note"): st.caption(line["note"])
         with c3:
             if st.button("🗑️ Supprimer", key=f"del_{port_key}_{idx}"):
@@ -533,11 +542,21 @@ if run:
     c5.metric("Valeur (Vous)", to_eur(valB))
     c6.metric("XIRR (Vous)", f"{xirrB:.2f}%" if xirrB is not None else "—")
 
+    # ===== Bloc clair "Et si c’était avec nous ?" =====
     st.subheader("✅ Et si c’était avec nous ?")
-    if valA and valB:
-        st.markdown(f"- **Gain de valeur** vs portefeuille client : **{to_eur(valB - valA)}**")
+    if (valA is not None) and (valB is not None):
+        delta_val = (valB or 0.0) - (valA or 0.0)
+        msg = f"**Vous auriez gagné {to_eur(delta_val)} de plus.**"
+        if (xirrA is not None) and (xirrB is not None):
+            delta_xirr = (xirrB - xirrA)
+            msg += f" **Soit +{delta_xirr:.2f}% de performance annualisée.**"
+        st.success(msg)
+        # Détail conservé
+        st.markdown(f"- **Gain de valeur** vs portefeuille client : **{to_eur(delta_val)}**")
         if xirrA is not None and xirrB is not None:
             st.markdown(f"- **Surperformance annualisée (Δ XIRR)** : **{(xirrB - xirrA):+.2f}%**")
+        if abs((investB or 0.0) - (investA or 0.0)) > 1e-6:
+            st.caption("Note : les investissements totaux peuvent différer (versements). Le Δ valeur compare les valorisations finales.")
     else:
         st.info("Ajoute des lignes et relance pour voir le delta.")
 
@@ -559,6 +578,7 @@ if run:
                 "Quantité": float(ln.get("qty_calc",0.0)),
                 "Prix achat": float(ln.get("buy_px",np.nan)),
                 "Dernier cours": last,
+                "Date d’achat": fmt_date(ln.get("buy_date")),
             })
         dfv=pd.DataFrame(rows)
         st.dataframe(dfv.style.format({"Montant investi €":to_eur,"Quantité":"{:.6f}","Prix achat":to_eur,"Dernier cours":to_eur}),

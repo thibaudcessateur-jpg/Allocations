@@ -2,13 +2,14 @@
 # app.py — Comparateur Portefeuilles CGP
 # - Saisie par MONTANT (€), quantité auto
 # - Résolution EODHD "ISIN-first" avec fallbacks
-# - Noms de fonds auto (même si ISIN seul)
+# - Noms auto via /search quand ISIN seul
 # - Courbes d'évolution (valeur quotidienne)
-# - Versements mensuels + complémentaire (répartis au prorata)
-# - "Et si c'était avec nous ?" (delta valeur & delta XIRR)
+# - Versements mensuels & ponctuels
+# - ⚠️ Affectation des versements paramétrable (pro-rata / custom / 1 seul fonds)
+# - Bloc "Et si c’était avec nous ?" (delta valeur & delta XIRR)
 # =========================================
 import os, re, math, requests, calendar
-from datetime import date, datetime
+from datetime import date
 from typing import Optional, List, Dict, Any, Tuple
 
 import numpy as np
@@ -202,19 +203,6 @@ UNI_OPTIONS = ["— Saisie libre —"] + [f"{r['name']} — {r['isin']}" for r i
 for key in ["A_lines","B_lines"]:
     if key not in st.session_state: st.session_state[key]=[]
 
-# ---------- UI : paramètres de versements ----------
-with st.sidebar:
-    st.header("⚙️ Paramètres")
-    st.subheader("Portefeuille 1 — Client")
-    mA = st.number_input("Versement mensuel (A)", min_value=0.0, value=0.0, step=100.0, help="0€ = désactivé")
-    oneA_amt = st.number_input("Versement complémentaire (A)", min_value=0.0, value=0.0, step=100.0)
-    oneA_date = st.date_input("Date versement complémentaire (A)", value=date.today())
-    st.divider()
-    st.subheader("Portefeuille 2 — Vous")
-    mB = st.number_input("Versement mensuel (B)", min_value=0.0, value=0.0, step=100.0, help="0€ = désactivé")
-    oneB_amt = st.number_input("Versement complémentaire (B)", min_value=0.0, value=0.0, step=100.0)
-    oneB_date = st.date_input("Date versement complémentaire (B)", value=date.today())
-
 # ---------- helpers ----------
 def _auto_name_from_isin(isin: str) -> str:
     if not isin: return ""
@@ -234,6 +222,22 @@ def _get_close_on(df: pd.DataFrame, dt: pd.Timestamp) -> Optional[float]:
         return float(after["Close"].iloc[0])
     return float(df["Close"].iloc[-1]) if not df.empty else None
 
+def _month_end(d: pd.Timestamp) -> pd.Timestamp:
+    last_day = calendar.monthrange(d.year, d.month)[1]
+    return pd.Timestamp(year=d.year, month=d.month, day=last_day)
+
+def _month_schedule(start_dt: pd.Timestamp, end_dt: pd.Timestamp) -> List[pd.Timestamp]:
+    dates=[]; cur=pd.Timestamp(year=start_dt.year, month=start_dt.month, day=start_dt.day)
+    cur = min(cur, _month_end(cur))
+    while cur<=end_dt:
+        dates.append(cur)
+        y = cur.year + (cur.month//12)
+        m = 1 if cur.month==12 else cur.month+1
+        day = min(start_dt.day, calendar.monthrange(y,m)[1])
+        cur = pd.Timestamp(year=y, month=m, day=day)
+    return dates
+
+# ---------- UI : construction lignes ----------
 def _add_line_ui(port_key: str, title: str):
     st.subheader(title)
     with st.form(key=f"{port_key}_form", clear_on_submit=False):
@@ -259,7 +263,6 @@ def _add_line_ui(port_key: str, title: str):
         submitted = st.form_submit_button("➕ Ajouter", type="primary")
 
     if submitted:
-        # montant
         try:
             amt = float(str(amount).replace(" ","").replace(",",".")); assert amt>0
         except Exception:
@@ -268,12 +271,10 @@ def _add_line_ui(port_key: str, title: str):
         if not isin and not name:
             st.warning("Indique au minimum l’**ISIN** ou le **nom** du fonds."); st.stop()
 
-        # série de VL, symbole, note
         dfp, sym_used, note = load_price_series_any(isin or name, pd.Timestamp(dt))
         if dfp.empty:
             st.error("Impossible de récupérer des VL pour ce fonds."); st.stop()
 
-        # prix d'achat
         px = None
         if px_opt:
             try: px = float(str(px_opt).replace(",", "."))
@@ -284,8 +285,6 @@ def _add_line_ui(port_key: str, title: str):
             st.error("Prix d’achat non déterminable."); st.stop()
 
         qty = amt/px
-
-        # auto-nom si besoin
         if not name and isin:
             name = _auto_name_from_isin(isin) or "—"
 
@@ -330,112 +329,137 @@ with tabB:
     _add_line_ui("B_lines","Portefeuille 2 — Vous")
     for i,ln in enumerate(st.session_state["B_lines"]): _line_card(ln,i,"B_lines")
 
-# ---------- Construction séries portefeuille + versements ----------
-def _month_end(d: pd.Timestamp) -> pd.Timestamp:
-    last_day = calendar.monthrange(d.year, d.month)[1]
-    return pd.Timestamp(year=d.year, month=d.month, day=last_day)
+# ---------- Paramètres de versements & AFFECTATION ----------
+def _alloc_sidebar(side_label: str, lines_key: str, prefix: str):
+    st.subheader(side_label)
+    m = st.number_input(f"Versement mensuel ({prefix})", min_value=0.0, value=0.0, step=100.0)
+    one_amt = st.number_input(f"Versement complémentaire ({prefix})", min_value=0.0, value=0.0, step=100.0)
+    one_date = st.date_input(f"Date versement complémentaire ({prefix})", value=date.today())
+    mode = st.selectbox(f"Affectation des versements ({prefix})",
+                        ["Pro-rata montants initiaux", "Répartition personnalisée", "Tout sur un seul fonds"])
+    custom = {}
+    single = None
+    lines = st.session_state[lines_key]
+    if mode == "Répartition personnalisée":
+        if lines:
+            st.caption("Répartir sur les lignes ci-dessous (total ≈ 100 %).")
+            default = round(100.0/len(lines), 2)
+            tot = 0.0
+            for i, ln in enumerate(lines):
+                w = st.slider(f"{ln['name']} ({ln['isin']})", 0.0, 100.0, default, 1.0, key=f"{prefix}_w{i}")
+                custom[id(ln)] = w/100.0
+                tot += w
+            if abs(tot-100.0) > 1.0:
+                st.warning("La somme des poids s’éloigne de 100 % — elle sera renormalisée automatiquement.")
+        else:
+            st.info("Ajoute au moins une ligne pour définir des poids personnalisés.")
+    elif mode == "Tout sur un seul fonds":
+        if lines:
+            options = [f"{ln['name']} — {ln['isin']}" for ln in lines]
+            pick = st.selectbox("Choisir la ligne cible", options, key=f"{prefix}_single_pick")
+            idx = options.index(pick)
+            single = id(lines[idx])
+        else:
+            st.info("Ajoute au moins une ligne pour choisir une cible unique.")
+    return m, one_amt, one_date, mode, custom, single
 
-def _month_schedule(start_dt: pd.Timestamp, end_dt: pd.Timestamp) -> List[pd.Timestamp]:
-    dates=[]; cur=pd.Timestamp(year=start_dt.year, month=start_dt.month, day=start_dt.day)
-    cur = min(cur, _month_end(cur))
-    while cur<=end_dt:
-        dates.append(cur)
-        # next month same day (clamp)
-        y = cur.year + (cur.month//12)
-        m = 1 if cur.month==12 else cur.month+1
-        day = min(start_dt.day, calendar.monthrange(y,m)[1])
-        cur = pd.Timestamp(year=y, month=m, day=day)
-    return dates
+with st.sidebar:
+    st.header("⚙️ Paramètres")
+    mA, oneA_amt, oneA_date, modeA, customA, singleA = _alloc_sidebar("Portefeuille 1 — Client", "A_lines", "A")
+    st.divider()
+    mB, oneB_amt, oneB_date, modeB, customB, singleB = _alloc_sidebar("Portefeuille 2 — Vous", "B_lines", "B")
+
+# ---------- Construction séries portefeuille + versements ----------
+def _weights_for(lines: List[Dict[str,Any]], mode: str, custom: Dict[int,float], single_id: Optional[int]) -> Dict[int,float]:
+    if not lines:
+        return {}
+    if mode == "Tout sur un seul fonds" and single_id is not None:
+        return {id(ln): (1.0 if id(ln)==single_id else 0.0) for ln in lines}
+    if mode == "Répartition personnalisée" and custom:
+        s = sum(max(0.0, v) for v in custom.values())
+        if s <= 0:
+            # fallback égalitaire
+            return {id(ln): 1.0/len(lines) for ln in lines}
+        return {k: max(0.0, v)/s for k,v in custom.items()}
+    # Pro-rata montants initiaux (défaut)
+    total = sum(float(ln["amount"]) for ln in lines)
+    if total > 0:
+        return {id(ln): float(ln["amount"])/total for ln in lines}
+    return {id(ln): 1.0/len(lines) for ln in lines}
 
 @st.cache_data(ttl=1800, show_spinner=False)
 def build_portfolio_series(lines: List[Dict[str,Any]],
                            monthly_amt: float,
-                           one_amt: float, one_date: date) -> Tuple[pd.DataFrame, float, float, Optional[float]]:
+                           one_amt: float, one_date: date,
+                           alloc_mode: str,
+                           custom_weights: Dict[int,float],
+                           single_target: Optional[int]) -> Tuple[pd.DataFrame, float, float, Optional[float]]:
     """Retourne (df_valeur, total_investi, valeur_finale, xirr_pct)
-       df_valeur : index dates, colonne 'Valeur'
-       Achats mensuels répartis au prorata des montants initiaux.
+       Versements appliqués selon 'alloc_mode' (pro-rata / custom / single_target).
     """
     if not lines:
         return pd.DataFrame(), 0.0, 0.0, None
 
-    # collect price series and initial positions
+    # séries de prix
     min_dt = min(pd.Timestamp(l["buy_date"]) for l in lines)
     max_dt = TODAY
-    # load all series
     series = {}
     for ln in lines:
         df,_,_ = load_price_series_any(ln.get("isin") or ln.get("name"), None)
         if df.empty: continue
         series[id(ln)] = df["Close"]
 
-    # common date index (business days union of all)
     idx = pd.Index(sorted(set().union(*[s.index for s in series.values()])))
     idx = idx[(idx>=min_dt) & (idx<=max_dt)]
     if len(idx)==0:
         return pd.DataFrame(), 0.0, 0.0, None
 
-    # current quantities per line (start with initial)
+    # quantités courantes
     qty = {id(ln): float(ln["qty_calc"]) for ln in lines}
-    invested_initial = sum(float(ln["amount"]) for ln in lines)
 
-    # weights for contributions (pro-rata initial amounts; if zero -> égalitaire)
-    weights = {id(ln): (float(ln["amount"])/invested_initial if invested_initial>0 else 1/len(lines)) for ln in lines}
+    # poids d'affectation
+    weights = _weights_for(lines, alloc_mode, custom_weights, single_target)
 
-    # cash flows for XIRR
-    cash_flows = []
-    for ln in lines:
-        cash_flows.append((pd.Timestamp(ln["buy_date"]), -float(ln["amount"])))
+    # cash-flows XIRR
+    cash_flows = [(pd.Timestamp(ln["buy_date"]), -float(ln["amount"])) for ln in lines]
 
-    # schedule contributions
-    if monthly_amt>0:
-        sched = _month_schedule(min_dt, TODAY)
-    else:
-        sched = []
+    # calendrier versements
+    sched = _month_schedule(min_dt, TODAY) if monthly_amt>0 else []
     one_dt = pd.Timestamp(one_date) if one_amt>0 else None
 
     values=[]
     for d in idx:
-        # process contributions on this date
-        if one_dt is not None and d==one_dt:
+        # versement ponctuel
+        if one_dt is not None and d==one_dt and one_amt>0:
             for ln in lines:
-                sid=id(ln); s=series[sid]
-                # prix du jour (ou prochain dispo)
-                if d in s.index: px=float(s.loc[d])
-                else:
-                    after=s.loc[s.index>=d]
-                    if after.empty: continue
-                    px=float(after.iloc[0])
-                alloc = one_amt * weights[sid]
-                qty[sid] += alloc/px
+                sid=id(ln); s=series[sid]; w=weights.get(sid, 0.0)
+                if w<=0: continue
+                px = float(s.loc[d]) if d in s.index else float(s.loc[s.index>=d].iloc[0])
+                qty[sid] += (one_amt * w)/px
             cash_flows.append((d, -float(one_amt)))
-
-        if d in sched:
+        # versement mensuel
+        if d in sched and monthly_amt>0:
             for ln in lines:
-                sid=id(ln); s=series[sid]
-                if d in s.index: px=float(s.loc[d])
-                else:
-                    after=s.loc[s.index>=d]
-                    if after.empty: continue
-                    px=float(after.iloc[0])
-                alloc = monthly_amt * weights[sid]
-                qty[sid] += alloc/px
+                sid=id(ln); s=series[sid]; w=weights.get(sid, 0.0)
+                if w<=0: continue
+                px = float(s.loc[d]) if d in s.index else float(s.loc[s.index>=d].iloc[0])
+                qty[sid] += (monthly_amt * w)/px
             cash_flows.append((d, -float(monthly_amt)))
 
-        # compute value today
+        # valeur du jour
         v=0.0
         for ln in lines:
-            sid=id(ln)
-            s=series[sid]
-            if d in s.index:
-                px=float(s.loc[d]); v += qty[sid]*px
+            sid=id(ln); s=series[sid]
+            if d in s.index: px=float(s.loc[d])
             else:
                 before=s.loc[s.index<=d]
                 if before.empty: continue
-                px=float(before.iloc[-1]); v += qty[sid]*px
+                px=float(before.iloc[-1])
+            v += qty[sid]*px
         values.append((d, v))
 
     df_val = pd.DataFrame(values, columns=["date","Valeur"]).set_index("date")
-    total_invested = invested_initial + (len(sched)*monthly_amt if monthly_amt>0 else 0.0) + (one_amt if one_amt>0 else 0.0)
+    total_invested = sum(float(ln["amount"]) for ln in lines) + len(sched)*monthly_amt + (one_amt if one_amt>0 else 0.0)
     final_val = float(df_val["Valeur"].iloc[-1])
     cash_flows.append((TODAY, final_val))
     irr = xirr(cash_flows)
@@ -446,21 +470,23 @@ st.divider()
 run = st.button("🚀 Lancer la comparaison", type="primary")
 
 if run:
-    # Séries + KPIs
-    dfA, investA, valA, xirrA = build_portfolio_series(st.session_state["A_lines"], mA, oneA_amt, oneA_date)
-    dfB, investB, valB, xirrB = build_portfolio_series(st.session_state["B_lines"], mB, oneB_amt, oneB_date)
+    dfA, investA, valA, xirrA = build_portfolio_series(
+        st.session_state["A_lines"], mA, oneA_amt, oneA_date, modeA, customA, singleA)
+    dfB, investB, valB, xirrB = build_portfolio_series(
+        st.session_state["B_lines"], mB, oneB_amt, oneB_date, modeB, customB, singleB)
 
     st.subheader("📈 Évolution de la valeur des portefeuilles")
     if not dfA.empty or not dfB.empty:
         df_plot = pd.DataFrame(index=sorted(set(dfA.index).union(dfB.index)))
         if not dfA.empty: df_plot["Client"] = dfA["Valeur"]
         if not dfB.empty: df_plot["Vous"] = dfB["Valeur"]
-        fig = px.line(df_plot, x=df_plot.index, y=df_plot.columns, labels={"value":"Valeur (€)","index":"Date"}, title="Valeur quotidienne")
+        fig = px.line(df_plot, x=df_plot.index, y=df_plot.columns,
+                      labels={"value":"Valeur (€)","index":"Date"},
+                      title="Valeur quotidienne (avec versements selon l’affectation choisie)")
         st.plotly_chart(fig, use_container_width=True)
     else:
         st.info("Ajoute des lignes pour au moins un portefeuille.")
 
-    # Synthèse
     st.subheader("📊 Synthèse chiffrée")
     c1,c2,c3,c4,c5,c6 = st.columns(6)
     c1.metric("Investi (Client)", to_eur(investA))
@@ -472,18 +498,13 @@ if run:
 
     st.subheader("✅ Et si c’était avec nous ?")
     if valA and valB:
-        delta_val = valB - valA
-        delta_inv = investB - investA
-        # on compare la valeur finale à investissement possiblement différent
-        st.markdown(f"- **Gain de valeur** vs portefeuille client : **{to_eur(delta_val)}**")
+        st.markdown(f"- **Gain de valeur** vs portefeuille client : **{to_eur(valB - valA)}**")
         if xirrA is not None and xirrB is not None:
             st.markdown(f"- **Surperformance annualisée (Δ XIRR)** : **{(xirrB - xirrA):+.2f}%**")
-        if abs(delta_inv) > 1e-6:
-            st.caption("Note : les investissements totaux diffèrent (versements). Le Δ valeur compare les valorisations finales.")
     else:
         st.info("Ajoute des lignes et relance pour voir le delta.")
 
-    # Détail des positions (état actuel simple)
+    # Détail positions actuelles
     def _detail_table(lines: List[Dict[str,Any]], title:str):
         st.markdown(f"#### {title}")
         if not lines:
@@ -510,7 +531,7 @@ if run:
     with d1: _detail_table(st.session_state["A_lines"], "Portefeuille 1 — Client (positions)")
     with d2: _detail_table(st.session_state["B_lines"], "Portefeuille 2 — Vous (positions)")
 else:
-    st.info("Renseigne tes lignes, tes versements (optionnels) puis clique **Lancer la comparaison**.")
+    st.info("Renseigne tes lignes, paramètre **où** investir les versements dans la barre latérale, puis clique **Lancer la comparaison**.")
 
 # ---------- Debug (optionnel) ----------
 with st.expander("🔧 Debug EODHD (optionnel)"):

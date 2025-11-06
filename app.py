@@ -1,5 +1,6 @@
 # =========================================
-# app.py — Comparateur Portefeuilles CGP (focus ISIN, récupération VL robuste)
+# app.py — Comparateur Portefeuilles CGP
+# Saisie par MONTANT investi (€), quantité auto = montant / prix d'achat
 # =========================================
 import os, re, math, requests
 from datetime import date
@@ -43,8 +44,7 @@ def to_pct(x: float) -> str:
 
 
 # =========================================
-# 2) EODHD CLIENT (recherche & prix)
-#     -> Stratégie "Valeris-like": ISIN-first + fallbacks VL
+# 2) EODHD CLIENT (recherche & prix) — ISIN-first + fallbacks
 # =========================================
 EODHD_BASE = "https://eodhd.com/api"
 
@@ -154,10 +154,9 @@ def eod_prices_any(symbol_or_isin: str, start_dt: Optional[pd.Timestamp] = None)
     Retourne (df_prices, symbol_used, note)
     df_prices: colonnes ['Close'] indexées par date
     Stratégie:
-      1) Si 'symbol_or_isin' a déjà un suffixe -> /eod sans 'from', puis avec 'from'
-      2) Si c'est un ISIN sans suffixe -> tester .EUFUND/.FUND/.USFUND (sans from, puis avec)
-      3) Sinon essayer suffixes actions EU
-      4) Si toujours vide: fallback au dernier prix depuis /search, série d'un point
+      1) /eod sans 'from', puis avec 'from'
+      2) Variantes .EUFUND/.FUND/.USFUND, puis suffixes actions
+      3) Fallback: dernier prix depuis /search en série 1 point
     """
     q = (symbol_or_isin or "").strip().upper()
     note = ""
@@ -175,58 +174,49 @@ def eod_prices_any(symbol_or_isin: str, start_dt: Optional[pd.Timestamp] = None)
         df["close"] = pd.to_numeric(df["close"], errors="coerce")
         return df[["close"]].rename(columns={"close": "Close"})
 
-    # Helper: try sequence no-from then from
     def _try_with_without_from(sym: str, from_ts: Optional[pd.Timestamp]) -> Optional[pd.DataFrame]:
-        # 1) no from
         df = _fetch(sym, None)
         if not df.empty:
-            # si from_ts fourni, on coupe localement
             if from_ts is not None:
                 df = df.loc[df.index >= from_ts]
             if not df.empty:
                 return df
-        # 2) with from
         f = from_ts.strftime("%Y-%m-%d") if from_ts is not None else None
         df = _fetch(sym, f)
         if not df.empty:
             return df
         return None
 
-    # Detect if already a symbol with suffix
+    # déjà un symbole ?
     if "." in q and not _looks_like_isin(q.split(".")[0]):
         df = _try_with_without_from(q, start_dt)
         if df is not None:
             return df, q, note
 
-    # If it looks like ISIN without suffix, try fund exchanges
     base = q.split(".")[0]
     if _looks_like_isin(base):
-        # 1) Prefer resolved symbol (if exists)
         sym_res = resolve_symbol(base)
         if sym_res:
             df = _try_with_without_from(sym_res, start_dt)
             if df is not None:
                 return df, sym_res, note
 
-        # 2) Try direct preferred fund exchanges
         for suf in PREFERRED_FUND_EXCH:
             sym = f"{base}{suf}"
             df = _try_with_without_from(sym, start_dt)
             if df is not None:
                 return df, sym, note
 
-        # 3) Try alt equity exchanges
         for suf in ALT_EQUITY_EXCH:
             sym = f"{base}{suf}"
             df = _try_with_without_from(sym, start_dt)
             if df is not None:
                 return df, sym, note
 
-    # 4) Fallback: last close from /search -> single-point series
+    # Fallback: dernier cours via /search
     srch = eod_search(base if _looks_like_isin(base) else q)
     last_px, last_dt = None, None
     if srch:
-        # essaye de trouver le bon item (priorité à ISIN exact si dispo)
         choices = srch
         if _looks_like_isin(base):
             choices = [it for it in srch if str(it.get("ISIN", "")).upper() == base] or srch
@@ -238,16 +228,14 @@ def eod_prices_any(symbol_or_isin: str, start_dt: Optional[pd.Timestamp] = None)
             last_px = float(last_px)
             last_dt = pd.to_datetime(last_dt).normalize() if last_dt else TODAY
             df = pd.DataFrame({"Close": [last_px]}, index=[last_dt])
-            note = "⚠️ Historique VL indisponible via /eod — utilisation du dernier cours renvoyé par /search."
+            note = "⚠️ Historique VL indisponible via /eod — utilisation du dernier cours (/search)."
             used = resolve_symbol(base) or base
             return df, used, note
         except Exception:
             pass
 
-    # Rien trouvé
-    return pd.DataFrame(), q, "⚠️ Aucune VL récupérée (symbole introuvable ou non couvert par l’API EODHD)."
+    return pd.DataFrame(), q, "⚠️ Aucune VL récupérée (symbole introuvable ou non couvert par l’API)."
 
-# Wrapper de confort
 @st.cache_data(ttl=3600, show_spinner=False)
 def load_price_series_any(symbol_or_isin: str, from_dt: Optional[pd.Timestamp]) -> Tuple[pd.DataFrame, str, str]:
     return eod_prices_any(symbol_or_isin, from_dt)
@@ -297,11 +285,11 @@ UNI_OPTIONS = ["— Saisie libre —"] + [f"{r['name']} — {r['isin']}" for r i
 # 5) UI — Constructeur de portefeuilles (cartes)
 # =========================================
 st.title("🟣 Comparer deux portefeuilles (Client vs Vous)")
-st.caption("ISIN seul accepté, touche **Entrée** valide. VL récupérées avec fallback multi-exchanges.")
+st.caption("**Montant investi (€)** par ligne (la quantité est calculée automatiquement). ISIN seul accepté.")
 
 for key in ["A_lines", "B_lines"]:
     if key not in st.session_state:
-        st.session_state[key] = []  # {name, isin, qty, buy_date, buy_px_opt}
+        st.session_state[key] = []  # {name, isin, amount, buy_date, buy_px_opt, sym_used, note}
 
 def _parse_float(x: Any) -> Optional[float]:
     if x in (None, "", "—"): return None
@@ -309,20 +297,24 @@ def _parse_float(x: Any) -> Optional[float]:
     except: return None
 
 def _line_card(line: Dict[str, Any], idx: int, port_key: str):
-    col1, col2, col3, col4, col5 = st.columns([3,2,1.4,1.6,0.8])
+    col1, col2, col3, col4, col5, col6 = st.columns([3,1.6,1.6,1.6,1.4,0.8])
     with col1:
         st.markdown(f"**{line.get('name','?')}**")
         st.caption(f"ISIN : `{line.get('isin','—')}`")
     with col2:
-        st.markdown(f"**Quantité :** {line.get('qty','—')}")
+        st.markdown(f"**Montant investi :** {to_eur(line.get('amount')) if line.get('amount') else '—'}")
         st.caption(f"Achat : {line.get('buy_date')}")
     with col3:
         st.markdown("Prix achat")
-        st.markdown(f"{to_eur(line.get('buy_px_opt')) if line.get('buy_px_opt') else '—'}")
+        st.markdown(f"{to_eur(line.get('buy_px_opt')) if line.get('buy_px_opt') else 'auto (VL)'}")
     with col4:
+        st.markdown("Quantité (calculée)")
+        q = line.get("qty_calc")
+        st.markdown(f"{q:.6f}" if isinstance(q, (int,float)) and not pd.isna(q) else "—")
+    with col5:
         st.caption("Symbole utilisé")
         st.code(line.get("sym_used", "—"))
-    with col5:
+    with col6:
         if st.button("🗑️", key=f"del_{port_key}_{idx}", help="Supprimer cette ligne"):
             st.session_state[port_key].pop(idx)
             st.experimental_rerun()
@@ -335,13 +327,13 @@ def _add_line_ui(port_key: str, title: str):
         with c1:
             sel = st.selectbox("Choisir un fonds (ou saisie libre) :", UNI_OPTIONS, key=f"{port_key}_select")
         with c2:
-            qty = st.number_input("Quantité", min_value=0.0, value=0.0, step=1.0, key=f"{port_key}_qty")
+            amount = st.text_input("Montant investi (€)", value="", key=f"{port_key}_amount", help="Ex: 10 000 ou 10000,00")
 
         c3, c4 = st.columns(2)
         with c3:
             dt = st.date_input("Date d’achat", value=date(2024,1,2), key=f"{port_key}_date")
         with c4:
-            px_opt = st.text_input("Prix d’achat (optionnel)", value="", key=f"{port_key}_px")
+            px_opt = st.text_input("Prix d’achat (optionnel, sinon VL)", value="", key=f"{port_key}_px")
 
         if sel != "— Saisie libre —":
             name, isin = sel.split(" — ")
@@ -354,10 +346,15 @@ def _add_line_ui(port_key: str, title: str):
         submitted = st.form_submit_button("➕ Ajouter la ligne", type="primary")
 
     if submitted:
-        valid_free = (bool(isin) or bool(name)) and qty > 0
-        valid_list = (sel != "— Saisie libre —") and qty > 0
+        amt = _parse_float(amount)
+        if not amt or amt <= 0:
+            st.warning("Entre un **montant investi (€)** strictement positif.")
+            st.stop()
+
+        valid_free = (bool(isin) or bool(name))
+        valid_list = (sel != "— Saisie libre —")
         if not (valid_free or valid_list):
-            st.warning("Indique au minimum le fonds (ISIN ou Nom) et une quantité > 0.")
+            st.warning("Indique au minimum le fonds (ISIN ou Nom).")
             st.stop()
 
         try:
@@ -365,19 +362,38 @@ def _add_line_ui(port_key: str, title: str):
         except Exception:
             buy_px_opt = None
 
-        # On charge DIRECT la série (avec multi-fallback) pour valider tout de suite
+        # On charge la série dès maintenant (multi-fallback) pour:
+        #  - récupérer la VL d'achat
+        #  - calculer la quantité
         from_ts = pd.Timestamp(dt)
         dfp, sym_used, note = load_price_series_any(isin or name, from_ts)
-
         if dfp.empty:
             st.error("Impossible de récupérer des VL via EODHD pour ce fonds.")
             st.info("Astuce: vérifie l’ISIN exact. L’app teste .EUFUND, .FUND, .USFUND et quelques places actions.")
             st.stop()
 
+        # prix d’achat
+        if buy_px_opt is None:
+            # tente VL du jour d'achat, sinon première après
+            if from_ts in dfp.index:
+                px_buy = float(dfp.loc[from_ts, "Close"])
+            else:
+                after = dfp.loc[dfp.index >= from_ts]
+                px_buy = float(after["Close"].iloc[0]) if not after.empty else float(dfp["Close"].iloc[0])
+        else:
+            px_buy = float(buy_px_opt)
+
+        if px_buy <= 0 or pd.isna(px_buy):
+            st.error("Prix d’achat non déterminable (VL indisponible).")
+            st.stop()
+
+        qty_calc = float(amt) / float(px_buy)
+
         line = {
             "name": name or "—",
             "isin": isin or "",
-            "qty": float(qty),
+            "amount": float(amt),
+            "qty_calc": qty_calc,
             "buy_date": pd.Timestamp(dt),
             "buy_px_opt": buy_px_opt,
             "sym_used": sym_used,
@@ -407,11 +423,10 @@ with tabB:
 
 
 # =========================================
-# 6) CALCUL DES PERFORMANCES
+# 6) CALCUL DES PERFORMANCES (avec 'amount' prioritaire)
 # =========================================
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_series_for_line(line: Dict[str, Any]) -> pd.DataFrame:
-    # Recharge la série avec les mêmes fallbacks, coupe à la date d'achat
     dfp, _, _ = load_price_series_any(line.get("isin") or line.get("name"), pd.Timestamp(line["buy_date"]))
     return dfp
 
@@ -436,27 +451,32 @@ def compute_portfolio_from_lines(lines: List[Dict[str, Any]], label: str) -> Tup
     for ln in lines:
         name = str(ln.get("name","")).strip()
         isin = str(ln.get("isin","")).strip() or None
-        qty  = float(ln.get("qty", 0.0))
+        amount = float(ln.get("amount", 0.0) or 0.0)   # ✅ montant investi prioritaire
+        qty_calc = float(ln.get("qty_calc") or 0.0)
         d_buy: pd.Timestamp = ln.get("buy_date")
         px_buy_opt = ln.get("buy_px_opt")
         sym_used = ln.get("sym_used", "—")
 
-        if (not name and not isin) or qty <= 0 or d_buy is None:
+        if (not name and not isin) or amount <= 0 or d_buy is None:
             continue
 
         dfp = get_series_for_line(ln)
         last_close = dfp["Close"].iloc[-1] if not dfp.empty else np.nan
 
+        # prix d'achat réel (si px_buy_opt non fourni)
         if px_buy_opt is None:
             px_buy = get_close_on(dfp, d_buy)
             if px_buy is None:
                 after = dfp.loc[dfp.index >= d_buy]
-                px_buy = float(after["Close"].iloc[0]) if not after.empty else np.nan
+                px_buy = float(after["Close"].iloc[0]) if not after.empty else float(dfp["Close"].iloc[0])
         else:
             px_buy = float(px_buy_opt)
 
-        investi = float(qty) * float(px_buy) if pd.notna(px_buy) else np.nan
-        valeur  = float(qty) * float(last_close) if pd.notna(last_close) else np.nan
+        # quantité utilisée pour la valorisation : recompute si besoin pour robustesse
+        qty_eff = qty_calc if qty_calc > 0 else (amount / px_buy if px_buy else np.nan)
+
+        investi = amount  # ✅ on respecte exactement le montant saisi
+        valeur  = float(qty_eff) * float(last_close) if (pd.notna(last_close) and not pd.isna(qty_eff)) else np.nan
         pl_eur  = valeur - investi if (pd.notna(valeur) and pd.notna(investi)) else np.nan
         perf_pct = (valeur / investi - 1.0) * 100.0 if (pd.notna(valeur) and pd.notna(investi) and investi != 0) else np.nan
 
@@ -464,11 +484,11 @@ def compute_portfolio_from_lines(lines: List[Dict[str, Any]], label: str) -> Tup
             "Fonds": name or "—",
             "ISIN": isin or "—",
             "Symbole": sym_used,
-            "Quantité": qty,
+            "Montant investi €": investi,
+            "Quantité": qty_eff,
             "Date achat": d_buy.date(),
             "Prix achat": px_buy if pd.notna(px_buy) else "—",
             "Dernier cours": last_close if pd.notna(last_close) else "ND",
-            "Investi €": investi,
             "Valeur actuelle €": valeur,
             "P&L €": pl_eur,
             "Perf % depuis achat": perf_pct
@@ -543,13 +563,13 @@ if run:
             return
         for _, r in df_lines.iterrows():
             with st.container(border=True):
-                c1, c2, c3, c4 = st.columns([3,2,2,2])
+                c1, c2, c3, c4 = st.columns([3,2.2,2.2,2.2])
                 with c1:
                     st.markdown(f"**{r['Fonds']}**")
                     st.caption(f"ISIN : `{r['ISIN']}` • Symbole : `{r['Symbole']}`")
                 with c2:
-                    st.markdown(f"**Quantité :** {r['Quantité']}")
-                    st.caption(f"Achat : {r['Date achat']}")
+                    st.markdown(f"Investi\n\n**{to_eur(r['Montant investi €'])}**")
+                    st.caption(f"Quantité : **{(r['Quantité'] if pd.notna(r['Quantité']) else '—')}**")
                 with c3:
                     st.markdown(f"Prix achat\n\n**{to_eur(r['Prix achat']) if isinstance(r['Prix achat'], (int,float)) else r['Prix achat']}**")
                     st.caption(f"Dernier : **{to_eur(r['Dernier cours']) if isinstance(r['Dernier cours'], (int,float)) else r['Dernier cours']}**")
@@ -559,9 +579,10 @@ if run:
         with st.expander("Voir le tableau récapitulatif"):
             st.dataframe(
                 df_lines.style.format({
+                    "Montant investi €": to_eur, "Quantité": "{:.6f}",
                     "Prix achat": to_eur, "Dernier cours": to_eur,
-                    "Investi €": to_eur, "Valeur actuelle €": to_eur,
-                    "P&L €": to_eur, "Perf % depuis achat": "{:.2f}%"
+                    "Valeur actuelle €": to_eur, "P&L €": to_eur,
+                    "Perf % depuis achat": "{:.2f}%"
                 }, na_rep=""),
                 use_container_width=True, hide_index=True
             )
@@ -588,7 +609,7 @@ if run:
     )
 
 else:
-    st.info("Ajoute des lignes (ISIN seul possible), puis clique **Comparer**.")
+    st.info("Ajoute des lignes avec un **montant investi (€)**, puis clique **Comparer**.")
 
 
 # =========================================

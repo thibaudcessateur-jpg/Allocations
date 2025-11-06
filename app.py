@@ -582,3 +582,168 @@ if run_ref:
         st.line_chart(base100.rename(columns={"Valeur": "Référence (base 100)"}))
 else:
     st.info("Remplis les poids, la date (et VLP si besoin), puis clique **Calculer**.")
+
+# =========================================
+# 08) PORTEFEUILLES PAR POIDS — A (client) vs B (toi)
+#     - même logique que le portefeuille de référence
+#     - poids (0% possible), date, montant initial, VLP
+# =========================================
+
+st.divider()
+st.header("⚖️ Comparaison par composition (poids) — Portefeuille A vs Portefeuille B")
+
+# --- Table poids A & B (pré-remplies avec l'univers Generali)
+_w_template = pd.DataFrame(
+    [{"Fonds": r["name"], "ISIN": r["isin"], "Type": r["type"], "Poids %": 0.0} for r in UNIVERSE_GENERALI]
+)
+
+cA, cB = st.columns(2)
+with cA:
+    st.subheader("Portefeuille A (client) — Composition")
+    df_weights_A = st.data_editor(_w_template.copy(), use_container_width=True, num_rows="fixed", key="weights_A")
+with cB:
+    st.subheader("Portefeuille B (toi) — Composition")
+    df_weights_B = st.data_editor(_w_template.copy(), use_container_width=True, num_rows="fixed", key="weights_B")
+
+# --- Paramètres d’investissement A & B
+colA1, colA2, colA3 = st.columns(3)
+with colA1:
+    A_initial_date = st.date_input("A — Date d’investissement initial", value=date(2024, 1, 2), key="A_dt")
+with colA2:
+    A_initial_amount = st.number_input("A — Montant initial (€)", min_value=0.0, value=10000.0, step=500.0, format="%.2f", key="A_amt")
+with colA3:
+    A_euro_rate = st.number_input("A — Rendement annuel Fonds € (%)", min_value=0.0, value=euro_rate, step=0.10, format="%.2f", key="A_euro")
+
+colA4, colA5, colA6, colA7 = st.columns(4)
+with colA4:
+    A_vlp_enable = st.checkbox("A — Activer VLP mensuels", value=False, key="A_vlp_on")
+with colA5:
+    A_vlp_amount = st.number_input("A — Montant VLP mensuel (€)", min_value=0.0, value=300.0, step=50.0, format="%.2f", disabled=not A_vlp_enable, key="A_vlp_amt")
+with colA6:
+    A_vlp_start = st.date_input("A — Début VLP", value=A_initial_date, disabled=not A_vlp_enable, key="A_vlp_start")
+with colA7:
+    A_vlp_end = st.date_input("A — Fin VLP", value=date.today(), disabled=not A_vlp_enable, key="A_vlp_end")
+
+colB1, colB2, colB3 = st.columns(3)
+with colB1:
+    B_initial_date = st.date_input("B — Date d’investissement initial", value=date(2024, 1, 2), key="B_dt")
+with colB2:
+    B_initial_amount = st.number_input("B — Montant initial (€)", min_value=0.0, value=10000.0, step=500.0, format="%.2f", key="B_amt")
+with colB3:
+    B_euro_rate = st.number_input("B — Rendement annuel Fonds € (%)", min_value=0.0, value=euro_rate, step=0.10, format="%.2f", key="B_euro")
+
+colB4, colB5, colB6, colB7 = st.columns(4)
+with colB4:
+    B_vlp_enable = st.checkbox("B — Activer VLP mensuels", value=False, key="B_vlp_on")
+with colB5:
+    B_vlp_amount = st.number_input("B — Montant VLP mensuel (€)", min_value=0.0, value=300.0, step=50.0, format="%.2f", disabled=not B_vlp_enable, key="B_vlp_amt")
+with colB6:
+    B_vlp_start = st.date_input("B — Début VLP", value=B_initial_date, disabled=not B_vlp_enable, key="B_vlp_start")
+with colB7:
+    B_vlp_end = st.date_input("B — Fin VLP", value=date.today(), disabled=not B_vlp_enable, key="B_vlp_end")
+
+# ⚠️ Important : si le "Fonds en euros" est présent, on réutilise la série synthétique avec le taux saisi
+# on met à jour euro_rate dynamique avant calcul
+def _set_euro_rate(rate: float):
+    # simple setter local: la fonction euro_fund_series lit euro_rate via la closure de load_price_series_generic (si tu préfères, passe rate en param)
+    # Ici on écrase la variable globale 'euro_rate' si elle existe
+    try:
+        globals()["euro_rate"] = rate
+    except Exception:
+        pass
+
+run_comp = st.button("🚀 Calculer A (client) vs B (toi) — par composition", type="primary")
+
+if run_comp:
+    # normalise les poids et calcule chaque portefeuille via simulate_reference_portfolio
+    # (on réutilise la logique de la section Référence)
+    # A
+    _set_euro_rate(A_euro_rate)
+    resA = simulate_reference_portfolio(
+        df_weights_A, A_initial_date, A_initial_amount,
+        A_vlp_enable, A_vlp_amount, A_vlp_start, A_vlp_end
+    )
+    # B
+    _set_euro_rate(B_euro_rate)
+    resB = simulate_reference_portfolio(
+        df_weights_B, B_initial_date, B_initial_amount,
+        B_vlp_enable, B_vlp_amount, B_vlp_start, B_vlp_end
+    )
+
+    if resA and resB:
+        st.subheader("📈 Valeur des portefeuilles (VL agrégées)")
+        left, right = st.columns(2)
+        with left:
+            st.markdown("**Portefeuille A (client)**")
+            figA = px.line(resA["values"].reset_index(), x="Date", y="Valeur", title="A — Valeur du portefeuille")
+            st.plotly_chart(figA, use_container_width=True)
+        with right:
+            st.markdown("**Portefeuille B (toi)**")
+            figB = px.line(resB["values"].reset_index(), x="Date", y="Valeur", title="B — Valeur du portefeuille")
+            st.plotly_chart(figB, use_container_width=True)
+
+        # Métriques côte-à-côte
+        st.subheader("📊 Synthèse")
+        c1, c2 = st.columns(2)
+        with c1:
+            st.markdown("### A (client)")
+            ca1, ca2, ca3, ca4 = st.columns(4)
+            ca1.metric("Investi", to_eur(resA["investi"]))
+            ca2.metric("Valeur", to_eur(resA["final"]))
+            ca3.metric("P&L", to_eur(resA["pl"]))
+            ca4.metric("Perf", f"{resA['perf_pct']:.2f}%")
+            st.markdown(f"**XIRR (annualisé)** : {'' if pd.isna(resA['xirr_pct']) else f'{resA['xirr_pct']:.2f}%'}")
+
+        with c2:
+            st.markdown("### B (toi)")
+            cb1, cb2, cb3, cb4 = st.columns(4)
+            cb1.metric("Investi", to_eur(resB["investi"]))
+            cb2.metric("Valeur", to_eur(resB["final"]))
+            cb3.metric("P&L", to_eur(resB["pl"]))
+            cb4.metric("Perf", f"{resB['perf_pct']:.2f}%")
+            st.markdown(f"**XIRR (annualisé)** : {'' if pd.isna(resB['xirr_pct']) else f'{resB['xirr_pct']:.2f}%'}")
+
+        # Base 100 comparée
+        st.subheader("📎 Comparaison directe — Base 100")
+        base = pd.concat(
+            [
+                resA["values"].rename(columns={"Valeur": "A (client)"}),
+                resB["values"].rename(columns={"Valeur": "B (toi)"}),
+            ],
+            axis=1
+        ).dropna(how="any")
+        if not base.empty:
+            base100 = base / base.iloc[0] * 100.0
+            fig_comp = px.line(base100.reset_index(), x="Date", y=base100.columns, title="A vs B — Base 100")
+            st.plotly_chart(fig_comp, use_container_width=True)
+        else:
+            st.info("Périodes non chevauchantes : impossible de tracer la base 100 commune. Essaie de rapprocher les dates d’investissement.")
+
+        # Détail positions au dernier point (optionnel)
+        with st.expander("📄 Détail des positions (dernier jour)"):
+            # A
+            lastA = resA["values"].index[-1]
+            last_px_A = resA["prices"].loc[lastA]
+            tblA = []
+            for f in resA["prices"].columns:
+                qty = resA["parts"].get(f, 0.0)
+                px = float(last_px_A.get(f, np.nan))
+                val = qty * px if pd.notna(px) else np.nan
+                tblA.append({"Portefeuille": "A", "Fonds": f, "Parts détenues": qty, "Dernier prix": px, "Valeur €": val})
+            # B
+            lastB = resB["values"].index[-1]
+            last_px_B = resB["prices"].loc[lastB]
+            tblB = []
+            for f in resB["prices"].columns:
+                qty = resB["parts"].get(f, 0.0)
+                px = float(last_px_B.get(f, np.nan))
+                val = qty * px if pd.notna(px) else np.nan
+                tblB.append({"Portefeuille": "B", "Fonds": f, "Parts détenues": qty, "Dernier prix": px, "Valeur €": val})
+
+            df_pos = pd.DataFrame(tblA + tblB)
+            st.dataframe(
+                df_pos.style.format({"Parts détenues": "{:.4f}", "Dernier prix": to_eur, "Valeur €": to_eur}, na_rep=""),
+                use_container_width=True, hide_index=True
+            )
+    else:
+        st.warning("Renseigne des poids > 0 et vérifie que des VL sont disponibles sur la période.")

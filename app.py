@@ -4,9 +4,9 @@
 # - Résolution EODHD "ISIN-first" avec fallbacks
 # - Noms auto via /search quand ISIN seul
 # - Courbes d'évolution (valeur quotidienne)
-# - Versements mensuels & ponctuels
-# - ⚠️ Affectation des versements paramétrable (pro-rata / custom / 1 seul fonds)
-# - Bloc "Et si c’était avec nous ?" (delta valeur & delta XIRR)
+# - Versements mensuels & ponctuel, affectation paramétrable
+# - FIX: quantités initiales ajoutées le JOUR EFFECTIF d’achat
+# - Bloc "Et si c’était avec nous ?" (delta valeur & XIRR)
 # =========================================
 import os, re, math, requests, calendar
 from datetime import date
@@ -369,7 +369,6 @@ with st.sidebar:
     st.divider()
     mB, oneB_amt, oneB_date, modeB, customB, singleB = _alloc_sidebar("Portefeuille 2 — Vous", "B_lines", "B")
 
-# ---------- Construction séries portefeuille + versements ----------
 def _weights_for(lines: List[Dict[str,Any]], mode: str, custom: Dict[int,float], single_id: Optional[int]) -> Dict[int,float]:
     if not lines:
         return {}
@@ -378,15 +377,14 @@ def _weights_for(lines: List[Dict[str,Any]], mode: str, custom: Dict[int,float],
     if mode == "Répartition personnalisée" and custom:
         s = sum(max(0.0, v) for v in custom.values())
         if s <= 0:
-            # fallback égalitaire
             return {id(ln): 1.0/len(lines) for ln in lines}
         return {k: max(0.0, v)/s for k,v in custom.items()}
-    # Pro-rata montants initiaux (défaut)
     total = sum(float(ln["amount"]) for ln in lines)
     if total > 0:
         return {id(ln): float(ln["amount"])/total for ln in lines}
     return {id(ln): 1.0/len(lines) for ln in lines}
 
+# ---------- CONSTRUCTION SÉRIES (FIX APPLIQUÉ) ----------
 @st.cache_data(ttl=1800, show_spinner=False)
 def build_portfolio_series(lines: List[Dict[str,Any]],
                            monthly_amt: float,
@@ -394,68 +392,107 @@ def build_portfolio_series(lines: List[Dict[str,Any]],
                            alloc_mode: str,
                            custom_weights: Dict[int,float],
                            single_target: Optional[int]) -> Tuple[pd.DataFrame, float, float, Optional[float]]:
-    """Retourne (df_valeur, total_investi, valeur_finale, xirr_pct)
-       Versements appliqués selon 'alloc_mode' (pro-rata / custom / single_target).
+    """
+    Retourne (df_valeur, total_investi, valeur_finale, xirr_pct)
+    FIX: les quantités initiales sont ajoutées le JOUR EFFECTIF D’ACHAT
+         (1ère VL dispo ≥ date d’achat), pas avant.
     """
     if not lines:
         return pd.DataFrame(), 0.0, 0.0, None
 
-    # séries de prix
-    min_dt = min(pd.Timestamp(l["buy_date"]) for l in lines)
-    max_dt = TODAY
-    series = {}
+    # Séries de prix
+    series: Dict[int, pd.Series] = {}
     for ln in lines:
         df,_,_ = load_price_series_any(ln.get("isin") or ln.get("name"), None)
-        if df.empty: continue
-        series[id(ln)] = df["Close"]
+        if not df.empty:
+            series[id(ln)] = df["Close"]
+    if not series:
+        return pd.DataFrame(), 0.0, 0.0, None
 
+    # Date d’achat effective & quantité initiale
+    eff_buy_date: Dict[int, pd.Timestamp] = {}
+    qty_init: Dict[int, float] = {}
+    for ln in lines:
+        sid=id(ln); s=series.get(sid)
+        if s is None or s.empty: continue
+        d_buy = pd.Timestamp(ln["buy_date"])
+        if d_buy in s.index:
+            px_buy=float(s.loc[d_buy]); eff_dt=d_buy
+        else:
+            after=s.loc[s.index>=d_buy]
+            if after.empty:
+                px_buy=float(s.iloc[-1]); eff_dt=s.index[-1]
+            else:
+                px_buy=float(after.iloc[0]); eff_dt=after.index[0]
+        px_manual = ln.get("buy_px", None)
+        px_for_qty = float(px_manual) if (px_manual and px_manual>0) else px_buy
+        qty_init[sid] = float(ln["amount"]) / float(px_for_qty)
+        eff_buy_date[sid] = eff_dt
+
+    min_eff_dt = min(eff_buy_date.values())
     idx = pd.Index(sorted(set().union(*[s.index for s in series.values()])))
-    idx = idx[(idx>=min_dt) & (idx<=max_dt)]
+    idx = idx[(idx>=min_eff_dt) & (idx<=TODAY)]
     if len(idx)==0:
         return pd.DataFrame(), 0.0, 0.0, None
 
-    # quantités courantes
-    qty = {id(ln): float(ln["qty_calc"]) for ln in lines}
+    # Quantités courantes : démarrer à 0 — ajouter à la date effective
+    qty_curr: Dict[int, float] = {id(ln): 0.0 for ln in lines}
 
-    # poids d'affectation
+    # Poids versements
     weights = _weights_for(lines, alloc_mode, custom_weights, single_target)
 
-    # cash-flows XIRR
-    cash_flows = [(pd.Timestamp(ln["buy_date"]), -float(ln["amount"])) for ln in lines]
+    # Cash-flows XIRR aux dates EFFECTIVES
+    cash_flows: List[Tuple[pd.Timestamp, float]] = []
+    for ln in lines:
+        sid=id(ln)
+        if sid in eff_buy_date:
+            cash_flows.append((eff_buy_date[sid], -float(ln["amount"])))
 
-    # calendrier versements
-    sched = _month_schedule(min_dt, TODAY) if monthly_amt>0 else []
+    # Calendrier versements
+    sched = _month_schedule(min_eff_dt, TODAY) if monthly_amt>0 else []
     one_dt = pd.Timestamp(one_date) if one_amt>0 else None
 
     values=[]
     for d in idx:
-        # versement ponctuel
+        # Ajout des quantités initiales à la date effective
+        for ln in lines:
+            sid=id(ln)
+            if sid in eff_buy_date and d == eff_buy_date[sid]:
+                qty_curr[sid] += qty_init[sid]
+
+        # Versement ponctuel
         if one_dt is not None and d==one_dt and one_amt>0:
             for ln in lines:
-                sid=id(ln); s=series[sid]; w=weights.get(sid, 0.0)
+                sid=id(ln); s=series.get(sid)
+                if s is None or s.empty: continue
+                w=weights.get(sid,0.0)
                 if w<=0: continue
                 px = float(s.loc[d]) if d in s.index else float(s.loc[s.index>=d].iloc[0])
-                qty[sid] += (one_amt * w)/px
+                qty_curr[sid] += (one_amt*w)/px
             cash_flows.append((d, -float(one_amt)))
-        # versement mensuel
+
+        # Versement mensuel
         if d in sched and monthly_amt>0:
             for ln in lines:
-                sid=id(ln); s=series[sid]; w=weights.get(sid, 0.0)
+                sid=id(ln); s=series.get(sid)
+                if s is None or s.empty: continue
+                w=weights.get(sid,0.0)
                 if w<=0: continue
                 px = float(s.loc[d]) if d in s.index else float(s.loc[s.index>=d].iloc[0])
-                qty[sid] += (monthly_amt * w)/px
+                qty_curr[sid] += (monthly_amt*w)/px
             cash_flows.append((d, -float(monthly_amt)))
 
-        # valeur du jour
+        # Valorisation
         v=0.0
         for ln in lines:
-            sid=id(ln); s=series[sid]
+            sid=id(ln); s=series.get(sid)
+            if s is None or s.empty: continue
             if d in s.index: px=float(s.loc[d])
             else:
                 before=s.loc[s.index<=d]
                 if before.empty: continue
                 px=float(before.iloc[-1])
-            v += qty[sid]*px
+            v += qty_curr[sid]*px
         values.append((d, v))
 
     df_val = pd.DataFrame(values, columns=["date","Valeur"]).set_index("date")

@@ -2,7 +2,9 @@
 # app.py — Comparateur Portefeuilles CGP
 # - Fonds en euros (simulé) comme un support standard (EUROFUND)
 # - Taux annuel paramétrable (sidebar), intérêts capitalisés le 31/12
-# - Tout le reste identique (dates d’achat effectives, start mode, base 100, etc.)
+# - Départ du graphe = "premier euro investi" (par défaut)
+# - Axe Y ajusté au niveau d'investissement initial
+# - Import portefeuille client (Excel/CSV) + template CSV
 # =========================================
 import os, re, math, requests, calendar
 from datetime import date
@@ -135,7 +137,7 @@ def _eurofund_series(euro_rate: float,
 def eod_prices_any(symbol_or_isin: str,
                    start_dt: Optional[pd.Timestamp],
                    euro_rate: float) -> Tuple[pd.DataFrame, str, str]:
-    """df, symbol_used, note. EUROFUND est simulé."""
+    """df, symbol_used, note. EUROFUND est simulé (rebasé à 1 au départ réel)."""
     q = (symbol_or_isin or "").strip()
     if not q:
         return pd.DataFrame(), q, "⚠️ identifiant vide."
@@ -145,10 +147,12 @@ def eod_prices_any(symbol_or_isin: str,
         ser = _eurofund_series(euro_rate=euro_rate,
                                start=pd.Timestamp("1990-01-01"),
                                end=TODAY)
-        df = ser.to_frame()
         if start_dt is not None:
-            df = df.loc[df.index >= start_dt]
-        note = f"Fonds en euros simulé — intérêts le 31/12 au taux {euro_rate:.2f}%/an."
+            ser = ser.loc[ser.index >= start_dt]
+        if not ser.empty:
+            ser = ser / ser.iloc[0]  # rebase à 1 au jour d'achat (affichage intuitif)
+        df = ser.to_frame()
+        note = f"Fonds en euros simulé — intérêts le 31/12 au taux {euro_rate:.2f}%/an (rebasé à 1 au départ)."
         return df, "EUROFUND", note
 
     # --- Sinon : flux EODHD (fonds/ETF réels) ---
@@ -174,7 +178,7 @@ def eod_prices_any(symbol_or_isin: str,
         return None
 
     if "." in qU and not _looks_like_isin(qU.split(".")[0]):
-        df=_try(qU,start_dt); 
+        df=_try(qU,start_dt)
         if df is not None: return df,qU,note
 
     base=qU.split(".")[0]
@@ -243,7 +247,7 @@ UNI_OPTIONS = ["— Saisie libre —"] + [f"{r['name']} — {r['isin']}" for r i
 for key in ["A_lines","B_lines"]:
     if key not in st.session_state: st.session_state[key]=[]
 
-# ---------- helpers ----------
+# ---------- Helpers dates & quantités ----------
 def _auto_name_from_isin(isin: str) -> str:
     if not isin: return ""
     if isin.upper()=="EUROFUND": return "Fonds en euros (simulé)"
@@ -278,7 +282,104 @@ def _month_schedule(start_dt: pd.Timestamp, end_dt: pd.Timestamp) -> List[pd.Tim
         cur = pd.Timestamp(year=y, month=m, day=day)
     return dates
 
-# ---------- UI : construction lignes ----------
+# ---------- Import/Export Portefeuille (Excel/CSV) ----------
+def _normalize_col(s: str) -> str:
+    s = (s or "").strip().lower()
+    s = s.replace("€", "").replace("(", "").replace(")", "").replace(".", "").replace(",", "").replace("  ", " ")
+    s = s.replace("montant investi", "amount").replace("montant", "amount").replace("investi", "amount")
+    s = s.replace("nom du fonds", "name").replace("fonds", "name").replace("nom", "name")
+    s = s.replace("isin code", "isin").replace("code isin", "isin")
+    s = s.replace("prix dachat", "buy_price").replace("prix achat", "buy_price").replace("prix", "buy_price")
+    s = s.replace("quantite", "quantity").replace("qté", "quantity").replace("qte", "quantity")
+    s = s.replace("date dachat", "buy_date").replace("date achat", "buy_date").replace("date", "buy_date")
+    return s
+
+def _standardize_df(df_raw: pd.DataFrame) -> pd.DataFrame:
+    colmap = {c: _normalize_col(str(c)) for c in df_raw.columns}
+    df = df_raw.rename(columns=colmap)
+    keep = [c for c in ["name","isin","amount","quantity","buy_price","buy_date"] if c in df.columns]
+    df = df[keep].copy()
+    if "amount" in df:
+        df["amount"] = (
+            df["amount"].astype(str).str.replace(" ", "").str.replace("€", "").str.replace(",", ".")
+            .apply(lambda x: pd.to_numeric(x, errors="coerce"))
+        )
+    if "quantity" in df:
+        df["quantity"] = pd.to_numeric(df["quantity"], errors="coerce")
+    if "buy_price" in df:
+        df["buy_price"] = (
+            df["buy_price"].astype(str).str.replace(" ", "").str.replace("€", "").str.replace(",", ".")
+            .apply(lambda x: pd.to_numeric(x, errors="coerce"))
+        )
+    if "buy_date" in df:
+        df["buy_date"] = pd.to_datetime(df["buy_date"], errors="coerce", dayfirst=True).dt.date
+    if "isin" in df:
+        df["isin"] = df["isin"].astype(str).str.upper().str.strip()
+    if "name" in df:
+        df["name"] = df["name"].astype(str).str.strip()
+    df = df.dropna(how="all")
+    return df
+
+def build_import_template_df() -> pd.DataFrame:
+    return pd.DataFrame(
+        [
+            {"name":"R-co Valor C EUR","isin":"FR0011253624","amount":10000,"quantity":"","buy_price":"","buy_date":"2024-01-02"},
+            {"name":"Fonds en euros (simulé)","isin":"EUROFUND","amount":10000,"quantity":"","buy_price":"","buy_date":"2024-01-02"},
+        ],
+        columns=["name","isin","amount","quantity","buy_price","buy_date"]
+    )
+
+def export_template_csv_bytes() -> bytes:
+    return build_import_template_df().to_csv(index=False).encode("utf-8")
+
+def lines_from_dataframe(df_std: pd.DataFrame, euro_rate: float) -> List[Dict[str, Any]]:
+    lines: List[Dict[str, Any]] = []
+    for _, row in df_std.iterrows():
+        isin = str(row.get("isin","") or "").strip().upper()
+        name = str(row.get("name","") or "").strip()
+        amount = row.get("amount", None)
+        qty = row.get("quantity", None)
+        buy_price = row.get("buy_price", None)
+        buy_date = row.get("buy_date", None)
+
+        if (not isin and not name) or (amount is None or pd.isna(amount) or float(amount) <= 0):
+            continue
+        if not buy_date or pd.isna(buy_date):
+            continue
+        buy_ts = pd.Timestamp(buy_date)
+
+        dfp, sym_used, note = load_price_series_any(isin or name, buy_ts, euro_rate)
+        if dfp.empty:
+            continue
+
+        px = None
+        if (buy_price is not None) and not pd.isna(buy_price) and float(buy_price) > 0:
+            px = float(buy_price)
+        else:
+            px = _get_close_on(dfp, buy_ts)
+
+        if (qty is None or pd.isna(qty) or float(qty) <= 0) and px and px > 0:
+            qty = float(amount) / float(px)
+
+        if not name and isin:
+            name = _auto_name_from_isin(isin) or (isin if isin else "—")
+
+        if not px or px <= 0 or not qty or qty <= 0:
+            continue
+
+        lines.append({
+            "name": name or "—",
+            "isin": isin or "",
+            "amount": float(amount),
+            "qty_calc": float(qty),
+            "buy_date": buy_ts,
+            "buy_px": float(px),
+            "sym_used": sym_used,
+            "note": note,
+        })
+    return lines
+
+# ---------- UI : ajout de lignes ----------
 def _add_line_ui(port_key: str, title: str, euro_rate: float):
     st.subheader(title)
     with st.form(key=f"{port_key}_form", clear_on_submit=False):
@@ -312,7 +413,6 @@ def _add_line_ui(port_key: str, title: str, euro_rate: float):
         if not isin and not name:
             st.warning("Indique au minimum l’**ISIN** ou le **nom** du fonds."); st.stop()
 
-        # Séries (EUROFUND géré par load_price_series_any via euro_rate)
         dfp, sym_used, note = load_price_series_any(isin or name, pd.Timestamp(dt), euro_rate)
         if dfp.empty:
             st.error("Impossible de récupérer des VL pour ce fonds."); st.stop()
@@ -326,7 +426,7 @@ def _add_line_ui(port_key: str, title: str, euro_rate: float):
         if not px or px<=0:
             st.error("Prix d’achat non déterminable."); st.stop()
 
-        qty = amt/px
+        qty = float(amt)/float(px)
         if not name and isin:
             name = _auto_name_from_isin(isin) or "—"
 
@@ -365,7 +465,6 @@ def _line_card(line: Dict[str,Any], idx:int, port_key:str):
 # ---------- UI deux portefeuilles ----------
 st.title("🟣 Comparer deux portefeuilles (Client vs Vous)")
 
-# Fonds en euros : taux global (agit sur toute ligne EUROFUND, dans A et B si présents)
 with st.sidebar:
     st.header("💶 Fonds en euros — Paramètre global")
     EURO_RATE = st.number_input("Taux annuel du fonds en euros (%)",
@@ -375,7 +474,46 @@ with st.sidebar:
 tabA, tabB = st.tabs(["📁 Portefeuille 1 — Client","🟣 Portefeuille 2 — Vous"])
 with tabA:
     _add_line_ui("A_lines","Portefeuille 1 — Client", EURO_RATE)
+
+    # ---- Import portefeuille (Excel/CSV) ----
+    with st.expander("📥 Importer un portefeuille client (Excel/CSV)"):
+        cta1, cta2 = st.columns(2)
+        with cta1:
+            st.download_button(
+                "⬇️ Télécharger le template CSV",
+                data=export_template_csv_bytes(),
+                file_name="template_portefeuille_client.csv",
+                mime="text/csv"
+            )
+        with cta2:
+            st.caption("Colonnes attendues : **name**, **isin**, **amount**, **quantity** (opt.), **buy_price** (opt.), **buy_date** (YYYY-MM-DD).")
+
+        up = st.file_uploader("Choisir un fichier .xlsx/.xls/.csv", type=["xlsx","xls","csv"])
+        replace_mode = st.radio("Mode d’import", ["Remplacer le portefeuille client", "Ajouter aux lignes existantes"], horizontal=True)
+        if up is not None:
+            try:
+                if up.name.lower().endswith(".csv"):
+                    df_raw = pd.read_csv(up)
+                else:
+                    df_raw = pd.read_excel(up)
+                df_std = _standardize_df(df_raw)
+                st.write("Aperçu détecté :", df_std.head())
+                if st.button("Importer ces lignes", type="primary"):
+                    new_lines = lines_from_dataframe(df_std, EURO_RATE)
+                    if not new_lines:
+                        st.warning("Aucune ligne valide détectée dans le fichier.")
+                    else:
+                        if replace_mode.startswith("Remplacer"):
+                            st.session_state["A_lines"] = new_lines
+                        else:
+                            st.session_state["A_lines"].extend(new_lines)
+                        st.success(f"{len(new_lines)} ligne(s) importée(s).")
+                        st.experimental_rerun()
+            except Exception as e:
+                st.error(f"Impossible de lire le fichier : {e}. Astuce : essaye en CSV.")
+
     for i,ln in enumerate(st.session_state["A_lines"]): _line_card(ln,i,"A_lines")
+
 with tabB:
     _add_line_ui("B_lines","Portefeuille 2 — Vous", EURO_RATE)
     for i,ln in enumerate(st.session_state["B_lines"]): _line_card(ln,i,"B_lines")
@@ -435,7 +573,7 @@ def _weights_for(lines: List[Dict[str,Any]], mode: str, custom: Dict[int,float],
         return {id(ln): float(ln["amount"])/total for ln in lines}
     return {id(ln): 1.0/len(lines) for ln in lines}
 
-# ---------- CONSTRUCTION SÉRIES (FIX + renvoi dates) ----------
+# ---------- CONSTRUCTION SÉRIES ----------
 @st.cache_data(ttl=1800, show_spinner=False)
 def build_portfolio_series(lines: List[Dict[str,Any]],
                            monthly_amt: float,
@@ -447,7 +585,7 @@ def build_portfolio_series(lines: List[Dict[str,Any]],
                            ) -> Tuple[pd.DataFrame, float, float, Optional[float], pd.Timestamp, pd.Timestamp]:
     """
     Retourne (df_valeur, total_investi, valeur_finale, xirr_pct, start_min, start_full)
-    FIX: quantités initiales ajoutées le JOUR EFFECTIF (1ère VL >= date d’achat), pas avant.
+    Quantités initiales ajoutées le JOUR EFFECTIF (1ère VL >= date d’achat).
     start_min = date du premier euro investi
     start_full = date à laquelle toutes les lignes initiales sont en place
     """
@@ -554,7 +692,8 @@ def build_portfolio_series(lines: List[Dict[str,Any]],
     cash_flows.append((TODAY, final_val))
     irr = xirr(cash_flows)
     return df_val, total_invested, final_val, (irr*100.0 if irr is not None else None), start_min, start_full
-# ---------- Contrôles d’affichage des courbes ----------
+
+# ---------- Contrôles d’affichage ----------
 rebase_100 = st.checkbox("Normaliser les courbes à 100 au départ", value=False)
 
 # ---------- Action : Calcul & affichages ----------
@@ -567,7 +706,7 @@ if run:
     dfB, investB, valB, xirrB, B_first, B_full = build_portfolio_series(
         st.session_state["B_lines"], mB, oneB_amt, oneB_date, modeB, customB, singleB, EURO_RATE)
 
-    # Le départ est toujours "Premier euro investi"
+    # Départ = premier euro investi
     A_start, B_start = A_first, B_first
 
     dfA_plot = dfA.loc[dfA.index >= A_start].copy() if not dfA.empty else dfA
@@ -588,11 +727,18 @@ if run:
 
         y_label = "Indice (base 100)" if rebase_100 else "Valeur (€)"
 
-        # Calcul auto de la plage Y pour éviter les grands espaces vides
-        y_min = min(df_plot.min()) if not df_plot.empty else 0
-        y_max = max(df_plot.max()) if not df_plot.empty else 1
-        y_margin = (y_max - y_min) * 0.05  # marge de 5%
-        y_min_adj = max(0, y_min - y_margin)
+        # Axe Y calé au niveau d'investissement initial (±5%)
+        starts = []
+        if not dfA_plot.empty: starts.append(float(dfA_plot["Valeur"].iloc[0]))
+        if not dfB_plot.empty: starts.append(float(dfB_plot["Valeur"].iloc[0]))
+        if starts:
+            base_min = min(starts)
+        else:
+            base_min = min(df_plot.min()) if not df_plot.empty else 0.0
+
+        y_max = max(df_plot.max()) if not df_plot.empty else 1.0
+        y_margin = (y_max - base_min) * 0.05
+        y_min_adj = max(0.0, base_min - y_margin)
 
         fig = px.line(
             df_plot, x=df_plot.index, y=df_plot.columns,
@@ -666,13 +812,12 @@ if run:
 else:
     st.info("Renseigne tes lignes, paramètre **où** investir les versements dans la barre latérale, puis clique **Lancer la comparaison**.")
 
-
 # ---------- Debug (optionnel) ----------
 with st.expander("🔧 Debug EODHD (optionnel)"):
     test_q = st.text_input("Tester une recherche (ISIN, nom ou EUROFUND)")
     if test_q:
         st.write("Résultat /search :", eod_search(test_q))
-        df_dbg, sym_dbg, note_dbg = load_price_series_any(test_q, None, st.session_state.get("EURO_RATE", 2.0) if "EURO_RATE" in st.session_state else 2.0)
+        df_dbg, sym_dbg, note_dbg = load_price_series_any(test_q, None, EURO_RATE if 'EURO_RATE' in locals() else 2.0)
         st.write("Symbole testé :", sym_dbg)
         if note_dbg: st.caption(note_dbg)
         if not df_dbg.empty: st.dataframe(df_dbg.tail(5))

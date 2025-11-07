@@ -608,10 +608,12 @@ st.divider()
 run = st.button("🚀 Lancer la comparaison", type="primary")
 
 if run:
-    dfA, investA, valA, xirrA, A_first, A_full = build_portefeuille_series := build_portfolio_series(
-        st.session_state["A_lines"], mA, oneA_amt, oneA_date, modeA, customA, singleA, euroA)
-    dfB, investB, valB, xirrB, B_first, B_full = build_portefeuille_series(
-        st.session_state["B_lines"], mB, oneB_amt, oneB_date, modeB, customB, singleB, euroB)
+    dfA, investA, valA, xirrA, A_first, A_full = build_portfolio_series(
+        st.session_state["A_lines"], mA, oneA_amt, oneA_date, modeA, customA, singleA, euroA
+    )
+    dfB, investB, valB, xirrB, B_first, B_full = build_portfolio_series(
+        st.session_state["B_lines"], mB, oneB_amt, oneB_date, modeB, customB, singleB, euroB
+    )
 
     # Choix du point de départ par portefeuille
     A_start = A_first if start_mode == "Premier euro investi" else A_full

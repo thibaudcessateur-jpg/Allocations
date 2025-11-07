@@ -1,13 +1,5 @@
 # =========================================
 # app.py — Comparateur Portefeuilles CGP
-# - Saisie par MONTANT (€), quantité auto
-# - Résolution EODHD "ISIN-first" avec fallbacks
-# - Noms auto via /search quand ISIN seul
-# - Courbes d'évolution (valeur quotidienne)
-# - Versements mensuels & ponctuel, affectation paramétrable
-# - FIX: quantités initiales ajoutées le JOUR EFFECTIF d’achat
-# - Ajout des dates sur "Investi" et "Prix achat"
-# - Encadré clair "Si c’était avec nous" (gain € + surperf %/an)
 # =========================================
 import os, re, math, requests, calendar
 from datetime import date
@@ -193,8 +185,30 @@ def xirr(cash_flows: List[Tuple[pd.Timestamp, float]]) -> Optional[float]:
         else: lo=mid
     return None
 
+# ---------- Fonds en euros (2% base, crédit annuel fin d’année) ----------
+BASE_EURO_RATE = 0.02  # 2%/an
+
+def is_euro_fund(isin: str) -> bool:
+    return (isin or "").upper().startswith("FONDS_EURO_")
+
+def euro_series_annual(rate_annual: float) -> pd.DataFrame:
+    """
+    Série quotidienne (D) base 100 avec crédit UNIQUEMENT au 31/12 de chaque année.
+    Entre deux 31/12, la VL est plate (pas de capitalisation intra-annuelle).
+    """
+    idx = pd.date_range(start="2010-01-01", end=TODAY, freq="D")
+    vals = []
+    v = 100.0
+    for d in idx:
+        # crédit le dernier jour de l'année
+        if d.is_year_end:
+            v *= (1.0 + rate_annual)
+        vals.append(v)
+    return pd.DataFrame({"Close": vals}, index=idx)
+
 # ---------- Univers pré-rempli ----------
 UNIVERSE_GENERALI = [
+    # Core
     {"name":"R-co Valor C EUR","isin":"FR0011253624","type":"Actions Monde"},
     {"name":"Vivalor International","isin":"FR0014001LS1","type":"Actions Monde"},
     {"name":"CARMIGNAC Investissement A EUR","isin":"FR0010148981","type":"Actions Monde"},
@@ -203,6 +217,10 @@ UNIVERSE_GENERALI = [
     {"name":"CARMIGNAC Patrimoine","isin":"FR0010135103","type":"Diversifié patrimonial"},
     {"name":"SYCOYIELD 2030 RC","isin":"FR001400MCQ6","type":"Obligataire échéance"},
     {"name":"R-Co Target 2029 HY","isin":"FR001400AWH8","type":"Obligataire HY"},
+    # Fonds en euros simulés (nom générique; le taux effectif dépend des options choisies dans chaque portefeuille)
+    {"name":"Generali Eurossima","isin":"FONDS_EURO_EUROSSIMA","type":"Fonds en euros"},
+    {"name":"Generali Netissima","isin":"FONDS_EURO_NETISSIMA","type":"Fonds en euros"},
+    {"name":"Apicil Euro Garanti","isin":"FONDS_EURO_APICIL","type":"Fonds en euros"},
 ]
 UNI_OPTIONS = ["— Saisie libre —"] + [f"{r['name']} — {r['isin']}" for r in UNIVERSE_GENERALI]
 
@@ -213,6 +231,9 @@ for key in ["A_lines","B_lines"]:
 # ---------- helpers ----------
 def _auto_name_from_isin(isin: str) -> str:
     if not isin: return ""
+    if is_euro_fund(isin):
+        for r in UNIVERSE_GENERALI:
+            if r["isin"].upper()==isin.upper(): return r["name"]
     res = eod_search(isin)
     for it in res:
         if str(it.get("ISIN","")).upper()==isin.upper():
@@ -231,11 +252,11 @@ def _get_close_on(df: pd.DataFrame, dt: pd.Timestamp) -> Optional[float]:
 
 def _month_end(d: pd.Timestamp) -> pd.Timestamp:
     last_day = calendar.monthrange(d.year, d.month)[1]
-    return pd.Timestamp(year=d.year, month=d.month, day=day)
+    return pd.Timestamp(year=d.year, month=d.month, day=last_day)
 
 def _month_schedule(start_dt: pd.Timestamp, end_dt: pd.Timestamp) -> List[pd.Timestamp]:
     dates=[]; cur=pd.Timestamp(year=start_dt.year, month=start_dt.month, day=start_dt.day)
-    cur = min(cur, pd.Timestamp(year=cur.year, month=cur.month, day=calendar.monthrange(cur.year, cur.month)[1]))
+    cur = min(cur, _month_end(cur))
     while cur<=end_dt:
         dates.append(cur)
         y = cur.year + (cur.month//12)
@@ -278,7 +299,12 @@ def _add_line_ui(port_key: str, title: str):
         if not isin and not name:
             st.warning("Indique au minimum l’**ISIN** ou le **nom** du fonds."); st.stop()
 
-        dfp, sym_used, note = load_price_series_any(isin or name, pd.Timestamp(dt))
+        # --- Récup VL (euro-fund avec options appliquées plus tard dans le moteur) ou EODHD ici pour l'affichage achat ---
+        if is_euro_fund(isin):
+            dfp = euro_series_annual(BASE_EURO_RATE)  # base 2% pour déterminer un prix d’achat de référence
+            sym_used, note = isin, "Fonds en euros (VL synthétique)."
+        else:
+            dfp, sym_used, note = load_price_series_any(isin or name, pd.Timestamp(dt))
         if dfp.empty:
             st.error("Impossible de récupérer des VL pour ce fonds."); st.stop()
 
@@ -338,12 +364,28 @@ with tabB:
     _add_line_ui("B_lines","Portefeuille 2 — Vous")
     for i,ln in enumerate(st.session_state["B_lines"]): _line_card(ln,i,"B_lines")
 
-# ---------- Paramètres de versements & AFFECTATION ----------
+# ---------- Paramètres de versements & Options fonds en euros ----------
 def _alloc_sidebar(side_label: str, lines_key: str, prefix: str):
     st.subheader(side_label)
     m = st.number_input(f"Versement mensuel ({prefix})", min_value=0.0, value=0.0, step=100.0)
     one_amt = st.number_input(f"Versement complémentaire ({prefix})", min_value=0.0, value=0.0, step=100.0)
     one_date = st.date_input(f"Date versement complémentaire ({prefix})", value=date.today())
+
+    # Options fonds en euros (appliquées à toutes les lignes fonds € de ce portefeuille)
+    st.caption("⚙️ Options fonds en euros du portefeuille")
+    euro_mode = st.selectbox(
+        f"Option fonds en euros ({prefix})",
+        ["Aucune", "Bonus annuel (+X%)", "Fonds euros performant (taux défini)"],
+        index=0,
+        key=f"{prefix}_euro_mode"
+    )
+    euro_bonus = 0.0
+    euro_perf = BASE_EURO_RATE
+    if euro_mode == "Bonus annuel (+X%)":
+        euro_bonus = st.number_input(f"Bonus annuel (+X%) — {prefix}", min_value=0.0, max_value=5.0, value=0.0, step=0.1) / 100.0
+    elif euro_mode == "Fonds euros performant (taux défini)":
+        euro_perf = st.number_input(f"Taux annuel du fonds € performant — {prefix}", min_value=0.0, max_value=10.0, value=3.0, step=0.1) / 100.0
+
     mode = st.selectbox(f"Affectation des versements ({prefix})",
                         ["Pro-rata montants initiaux", "Répartition personnalisée", "Tout sur un seul fonds"])
     custom = {}
@@ -370,13 +412,15 @@ def _alloc_sidebar(side_label: str, lines_key: str, prefix: str):
             single = id(lines[idx])
         else:
             st.info("Ajoute au moins une ligne pour choisir une cible unique.")
-    return m, one_amt, one_date, mode, custom, single
+
+    euro_opts = {"mode": euro_mode, "bonus": euro_bonus, "perf": euro_perf}
+    return m, one_amt, one_date, mode, custom, single, euro_opts
 
 with st.sidebar:
     st.header("⚙️ Paramètres")
-    mA, oneA_amt, oneA_date, modeA, customA, singleA = _alloc_sidebar("Portefeuille 1 — Client", "A_lines", "A")
+    mA, oneA_amt, oneA_date, modeA, customA, singleA, euroA = _alloc_sidebar("Portefeuille 1 — Client", "A_lines", "A")
     st.divider()
-    mB, oneB_amt, oneB_date, modeB, customB, singleB = _alloc_sidebar("Portefeuille 2 — Vous", "B_lines", "B")
+    mB, oneB_amt, oneB_date, modeB, customB, singleB, euroB = _alloc_sidebar("Portefeuille 2 — Vous", "B_lines", "B")
 
 def _weights_for(lines: List[Dict[str,Any]], mode: str, custom: Dict[int,float], single_id: Optional[int]) -> Dict[int,float]:
     if not lines:
@@ -393,32 +437,52 @@ def _weights_for(lines: List[Dict[str,Any]], mode: str, custom: Dict[int,float],
         return {id(ln): float(ln["amount"])/total for ln in lines}
     return {id(ln): 1.0/len(lines) for ln in lines}
 
-# ---------- CONSTRUCTION SÉRIES (FIX APPLIQUÉ) ----------
+# ---------- CONSTRUCTION SÉRIES (avec options fonds € & versement ponctuel robuste) ----------
 @st.cache_data(ttl=1800, show_spinner=False)
 def build_portfolio_series(lines: List[Dict[str,Any]],
                            monthly_amt: float,
                            one_amt: float, one_date: date,
                            alloc_mode: str,
                            custom_weights: Dict[int,float],
-                           single_target: Optional[int]) -> Tuple[pd.DataFrame, float, float, Optional[float]]:
+                           single_target: Optional[int],
+                           euro_opts: Dict[str, float | str]) -> Tuple[pd.DataFrame, float, float, Optional[float], pd.Timestamp, pd.Timestamp]:
     """
-    Retourne (df_valeur, total_investi, valeur_finale, xirr_pct)
-    FIX: les quantités initiales sont ajoutées le JOUR EFFECTIF D’ACHAT
-         (1ère VL dispo ≥ date d’achat), pas avant.
+    Retourne (df_valeur, total_investi, valeur_finale, xirr_pct, start_min, start_full)
+    - Quantités initiales ajoutées à la 1ère VL >= date d’achat
+    - Versement ponctuel investi à la 1ère VL >= sa date (par ligne, CF XIRR alignés)
+    - Fonds en euros à 2% base, fin d'année; options Bonus (+X%) ou Perf (taux défini)
     """
     if not lines:
-        return pd.DataFrame(), 0.0, 0.0, None
+        return pd.DataFrame(), 0.0, 0.0, None, TODAY, TODAY
 
-    # Séries de prix
+    # Paramètres fonds € pour CE portefeuille
+    euro_mode = euro_opts.get("mode", "Aucune")
+    euro_bonus = float(euro_opts.get("bonus", 0.0) or 0.0)
+    euro_perf  = float(euro_opts.get("perf", BASE_EURO_RATE) or BASE_EURO_RATE)
+
+    def _effective_euro_rate():
+        if euro_mode == "Bonus annuel (+X%)":
+            return BASE_EURO_RATE + euro_bonus
+        if euro_mode == "Fonds euros performant (taux défini)":
+            return euro_perf
+        return BASE_EURO_RATE
+
+    # Séries de prix par ligne
     series: Dict[int, pd.Series] = {}
     for ln in lines:
-        df,_,_ = load_price_series_any(ln.get("isin") or ln.get("name"), None)
-        if not df.empty:
+        isin = ln.get("isin","")
+        if is_euro_fund(isin):
+            rate = _effective_euro_rate()
+            df = euro_series_annual(rate)
             series[id(ln)] = df["Close"]
+        else:
+            df,_,_ = load_price_series_any(isin or ln.get("name"), None)
+            if not df.empty:
+                series[id(ln)] = df["Close"]
     if not series:
-        return pd.DataFrame(), 0.0, 0.0, None
+        return pd.DataFrame(), 0.0, 0.0, None, TODAY, TODAY
 
-    # Date d’achat effective & quantité initiale
+    # Dates effectives & quantités initiales
     eff_buy_date: Dict[int, pd.Timestamp] = {}
     qty_init: Dict[int, float] = {}
     for ln in lines:
@@ -438,49 +502,67 @@ def build_portfolio_series(lines: List[Dict[str,Any]],
         qty_init[sid] = float(ln["amount"]) / float(px_for_qty)
         eff_buy_date[sid] = eff_dt
 
-    min_eff_dt = min(eff_buy_date.values())
+    start_min = min(eff_buy_date.values())
+    start_full = max(eff_buy_date.values())
+
     idx = pd.Index(sorted(set().union(*[s.index for s in series.values()])))
-    idx = idx[(idx>=min_eff_dt) & (idx<=TODAY)]
+    idx = idx[(idx>=start_min) & (idx<=TODAY)]
     if len(idx)==0:
-        return pd.DataFrame(), 0.0, 0.0, None
+        return pd.DataFrame(), 0.0, 0.0, None, start_min, start_full
 
-    # Quantités courantes : démarrer à 0 — ajouter à la date effective
+    # Quantités courantes
     qty_curr: Dict[int, float] = {id(ln): 0.0 for ln in lines}
-
-    # Poids versements
     weights = _weights_for(lines, alloc_mode, custom_weights, single_target)
 
-    # Cash-flows XIRR aux dates EFFECTIVES
+    # Cash-flows XIRR
     cash_flows: List[Tuple[pd.Timestamp, float]] = []
     for ln in lines:
         sid=id(ln)
         if sid in eff_buy_date:
             cash_flows.append((eff_buy_date[sid], -float(ln["amount"])))
 
-    # Calendrier versements
-    sched = _month_schedule(min_eff_dt, TODAY) if monthly_amt>0 else []
-    one_dt = pd.Timestamp(one_date) if one_amt>0 else None
+    # Plan du versement ponctuel: date effective par ligne
+    oneshot_plan: Dict[int, Tuple[pd.Timestamp, float]] = {}
+    if one_amt > 0:
+        for ln in lines:
+            sid=id(ln); s=series.get(sid)
+            if s is None or s.empty: continue
+            after = s.loc[s.index >= pd.Timestamp(one_date)]
+            if after.empty:
+                eff_dt = s.index[-1]; px = float(s.iloc[-1])
+            else:
+                eff_dt = after.index[0]; px = float(after.iloc[0])
+            oneshot_plan[sid] = (eff_dt, px)
+    oneshot_done: Dict[int, bool] = {id(ln): False for ln in lines}
+
+    # Calendrier versements récurrents
+    sched = _month_schedule(start_min, TODAY) if monthly_amt>0 else []
 
     values=[]
     for d in idx:
-        # Ajout des quantités initiales à la date effective
+        # Ajout quantités initiales au jour effectif
         for ln in lines:
             sid=id(ln)
             if sid in eff_buy_date and d == eff_buy_date[sid]:
                 qty_curr[sid] += qty_init[sid]
 
-        # Versement ponctuel
-        if one_dt is not None and d==one_dt and one_amt>0:
+        # Versement ponctuel : investir le jour effectif propre à chaque ligne
+        if one_amt > 0:
             for ln in lines:
                 sid=id(ln); s=series.get(sid)
                 if s is None or s.empty: continue
-                w=weights.get(sid,0.0)
-                if w<=0: continue
-                px = float(s.loc[d]) if d in s.index else float(s.loc[s.index>=d].iloc[0])
-                qty_curr[sid] += (one_amt*w)/px
-            cash_flows.append((d, -float(one_amt)))
+                if oneshot_done.get(sid, False): continue
+                w = weights.get(sid, 0.0)
+                if w <= 0: 
+                    oneshot_done[sid] = True
+                    continue
+                eff_dt, px_line = oneshot_plan[sid]
+                if d == eff_dt:
+                    qty_curr[sid] += (one_amt*w)/px_line
+                    cash_flows.append((eff_dt, -float(one_amt*w)))
+                    oneshot_done[sid] = True
 
-        # Versement mensuel
+        # Versements mensuels
         if d in sched and monthly_amt>0:
             for ln in lines:
                 sid=id(ln); s=series.get(sid)
@@ -505,29 +587,54 @@ def build_portfolio_series(lines: List[Dict[str,Any]],
         values.append((d, v))
 
     df_val = pd.DataFrame(values, columns=["date","Valeur"]).set_index("date")
-    total_invested = sum(float(ln["amount"]) for ln in lines) + len(sched)*monthly_amt + (one_amt if one_amt>0 else 0.0)
+    total_invested = sum(float(ln["amount"]) for ln in lines) \
+                     + len(sched)*monthly_amt \
+                     + (one_amt if one_amt>0 else 0.0)
     final_val = float(df_val["Valeur"].iloc[-1])
     cash_flows.append((TODAY, final_val))
     irr = xirr(cash_flows)
-    return df_val, total_invested, final_val, (irr*100.0 if irr is not None else None)
+    return df_val, total_invested, final_val, (irr*100.0 if irr is not None else None), start_min, start_full
+
+# ---------- Contrôles d’affichage des courbes ----------
+start_mode = st.radio(
+    "Départ du graphique",
+    ["Premier euro investi", "Quand le portefeuille est entièrement en place"],
+    horizontal=True
+)
+rebase_100 = st.checkbox("Normaliser les courbes à 100 au départ", value=False)
 
 # ---------- Action : Calcul & affichages ----------
 st.divider()
 run = st.button("🚀 Lancer la comparaison", type="primary")
 
 if run:
-    dfA, investA, valA, xirrA = build_portfolio_series(
-        st.session_state["A_lines"], mA, oneA_amt, oneA_date, modeA, customA, singleA)
-    dfB, investB, valB, xirrB = build_portfolio_series(
-        st.session_state["B_lines"], mB, oneB_amt, oneB_date, modeB, customB, singleB)
+    dfA, investA, valA, xirrA, A_first, A_full = build_portefeuille_series := build_portfolio_series(
+        st.session_state["A_lines"], mA, oneA_amt, oneA_date, modeA, customA, singleA, euroA)
+    dfB, investB, valB, xirrB, B_first, B_full = build_portefeuille_series(
+        st.session_state["B_lines"], mB, oneB_amt, oneB_date, modeB, customB, singleB, euroB)
+
+    # Choix du point de départ par portefeuille
+    A_start = A_first if start_mode == "Premier euro investi" else A_full
+    B_start = B_first if start_mode == "Premier euro investi" else B_full
+
+    dfA_plot = dfA.loc[dfA.index >= A_start].copy() if not dfA.empty else dfA
+    dfB_plot = dfB.loc[dfB.index >= B_start].copy() if not dfB.empty else dfB
+
+    # Option base 100
+    if rebase_100:
+        if not dfA_plot.empty:
+            dfA_plot["Valeur"] = 100 * dfA_plot["Valeur"] / dfA_plot["Valeur"].iloc[0]
+        if not dfB_plot.empty:
+            dfB_plot["Valeur"] = 100 * dfB_plot["Valeur"] / dfB_plot["Valeur"].iloc[0]
 
     st.subheader("📈 Évolution de la valeur des portefeuilles")
-    if not dfA.empty or not dfB.empty:
-        df_plot = pd.DataFrame(index=sorted(set(dfA.index).union(dfB.index)))
-        if not dfA.empty: df_plot["Client"] = dfA["Valeur"]
-        if not dfB.empty: df_plot["Vous"] = dfB["Valeur"]
+    if not dfA_plot.empty or not dfB_plot.empty:
+        df_plot = pd.DataFrame(index=sorted(set(dfA_plot.index).union(dfB_plot.index)))
+        if not dfA_plot.empty: df_plot["Client"] = dfA_plot["Valeur"]
+        if not dfB_plot.empty: df_plot["Vous"] = dfB_plot["Valeur"]
+        y_label = "Indice (base 100)" if rebase_100 else "Valeur (€)"
         fig = px.line(df_plot, x=df_plot.index, y=df_plot.columns,
-                      labels={"value":"Valeur (€)","index":"Date"},
+                      labels={"value": y_label, "index": "Date"},
                       title="Valeur quotidienne (avec versements selon l’affectation choisie)")
         st.plotly_chart(fig, use_container_width=True)
     else:
@@ -551,7 +658,6 @@ if run:
             delta_xirr = (xirrB - xirrA)
             msg += f" **Soit +{delta_xirr:.2f}% de performance annualisée.**"
         st.success(msg)
-        # Détail conservé
         st.markdown(f"- **Gain de valeur** vs portefeuille client : **{to_eur(delta_val)}**")
         if xirrA is not None and xirrB is not None:
             st.markdown(f"- **Surperformance annualisée (Δ XIRR)** : **{(xirrB - xirrA):+.2f}%**")
@@ -561,14 +667,27 @@ if run:
         st.info("Ajoute des lignes et relance pour voir le delta.")
 
     # Détail positions actuelles
-    def _detail_table(lines: List[Dict[str,Any]], title:str):
+    def _detail_table(lines: List[Dict[str,Any]], title:str, euro_opts: Dict[str, float | str]):
         st.markdown(f"#### {title}")
         if not lines:
             st.info("Aucune ligne.")
             return
+        # taux effectif pour affichage des fonds €
+        mode = euro_opts.get("mode","Aucune")
+        bonus = float(euro_opts.get("bonus",0.0) or 0.0)
+        perf  = float(euro_opts.get("perf",BASE_EURO_RATE) or BASE_EURO_RATE)
+        def _rate():
+            if mode == "Bonus annuel (+X%)": return BASE_EURO_RATE + bonus
+            if mode == "Fonds euros performant (taux défini)": return perf
+            return BASE_EURO_RATE
+
         rows=[]
         for ln in lines:
-            df,_,_ = load_price_series_any(ln.get("isin") or ln.get("name"), None)
+            isin = ln.get("isin") or ""
+            if is_euro_fund(isin):
+                df = euro_series_annual(_rate())
+            else:
+                df,_,_ = load_price_series_any(isin or ln.get("name"), None)
             last = float(df["Close"].iloc[-1]) if not df.empty else np.nan
             rows.append({
                 "Nom": ln.get("name","—"),
@@ -585,17 +704,22 @@ if run:
                      use_container_width=True, hide_index=True)
 
     d1,d2 = st.columns(2)
-    with d1: _detail_table(st.session_state["A_lines"], "Portefeuille 1 — Client (positions)")
-    with d2: _detail_table(st.session_state["B_lines"], "Portefeuille 2 — Vous (positions)")
+    with d1: _detail_table(st.session_state["A_lines"], "Portefeuille 1 — Client (positions)", euroA)
+    with d2: _detail_table(st.session_state["B_lines"], "Portefeuille 2 — Vous (positions)", euroB)
 else:
-    st.info("Renseigne tes lignes, paramètre **où** investir les versements dans la barre latérale, puis clique **Lancer la comparaison**.")
+    st.info("Renseigne tes lignes, paramètre les **options fonds en euros** (bonus/taux), les versements, puis clique **Lancer la comparaison**.")
 
 # ---------- Debug (optionnel) ----------
 with st.expander("🔧 Debug EODHD (optionnel)"):
     test_q = st.text_input("Tester une recherche (ISIN ou nom)")
     if test_q:
         st.write("Résultat /search :", eod_search(test_q))
-        df_dbg, sym_dbg, note_dbg = load_price_series_any(test_q, None)
+        if is_euro_fund(test_q):
+            st.caption("Fonds en euros — la VL affichée dépendra des options choisies dans le portefeuille.")
+            df_dbg = euro_series_annual(BASE_EURO_RATE)
+            sym_dbg = test_q; note_dbg = "Fonds en euros (2%/an, crédit fin d’année)."
+        else:
+            df_dbg, sym_dbg, note_dbg = load_price_series_any(test_q, None)
         st.write("Symbole testé :", sym_dbg)
         if note_dbg: st.caption(note_dbg)
         if not df_dbg.empty: st.dataframe(df_dbg.tail(5))

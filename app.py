@@ -554,13 +554,7 @@ def build_portfolio_series(lines: List[Dict[str,Any]],
     cash_flows.append((TODAY, final_val))
     irr = xirr(cash_flows)
     return df_val, total_invested, final_val, (irr*100.0 if irr is not None else None), start_min, start_full
-
 # ---------- Contrôles d’affichage des courbes ----------
-start_mode = st.radio(
-    "Départ du graphique",
-    ["Premier euro investi", "Quand le portefeuille est entièrement en place"],
-    horizontal=True
-)
 rebase_100 = st.checkbox("Normaliser les courbes à 100 au départ", value=False)
 
 # ---------- Action : Calcul & affichages ----------
@@ -573,9 +567,8 @@ if run:
     dfB, investB, valB, xirrB, B_first, B_full = build_portfolio_series(
         st.session_state["B_lines"], mB, oneB_amt, oneB_date, modeB, customB, singleB, EURO_RATE)
 
-    # Choix du point de départ par portefeuille
-    A_start = A_first if start_mode == "Premier euro investi" else A_full
-    B_start = B_first if start_mode == "Premier euro investi" else B_full
+    # Le départ est toujours "Premier euro investi"
+    A_start, B_start = A_first, B_first
 
     dfA_plot = dfA.loc[dfA.index >= A_start].copy() if not dfA.empty else dfA
     dfB_plot = dfB.loc[dfB.index >= B_start].copy() if not dfB.empty else dfB
@@ -592,10 +585,21 @@ if run:
         df_plot = pd.DataFrame(index=sorted(set(dfA_plot.index).union(dfB_plot.index)))
         if not dfA_plot.empty: df_plot["Client"] = dfA_plot["Valeur"]
         if not dfB_plot.empty: df_plot["Vous"] = dfB_plot["Valeur"]
+
         y_label = "Indice (base 100)" if rebase_100 else "Valeur (€)"
-        fig = px.line(df_plot, x=df_plot.index, y=df_plot.columns,
-                      labels={"value": y_label, "index": "Date"},
-                      title="Valeur quotidienne (avec versements selon l’affectation choisie)")
+
+        # Calcul auto de la plage Y pour éviter les grands espaces vides
+        y_min = min(df_plot.min()) if not df_plot.empty else 0
+        y_max = max(df_plot.max()) if not df_plot.empty else 1
+        y_margin = (y_max - y_min) * 0.05  # marge de 5%
+        y_min_adj = max(0, y_min - y_margin)
+
+        fig = px.line(
+            df_plot, x=df_plot.index, y=df_plot.columns,
+            labels={"value": y_label, "index": "Date"},
+            title="Valeur quotidienne (avec versements selon l’affectation choisie)",
+        )
+        fig.update_yaxes(range=[y_min_adj, y_max + y_margin])
         st.plotly_chart(fig, use_container_width=True)
     else:
         st.info("Ajoute des lignes pour au moins un portefeuille.")
@@ -647,14 +651,21 @@ if run:
                 "Date d’achat": fmt_date(ln.get("buy_date")),
             })
         dfv=pd.DataFrame(rows)
-        st.dataframe(dfv.style.format({"Montant investi €":to_eur,"Quantité":"{:.6f}","Prix achat":to_eur,"Dernier cours":to_eur}),
-                     use_container_width=True, hide_index=True)
+        st.dataframe(
+            dfv.style.format({
+                "Montant investi €":to_eur,
+                "Quantité":"{:.6f}",
+                "Prix achat":to_eur,
+                "Dernier cours":to_eur
+            }),
+            use_container_width=True, hide_index=True)
 
     d1,d2 = st.columns(2)
     with d1: _detail_table(st.session_state["A_lines"], "Portefeuille 1 — Client (positions)")
     with d2: _detail_table(st.session_state["B_lines"], "Portefeuille 2 — Vous (positions)")
 else:
     st.info("Renseigne tes lignes, paramètre **où** investir les versements dans la barre latérale, puis clique **Lancer la comparaison**.")
+
 
 # ---------- Debug (optionnel) ----------
 with st.expander("🔧 Debug EODHD (optionnel)"):

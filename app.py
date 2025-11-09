@@ -1,11 +1,11 @@
 # =========================================
 # app.py — Comparateur Portefeuilles CGP
-# - Fonds en euros (simulé) comme un support standard (EUROFUND)
+# - Fonds en euros (simulé) comme support standard (EUROFUND)
 # - Taux annuel paramétrable (sidebar), intérêts capitalisés le 31/12 (rebasé à 1 au départ)
 # - Départ du graphe = "premier euro investi"
-# - Axe Y ajusté autour du niveau d'investissement initial
-# - Import portefeuille (CSV/Excel*), "Coller un tableau" pour saisie massive
+# - Import CSV/Excel* + "Coller un tableau" (Nom | ISIN | Montant | [Date] | [Prix])
 # - Edition inline des lignes (montant/date/prix)
+# - Aucune écriture forcée dans st.session_state pour les widgets => plus d'erreur Streamlit
 # =========================================
 import os, re, math, requests, calendar
 from datetime import date
@@ -283,7 +283,7 @@ def _month_schedule(start_dt: pd.Timestamp, end_dt: pd.Timestamp) -> List[pd.Tim
         cur = pd.Timestamp(year=y, month=m, day=day)
     return dates
 
-# ---------- Import/Export Portefeuille (Excel/CSV) ----------
+# ---------- Import/Export & Collage ----------
 def _normalize_col(s: str) -> str:
     s = (s or "").strip().lower()
     s = s.replace("€", "").replace("(", "").replace(")", "").replace(".", "").replace(",", "").replace("  ", " ")
@@ -344,7 +344,7 @@ def lines_from_dataframe(df_std: pd.DataFrame, euro_rate: float, default_dt: Opt
 
         # date: si absente -> default_dt requis
         if not buy_date or pd.isna(buy_date):
-            if default_dt is None: 
+            if default_dt is None:
                 continue
             buy_ts = pd.Timestamp(default_dt)
         else:
@@ -379,13 +379,12 @@ def lines_from_dataframe(df_std: pd.DataFrame, euro_rate: float, default_dt: Opt
         })
     return lines
 
-# ---------- Coller un tableau utilitaires ----------
 def _detect_delimiter(s: str) -> Optional[str]:
     if "\t" in s: return "\t"
     counts = {";": s.count(";"), "|": s.count("|"), ",": s.count(",")}
     delim = max(counts, key=counts.get)
     if counts[delim] > 0: return delim
-    return None  # fallback: split on 2+ spaces
+    return None
 
 def _normalize_header(h: str) -> str:
     h = h.strip().lower()
@@ -406,10 +405,7 @@ def parse_pasted_table(text: str) -> pd.DataFrame:
     delim = _detect_delimiter(text)
     rows = []
     for ln in lines:
-        if delim:
-            parts = [p.strip() for p in ln.split(delim)]
-        else:
-            parts = re.split(r"\s{2,}", ln.strip())
+        parts = [p.strip() for p in (ln.split(delim) if delim else re.split(r"\s{2,}", ln.strip()))]
         rows.append(parts)
     header = rows[0]
     normalized = [_normalize_header(h) for h in header]
@@ -424,7 +420,6 @@ def parse_pasted_table(text: str) -> pd.DataFrame:
         data = rows[1:]
         df = pd.DataFrame(data, columns=normalized[:len(rows[0])])
 
-    # nettoyage basique
     for col in df.columns:
         df[col] = df[col].astype(str).str.strip()
         if col == "amount":
@@ -433,7 +428,7 @@ def parse_pasted_table(text: str) -> pd.DataFrame:
             df[col] = df[col].str.replace(" ", "").str.replace("€","").str.replace(",", ".")
     return df
 
-# ---------- Saisie d'une ligne + édition ----------
+# ---------- Saisie/édition d'une ligne ----------
 def _add_line_ui(port_key: str, title: str, euro_rate: float):
     st.subheader(title)
     with st.form(key=f"{port_key}_form", clear_on_submit=False):
@@ -531,7 +526,6 @@ def _line_card(line: Dict[str,Any], idx:int, port_key:str):
                 st.session_state[port_key].pop(idx)
                 st.experimental_rerun()
 
-        # Edition inline
         if st.session_state[state_key]:
             with st.form(key=f"form_edit_{port_key}_{idx}", clear_on_submit=False):
                 c1,c2,c3,c4 = st.columns([2,2,2,1])
@@ -579,7 +573,7 @@ def _line_card(line: Dict[str,Any], idx:int, port_key:str):
                     st.success("Ligne mise à jour.")
                     st.experimental_rerun()
 
-# ---------- UI deux portefeuilles ----------
+# ---------- Sidebar : paramètres globaux + affectation ----------
 st.title("🟣 Comparer deux portefeuilles (Client vs Vous)")
 
 with st.sidebar:
@@ -589,9 +583,49 @@ with st.sidebar:
                                 help="Intérêts capitalisés le 31/12 (série rebasée à 1 au départ).")
     st.session_state["EURO_RATE_PREVIEW"] = EURO_RATE
 
+def _alloc_sidebar(side_label: str, lines_key: str, prefix: str):
+    st.subheader(side_label)
+    m = st.number_input(f"Versement mensuel ({prefix})", min_value=0.0, value=0.0, step=100.0, key=f"m_{prefix}")
+    one_amt = st.number_input(f"Versement complémentaire ({prefix})", min_value=0.0, value=0.0, step=100.0, key=f"one_{prefix}_amt")
+    one_date = st.date_input(f"Date versement complémentaire ({prefix})", value=date.today(), key=f"one_{prefix}_date")
+    mode = st.selectbox(f"Affectation des versements ({prefix})",
+                        ["Pro-rata montants initiaux", "Répartition personnalisée", "Tout sur un seul fonds"],
+                        key=f"mode_{prefix}")
+    custom = {}
+    single = None
+    lines = st.session_state[lines_key]
+    if mode == "Répartition personnalisée":
+        if lines:
+            st.caption("Répartir sur les lignes ci-dessous (total ≈ 100 %).")
+            default = round(100.0/len(lines), 2)
+            tot = 0.0
+            for i, ln in enumerate(lines):
+                w = st.slider(f"{ln['name']} ({ln['isin']})", 0.0, 100.0, default, 1.0, key=f"{prefix}_w{i}")
+                custom[id(ln)] = w/100.0
+                tot += w
+            if abs(tot-100.0) > 1.0:
+                st.warning("La somme des poids s’éloigne de 100 % — elle sera renormalisée automatiquement.")
+        else:
+            st.info("Ajoute au moins une ligne pour définir des poids personnalisés.")
+    elif mode == "Tout sur un seul fonds":
+        if lines:
+            options = [f"{ln['name']} — {ln['isin']}" for ln in lines]
+            pick = st.selectbox("Choisir la ligne cible", options, key=f"{prefix}_single_pick")
+            idx = options.index(pick)
+            single = id(lines[idx])
+        else:
+            st.info("Ajoute au moins une ligne pour choisir une cible unique.")
+    return m, one_amt, one_date, mode, custom, single
+
+with st.sidebar:
+    st.header("⚙️ Paramètres de versement")
+    mA, oneA_amt, oneA_date, modeA, customA, singleA = _alloc_sidebar("Portefeuille 1 — Client", "A_lines", "A")
+    st.divider()
+    mB, oneB_amt, oneB_date, modeB, customB, singleB = _alloc_sidebar("Portefeuille 2 — Vous", "B_lines", "B")
+
+# ---------- UI deux portefeuilles ----------
 tabA, tabB = st.tabs(["📁 Portefeuille 1 — Client","🟣 Portefeuille 2 — Vous"])
 
-# ---------------- Portefeuille A ----------------
 with tabA:
     _add_line_ui("A_lines","Portefeuille 1 — Client", EURO_RATE)
 
@@ -617,13 +651,10 @@ with tabA:
             if dfp.empty:
                 st.warning("Fais d’abord la prévisualisation.")
             else:
-                # transformer types pour robustesse
                 dfp = dfp.replace("", np.nan)
-                # essayer de caster amount/prix
                 for col in ["amount","buy_price"]:
                     if col in dfp.columns:
                         dfp[col] = pd.to_numeric(dfp[col], errors="coerce")
-                # dates : laisser lines_from_dataframe gérer via default_dt
                 new_lines = lines_from_dataframe(dfp, EURO_RATE, default_dt=default_dt_saved)
                 if not new_lines:
                     st.warning("Aucune ligne valide à ajouter (vérifie ISIN/nom, montant, date par défaut).")
@@ -678,11 +709,9 @@ with tabA:
 
     for i,ln in enumerate(st.session_state["A_lines"]): _line_card(ln,i,"A_lines")
 
-# ---------------- Portefeuille B ----------------
 with tabB:
     _add_line_ui("B_lines","Portefeuille 2 — Vous", EURO_RATE)
 
-    # ---- Coller un tableau ----
     with st.expander("📋 Coller un tableau (Nom | ISIN | Montant | [Date] | [Prix])"):
         default_dt_B = st.date_input("Date d’achat par défaut (si absente dans le tableau)", value=date(2024,1,2), key="default_dt_B")
         pasteB = st.text_area("Colle ici depuis Excel/Sheets", height=180, key="pasteB")
@@ -718,46 +747,7 @@ with tabB:
 
     for i,ln in enumerate(st.session_state["B_lines"]): _line_card(ln,i,"B_lines")
 
-# ---------- Paramètres de versements & AFFECTATION ----------
-def _alloc_sidebar(side_label: str, lines_key: str, prefix: str):
-    st.subheader(side_label)
-    m = st.number_input(f"Versement mensuel ({prefix})", min_value=0.0, value=0.0, step=100.0)
-    one_amt = st.number_input(f"Versement complémentaire ({prefix})", min_value=0.0, value=0.0, step=100.0)
-    one_date = st.date_input(f"Date versement complémentaire ({prefix})", value=date.today())
-    mode = st.selectbox(f"Affectation des versements ({prefix})",
-                        ["Pro-rata montants initiaux", "Répartition personnalisée", "Tout sur un seul fonds"])
-    custom = {}
-    single = None
-    lines = st.session_state[lines_key]
-    if mode == "Répartition personnalisée":
-        if lines:
-            st.caption("Répartir sur les lignes ci-dessous (total ≈ 100 %).")
-            default = round(100.0/len(lines), 2)
-            tot = 0.0
-            for i, ln in enumerate(lines):
-                w = st.slider(f"{ln['name']} ({ln['isin']})", 0.0, 100.0, default, 1.0, key=f"{prefix}_w{i}")
-                custom[id(ln)] = w/100.0
-                tot += w
-            if abs(tot-100.0) > 1.0:
-                st.warning("La somme des poids s’éloigne de 100 % — elle sera renormalisée automatiquement.")
-        else:
-            st.info("Ajoute au moins une ligne pour définir des poids personnalisés.")
-    elif mode == "Tout sur un seul fonds":
-        if lines:
-            options = [f"{ln['name']} — {ln['isin']}" for ln in lines]
-            pick = st.selectbox("Choisir la ligne cible", options, key=f"{prefix}_single_pick")
-            idx = options.index(pick)
-            single = id(lines[idx])
-        else:
-            st.info("Ajoute au moins une ligne pour choisir une cible unique.")
-    return m, one_amt, one_date, mode, custom, single
-
-with st.sidebar:
-    st.header("⚙️ Paramètres de versement")
-    mA, oneA_amt, oneA_date, modeA, customA, singleA = _alloc_sidebar("Portefeuille 1 — Client", "A_lines", "A")
-    st.divider()
-    mB, oneB_amt, oneB_date, modeB, customB, singleB = _alloc_sidebar("Portefeuille 2 — Vous", "B_lines", "B")
-
+# ---------- AFFECTATION & CONSTRUCTION SÉRIES ----------
 def _weights_for(lines: List[Dict[str,Any]], mode: str, custom: Dict[int,float], single_id: Optional[int]) -> Dict[int,float]:
     if not lines:
         return {}
@@ -773,7 +763,6 @@ def _weights_for(lines: List[Dict[str,Any]], mode: str, custom: Dict[int,float],
         return {id(ln): float(ln["amount"])/total for ln in lines}
     return {id(ln): 1.0/len(lines) for ln in lines}
 
-# ---------- CONSTRUCTION SÉRIES ----------
 @st.cache_data(ttl=1800, show_spinner=False)
 def build_portfolio_series(lines: List[Dict[str,Any]],
                            monthly_amt: float,
@@ -783,16 +772,10 @@ def build_portfolio_series(lines: List[Dict[str,Any]],
                            single_target: Optional[int],
                            euro_rate: float
                            ) -> Tuple[pd.DataFrame, float, float, Optional[float], pd.Timestamp, pd.Timestamp]:
-    """
-    Retourne (df_valeur, total_investi, valeur_finale, xirr_pct, start_min, start_full)
-    Quantités initiales ajoutées le JOUR EFFECTIF (1ère VL >= date d’achat).
-    start_min = date du premier euro investi
-    start_full = date à laquelle toutes les lignes initiales sont en place
-    """
     if not lines:
         return pd.DataFrame(), 0.0, 0.0, None, TODAY, TODAY
 
-    # Séries de prix pour chaque ligne (EUROFUND inclus)
+    # Prix
     series: Dict[int, pd.Series] = {}
     for ln in lines:
         df,_,_ = load_price_series_any(ln.get("isin") or ln.get("name"), None, euro_rate)
@@ -832,20 +815,19 @@ def build_portfolio_series(lines: List[Dict[str,Any]],
     qty_curr: Dict[int, float] = {id(ln): 0.0 for ln in lines}
     weights = _weights_for(lines, alloc_mode, custom_weights, single_target)
 
-    # Cash-flows XIRR aux dates EFFECTIVES
+    # Cash-flows XIRR
     cash_flows: List[Tuple[pd.Timestamp, float]] = []
     for ln in lines:
         sid=id(ln)
         if sid in eff_buy_date:
             cash_flows.append((eff_buy_date[sid], -float(ln["amount"])))
 
-    # Calendrier versements
     sched = _month_schedule(start_min, TODAY) if monthly_amt>0 else []
     one_dt = pd.Timestamp(one_date) if one_amt>0 else None
 
     values=[]
     for d in idx:
-        # Ajout des quantités initiales le jour effectif
+        # Ajout quantités initiales
         for ln in lines:
             sid=id(ln)
             if sid in eff_buy_date and d == eff_buy_date[sid]:
@@ -902,33 +884,16 @@ run = st.button("🚀 Lancer la comparaison", type="primary")
 
 if run:
     dfA, investA, valA, xirrA, A_first, A_full = build_portfolio_series(
-        st.session_state["A_lines"], 
-        st.session_state.get("mA", 0.0), 
-        st.session_state.get("oneA_amt", 0.0), 
-        st.session_state.get("oneA_date", date.today()), 
-        st.session_state.get("modeA", "Pro-rata montants initiaux"), 
-        st.session_state.get("customA", {}), 
-        st.session_state.get("singleA", None), 
-        st.session_state["EURO_RATE_PREVIEW"]
+        st.session_state["A_lines"], mA, oneA_amt, oneA_date, modeA, customA, singleA, st.session_state.get("EURO_RATE_PREVIEW", 2.0)
     )
     dfB, investB, valB, xirrB, B_first, B_full = build_portfolio_series(
-        st.session_state["B_lines"], 
-        st.session_state.get("mB", 0.0), 
-        st.session_state.get("oneB_amt", 0.0), 
-        st.session_state.get("oneB_date", date.today()), 
-        st.session_state.get("modeB", "Pro-rata montants initiaux"), 
-        st.session_state.get("customB", {}), 
-        st.session_state.get("singleB", None), 
-        st.session_state["EURO_RATE_PREVIEW"]
+        st.session_state["B_lines"], mB, oneB_amt, oneB_date, modeB, customB, singleB, st.session_state.get("EURO_RATE_PREVIEW", 2.0)
     )
 
-    # Départ = premier euro investi
     A_start, B_start = A_first, B_first
-
     dfA_plot = dfA.loc[dfA.index >= A_start].copy() if not dfA.empty else dfA
     dfB_plot = dfB.loc[dfB.index >= B_start].copy() if not dfB.empty else dfB
 
-    # Option base 100
     if rebase_100:
         if not dfA_plot.empty:
             dfA_plot["Valeur"] = 100 * dfA_plot["Valeur"] / dfA_plot["Valeur"].iloc[0]
@@ -942,8 +907,6 @@ if run:
         if not dfB_plot.empty: df_plot["Vous"] = dfB_plot["Valeur"]
 
         y_label = "Indice (base 100)" if rebase_100 else "Valeur (€)"
-
-        # Axe Y calé autour du niveau d'investissement initial (±5%)
         starts = []
         if not dfA_plot.empty: starts.append(float(dfA_plot["Valeur"].iloc[0]))
         if not dfB_plot.empty: starts.append(float(dfB_plot["Valeur"].iloc[0]))
@@ -952,17 +915,15 @@ if run:
         y_margin = (y_max - base_min) * 0.05
         y_min_adj = max(0.0, base_min - y_margin)
 
-        fig = px.line(
-            df_plot, x=df_plot.index, y=df_plot.columns,
-            labels={"value": y_label, "index": "Date"},
-            title="Valeur quotidienne (avec versements selon l’affectation choisie)",
-        )
+        fig = px.line(df_plot, x=df_plot.index, y=df_plot.columns,
+                      labels={"value": y_label, "index": "Date"},
+                      title="Valeur quotidienne (avec versements selon l’affectation choisie)")
         fig.update_yaxes(range=[y_min_adj, y_max + y_margin])
         st.plotly_chart(fig, use_container_width=True)
     else:
         st.info("Ajoute des lignes pour au moins un portefeuille.")
 
-    st.subheader("📊 Synthèse chifrée")
+    st.subheader("📊 Synthèse chiffrée")
     c1,c2,c3,c4,c5,c6 = st.columns(6)
     c1.metric("Investi (Client)", to_eur(investA))
     c2.metric("Valeur (Client)", to_eur(valA))
@@ -992,7 +953,7 @@ if run:
             return
         rows=[]
         for ln in lines:
-            df,_,_ = load_price_series_any(ln.get("isin") or ln.get("name"), None, st.session_state["EURO_RATE_PREVIEW"])
+            df,_,_ = load_price_series_any(ln.get("isin") or ln.get("name"), None, st.session_state.get("EURO_RATE_PREVIEW", 2.0))
             last = float(df["Close"].iloc[-1]) if not df.empty else np.nan
             rows.append({
                 "Nom": ln.get("name","—"),
@@ -1019,53 +980,6 @@ if run:
     with d2: _detail_table(st.session_state["B_lines"], "Portefeuille 2 — Vous (positions)")
 else:
     st.info("Ajoute des lignes (formulaire ou **Coller un tableau**), règle les versements dans la barre latérale, puis clique **Lancer la comparaison**.")
-
-# ---------- Versements & affectation (sidebar persistant) ----------
-def _alloc_sidebar(side_label: str, lines_key: str, prefix: str):
-    st.subheader(side_label)
-    m = st.number_input(f"Versement mensuel ({prefix})", min_value=0.0, value=0.0, step=100.0, key=f"m{prefix}")
-    one_amt = st.number_input(f"Versement complémentaire ({prefix})", min_value=0.0, value=0.0, step=100.0, key=f"one{prefix}_amt")
-    one_date = st.date_input(f"Date versement complémentaire ({prefix})", value=date.today(), key=f"one{prefix}_date")
-    mode = st.selectbox(f"Affectation des versements ({prefix})",
-                        ["Pro-rata montants initiaux", "Répartition personnalisée", "Tout sur un seul fonds"],
-                        key=f"mode{prefix}")
-    custom = {}
-    single = None
-    lines = st.session_state[lines_key]
-    if mode == "Répartition personnalisée":
-        if lines:
-            st.caption("Répartir sur les lignes ci-dessous (total ≈ 100 %).")
-            default = round(100.0/len(lines), 2)
-            tot = 0.0
-            for i, ln in enumerate(lines):
-                w = st.slider(f"{ln['name']} ({ln['isin']})", 0.0, 100.0, default, 1.0, key=f"{prefix}_w{i}")
-                custom[id(ln)] = w/100.0
-                tot += w
-            if abs(tot-100.0) > 1.0:
-                st.warning("La somme des poids s’éloigne de 100 % — elle sera renormalisée automatiquement.")
-        else:
-            st.info("Ajoute au moins une ligne pour définir des poids personnalisés.")
-    elif mode == "Tout sur un seul fonds":
-        if lines:
-            options = [f"{ln['name']} — {ln['isin']}" for ln in lines]
-            pick = st.selectbox("Choisir la ligne cible", options, key=f"{prefix}_single_pick")
-            idx = options.index(pick)
-            single = id(lines[idx])
-        else:
-            st.info("Ajoute au moins une ligne pour choisir une cible unique.")
-    # stocker pour le run
-    st.session_state[f"m{prefix}"] = m
-    st.session_state[f"one{prefix}_amt"] = one_amt
-    st.session_state[f"one{prefix}_date"] = one_date
-    st.session_state[f"mode{prefix}"] = mode
-    st.session_state[f"custom{prefix}"] = custom
-    st.session_state[f"single{prefix}"] = single
-
-with st.sidebar:
-    st.header("⚙️ Paramètres de versement")
-    _alloc_sidebar("Portefeuille 1 — Client", "A_lines", "A")
-    st.divider()
-    _alloc_sidebar("Portefeuille 2 — Vous", "B_lines", "B")
 
 # ---------- Debug (optionnel) ----------
 with st.expander("🔧 Debug EODHD (optionnel)"):

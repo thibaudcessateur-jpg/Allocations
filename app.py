@@ -2,10 +2,11 @@
 # app.py — Comparateur Portefeuilles CGP
 # - Fonds en euros (simulé) comme un support standard (EUROFUND)
 # - Taux annuel paramétrable (sidebar), intérêts capitalisés le 31/12 (rebasé à 1 au départ)
-# - Départ du graphe = "premier euro investi" (par défaut)
+# - Départ du graphe = "premier euro investi"
 # - Axe Y ajusté autour du niveau d'investissement initial
-# - Import portefeuille client (Excel/CSV) + template CSV
+# - Import portefeuille client (Excel/CSV) + template CSV (Excel optionnel si openpyxl dispo)
 # - Saisie multiple (ajout en lot) + Edition inline des lignes (montant/date/prix)
+# - NOUVEAU : Coller un tableau (Nom | ISIN | Montant | [Date] | [Prix]) pour ajout en masse
 # =========================================
 import os, re, math, requests, calendar
 from datetime import date
@@ -394,26 +395,36 @@ def _records_to_lines(records: List[Dict[str, Any]], euro_rate: float) -> List[D
         if (not isin and not name) or amount is None:
             continue
         try:
-            amount = float(amount)
+            amount = float(str(amount).replace(" ", "").replace("€","").replace(",", "."))
         except Exception:
             continue
-        if amount <= 0:
+        if amount <= 0: continue
+
+        if buy_date:
+            # accepte formats libres type 2024-01-02 ou 02/01/2024
+            try:
+                buy_ts = pd.to_datetime(buy_date, dayfirst=True)
+            except Exception:
+                try:
+                    buy_ts = pd.to_datetime(buy_date)
+                except Exception:
+                    continue
+        else:
             continue
-        if not buy_date:
-            continue
-        buy_ts = pd.Timestamp(buy_date)
 
         dfp, sym_used, note = load_price_series_any(isin or name, buy_ts, euro_rate)
         if dfp.empty:
             continue
 
+        # prix
+        px = None
         if buy_price is not None and str(buy_price).strip()!="":
             try:
-                px = float(str(buy_price).replace(",", "."))
+                px = float(str(buy_price).replace(" ", "").replace("€","").replace(",", "."))
             except Exception:
-                px = _get_close_on(dfp, buy_ts)
+                px = _get_close_on(dfp, pd.Timestamp(buy_ts))
         else:
-            px = _get_close_on(dfp, buy_ts)
+            px = _get_close_on(dfp, pd.Timestamp(buy_ts))
         if not px or px <= 0:
             continue
 
@@ -426,12 +437,71 @@ def _records_to_lines(records: List[Dict[str, Any]], euro_rate: float) -> List[D
             "isin": isin or "",
             "amount": float(amount),
             "qty_calc": float(qty),
-            "buy_date": buy_ts,
+            "buy_date": pd.Timestamp(buy_ts),
             "buy_px": float(px),
             "sym_used": sym_used,
             "note": note,
         })
     return out
+
+# ---------- Coller un tableau (Nom | ISIN | Montant | [Date] | [Prix]) ----------
+def _detect_delimiter(s: str) -> str:
+    if "\t" in s: return "\t"
+    # count candidates
+    counts = {";": s.count(";"), "|": s.count("|"), ",": s.count(",")}
+    delim = max(counts, key=counts.get)
+    if counts[delim] > 0: return delim
+    return None  # fallback: split on 2+ spaces
+
+def _normalize_header(h: str) -> str:
+    h = h.strip().lower()
+    h = h.replace("€","").replace("(", "").replace(")", "")
+    h = h.replace("  "," ")
+    mapping = {
+        "nom": "name", "nom du fonds":"name", "fonds":"name", "name":"name",
+        "isin":"isin", "code isin":"isin", "isin code":"isin",
+        "montant":"amount", "montant investi":"amount", "amount":"amount", "investi":"amount",
+        "date":"buy_date", "date d'achat":"buy_date", "date achat":"buy_date", "buy date":"buy_date",
+        "prix":"buy_price", "prix d'achat":"buy_price", "buy price":"buy_price"
+    }
+    return mapping.get(h, h)
+
+def parse_pasted_table(text: str) -> pd.DataFrame:
+    lines = [ln for ln in text.strip().splitlines() if ln.strip()]
+    if not lines: return pd.DataFrame()
+    delim = _detect_delimiter(text)
+    rows = []
+    for ln in lines:
+        if delim:
+            parts = [p.strip() for p in ln.split(delim)]
+        else:
+            parts = re.split(r"\s{2,}", ln.strip())
+        rows.append(parts)
+    # header?
+    header = rows[0]
+    normalized = [_normalize_header(h) for h in header]
+    # heuristique : si header ne contient pas au moins un champ connu, on fabrique l'entête standard
+    known = set(normalized) & {"name","isin","amount","buy_date","buy_price"}
+    if not known:
+        # fabrique en suivant l'ordre attendu: name, isin, amount, buy_date?, buy_price?
+        cols = ["name","isin","amount"]
+        if len(header)>=4: cols.append("buy_date")
+        if len(header)>=5: cols.append("buy_price")
+        data = rows
+        df = pd.DataFrame(data, columns=cols[:len(data[0])])
+    else:
+        data = rows[1:]
+        df = pd.DataFrame(data, columns=normalized[:len(rows[0])])
+
+    # nettoyage basique
+    for col in df.columns:
+        df[col] = df[col].astype(str).str.strip()
+        if col == "amount":
+            df[col] = df[col].str.replace(" ", "").str.replace("€","").str.replace(",", ".")
+        if col == "buy_price":
+            df[col] = df[col].str.replace(" ", "").str.replace("€","").str.replace(",", ".")
+    # dates: ne pas convertir ici, laisser _records_to_lines gérer avec tolérance
+    return df
 
 # ---------- UI : ajout de lignes ----------
 def _add_line_ui(port_key: str, title: str, euro_rate: float):
@@ -517,7 +587,7 @@ def _line_card(line: Dict[str,Any], idx:int, port_key:str):
             if line.get("note"): st.caption(line["note"])
         with header[3]:
             try:
-                df_last,_,_ = load_price_series_any(line.get("isin") or line.get("name"), None, EURO_RATE)
+                df_last,_,_ = load_price_series_any(line.get("isin") or line.get("name"), None, st.session_state.get("EURO_RATE_PREVIEW", 2.0))
                 last = float(df_last["Close"].iloc[-1]) if not df_last.empty else np.nan
                 st.markdown(f"Dernier : **{to_eur(last)}**")
             except Exception:
@@ -553,7 +623,7 @@ def _line_card(line: Dict[str,Any], idx:int, port_key:str):
                         st.warning("Montant invalide."); st.stop()
 
                     buy_ts = pd.Timestamp(new_date)
-                    dfp,_,_ = load_price_series_any(line.get("isin") or line.get("name"), buy_ts, EURO_RATE)
+                    dfp,_,_ = load_price_series_any(line.get("isin") or line.get("name"), buy_ts, st.session_state.get("EURO_RATE_PREVIEW", 2.0))
                     if dfp.empty:
                         st.error("Impossible de recalculer la VL au jour choisi."); st.stop()
 
@@ -570,7 +640,6 @@ def _line_card(line: Dict[str,Any], idx:int, port_key:str):
 
                     qty = float(amt)/float(px)
 
-                    # mise à jour en place
                     line["amount"] = float(amt)
                     line["buy_date"] = buy_ts
                     line["buy_px"] = float(px)
@@ -588,14 +657,42 @@ with st.sidebar:
     EURO_RATE = st.number_input("Taux annuel du fonds en euros (%)",
                                 min_value=0.0, max_value=10.0, value=2.0, step=0.1,
                                 help="Intérêts capitalisés le 31/12 (série rebasée à 1 au départ).")
+    st.session_state["EURO_RATE_PREVIEW"] = EURO_RATE
 
 tabA, tabB = st.tabs(["📁 Portefeuille 1 — Client","🟣 Portefeuille 2 — Vous"])
 with tabA:
     _add_line_ui("A_lines","Portefeuille 1 — Client", EURO_RATE)
 
-    # ---- Saisie multiple (ajout en lot) ----
+    # ---- Coller un tableau ----
+    with st.expander("📋 Coller un tableau (Nom | ISIN | Montant | [Date] | [Prix])"):
+        pasteA = st.text_area("Colle ici depuis Excel/Sheets", height=180, key="pasteA")
+        if st.button("🔎 Prévisualiser (Client)"):
+            if not pasteA.strip():
+                st.warning("Rien à parser.")
+            else:
+                dfp = parse_pasted_table(pasteA)
+                if dfp.empty:
+                    st.warning("Impossible de détecter un tableau.")
+                else:
+                    st.write("Aperçu :", dfp)
+                    st.session_state["pasteA_preview"] = dfp
+        if st.button("➕ Ajouter ces lignes (Client)"):
+            dfp = st.session_state.get("pasteA_preview", pd.DataFrame())
+            if dfp.empty:
+                st.warning("Fais d’abord la prévisualisation.")
+            else:
+                recs = dfp.replace("", np.nan).dropna(how="all").to_dict("records")
+                new_lines = _records_to_lines(recs, EURO_RATE)
+                if not new_lines:
+                    st.warning("Aucune ligne valide à ajouter.")
+                else:
+                    st.session_state["A_lines"].extend(new_lines)
+                    st.success(f"{len(new_lines)} ligne(s) ajoutée(s).")
+                    st.experimental_rerun()
+
+    # ---- Saisie multiple (table éditable) ----
     with st.expander("🧾 Saisie multiple (ajout en lot)"):
-        st.caption("Renseigne plusieurs lignes d’un coup : Nom (ou ISIN), Montant, Date d’achat, Prix d’achat (optionnel).")
+        st.caption("Nom/ISIN/Montant obligatoires. Date & Prix d’achat optionnels.")
         df_multi_A = st.data_editor(
             pd.DataFrame([{
                 "name": "",
@@ -636,7 +733,7 @@ with tabA:
                 mime="text/csv"
             )
         with cta2:
-            st.caption("Colonnes attendues : **name**, **isin**, **amount**, **quantity** (opt.), **buy_price** (opt.), **buy_date** (YYYY-MM-DD).")
+            st.caption("Colonnes : **name**, **isin**, **amount**, **quantity** (opt.), **buy_price** (opt.), **buy_date** (YYYY-MM-DD).")
 
         up = st.file_uploader("Choisir un fichier .xlsx/.xls/.csv", type=["xlsx","xls","csv"])
         replace_mode = st.radio("Mode d’import", ["Remplacer le portefeuille client", "Ajouter aux lignes existantes"], horizontal=True)
@@ -645,31 +742,64 @@ with tabA:
                 if up.name.lower().endswith(".csv"):
                     df_raw = pd.read_csv(up)
                 else:
-                    df_raw = pd.read_excel(up)
-                df_std = _standardize_df(df_raw)
-                st.write("Aperçu détecté :", df_std.head())
-                if st.button("Importer ces lignes", type="primary"):
-                    new_lines = lines_from_dataframe(df_std, EURO_RATE)
-                    if not new_lines:
-                        st.warning("Aucune ligne valide détectée dans le fichier.")
-                    else:
-                        if replace_mode.startswith("Remplacer"):
-                            st.session_state["A_lines"] = new_lines
+                    try:
+                        import openpyxl  # noqa
+                        df_raw = pd.read_excel(up)
+                    except Exception:
+                        st.error("Lecture Excel indisponible (openpyxl manquant). Utilise plutôt un **CSV** ou la **fonction Coller un tableau**.")
+                        df_raw = None
+                if df_raw is not None:
+                    df_std = _standardize_df(df_raw)
+                    st.write("Aperçu détecté :", df_std.head())
+                    if st.button("Importer ces lignes", type="primary"):
+                        new_lines = lines_from_dataframe(df_std, EURO_RATE)
+                        if not new_lines:
+                            st.warning("Aucune ligne valide détectée dans le fichier.")
                         else:
-                            st.session_state["A_lines"].extend(new_lines)
-                        st.success(f"{len(new_lines)} ligne(s) importée(s).")
-                        st.experimental_rerun()
+                            if replace_mode.startswith("Remplacer"):
+                                st.session_state["A_lines"] = new_lines
+                            else:
+                                st.session_state["A_lines"].extend(new_lines)
+                            st.success(f"{len(new_lines)} ligne(s) importée(s).")
+                            st.experimental_rerun()
             except Exception as e:
-                st.error(f"Impossible de lire le fichier : {e}. Astuce : essaye en CSV.")
+                st.error(f"Impossible de lire le fichier : {e}. Astuce : utilise CSV ou 'Coller un tableau'.")
 
     for i,ln in enumerate(st.session_state["A_lines"]): _line_card(ln,i,"A_lines")
 
 with tabB:
     _add_line_ui("B_lines","Portefeuille 2 — Vous", EURO_RATE)
 
-    # ---- Saisie multiple (ajout en lot) ----
+    # ---- Coller un tableau ----
+    with st.expander("📋 Coller un tableau (Nom | ISIN | Montant | [Date] | [Prix])"):
+        pasteB = st.text_area("Colle ici depuis Excel/Sheets", height=180, key="pasteB")
+        if st.button("🔎 Prévisualiser (Vous)"):
+            if not pasteB.strip():
+                st.warning("Rien à parser.")
+            else:
+                dfp = parse_pasted_table(pasteB)
+                if dfp.empty:
+                    st.warning("Impossible de détecter un tableau.")
+                else:
+                    st.write("Aperçu :", dfp)
+                    st.session_state["pasteB_preview"] = dfp
+        if st.button("➕ Ajouter ces lignes (Vous)"):
+            dfp = st.session_state.get("pasteB_preview", pd.DataFrame())
+            if dfp.empty:
+                st.warning("Fais d’abord la prévisualisation.")
+            else:
+                recs = dfp.replace("", np.nan).dropna(how="all").to_dict("records")
+                new_lines = _records_to_lines(recs, EURO_RATE)
+                if not new_lines:
+                    st.warning("Aucune ligne valide à ajouter.")
+                else:
+                    st.session_state["B_lines"].extend(new_lines)
+                    st.success(f"{len(new_lines)} ligne(s) ajoutée(s).")
+                    st.experimental_rerun()
+
+    # ---- Saisie multiple (table éditable) ----
     with st.expander("🧾 Saisie multiple (ajout en lot)"):
-        st.caption("Renseigne plusieurs lignes d’un coup : Nom (ou ISIN), Montant, Date d’achat, Prix d’achat (optionnel).")
+        st.caption("Nom/ISIN/Montant obligatoires. Date & Prix d’achat optionnels.")
         df_multi_B = st.data_editor(
             pd.DataFrame([{
                 "name": "",
@@ -989,7 +1119,7 @@ if run:
     with d1: _detail_table(st.session_state["A_lines"], "Portefeuille 1 — Client (positions)")
     with d2: _detail_table(st.session_state["B_lines"], "Portefeuille 2 — Vous (positions)")
 else:
-    st.info("Renseigne tes lignes, utilise la saisie multiple si besoin, paramètre **où** investir les versements dans la barre latérale, puis clique **Lancer la comparaison**.")
+    st.info("Renseigne tes lignes (formulaire, **Coller un tableau** ou **Saisie multiple**), paramètre **où** investir les versements, puis clique **Lancer la comparaison**.")
 
 # ---------- Debug (optionnel) ----------
 with st.expander("🔧 Debug EODHD (optionnel)"):

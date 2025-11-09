@@ -1,10 +1,11 @@
 # =========================================
 # app.py — Comparateur Portefeuilles CGP
 # - Fonds en euros (simulé) comme un support standard (EUROFUND)
-# - Taux annuel paramétrable (sidebar), intérêts capitalisés le 31/12
+# - Taux annuel paramétrable (sidebar), intérêts capitalisés le 31/12 (rebasé à 1 au départ)
 # - Départ du graphe = "premier euro investi" (par défaut)
-# - Axe Y ajusté au niveau d'investissement initial
+# - Axe Y ajusté autour du niveau d'investissement initial
 # - Import portefeuille client (Excel/CSV) + template CSV
+# - Saisie multiple (ajout en lot) + Edition inline des lignes (montant/date/prix)
 # =========================================
 import os, re, math, requests, calendar
 from datetime import date
@@ -121,7 +122,7 @@ def resolve_symbol(q: str) -> Optional[str]:
 def _eurofund_series(euro_rate: float,
                      start: pd.Timestamp = pd.Timestamp("1990-01-01"),
                      end: pd.Timestamp = TODAY) -> pd.Series:
-    """NAV quotidienne qui reste constante, avec crédit d'intérêt le 31/12."""
+    """NAV quotidienne constante, crédit d'intérêt le 31/12."""
     idx = pd.date_range(start=start, end=end, freq="D")
     vals = [1.0]
     for i in range(1, len(idx)):
@@ -137,7 +138,7 @@ def _eurofund_series(euro_rate: float,
 def eod_prices_any(symbol_or_isin: str,
                    start_dt: Optional[pd.Timestamp],
                    euro_rate: float) -> Tuple[pd.DataFrame, str, str]:
-    """df, symbol_used, note. EUROFUND est simulé (rebasé à 1 au départ réel)."""
+    """df, symbol_used, note. EUROFUND simulé (rebasé à 1 au départ réel)."""
     q = (symbol_or_isin or "").strip()
     if not q:
         return pd.DataFrame(), q, "⚠️ identifiant vide."
@@ -379,6 +380,59 @@ def lines_from_dataframe(df_std: pd.DataFrame, euro_rate: float) -> List[Dict[st
         })
     return lines
 
+# ---------- Saisie multiple & maj lignes ----------
+def _records_to_lines(records: List[Dict[str, Any]], euro_rate: float) -> List[Dict[str, Any]]:
+    """Transforme des enregistrements bruts (name/isin/amount/buy_date/buy_price) en lignes internes prêtes à ajouter."""
+    out = []
+    for rec in records:
+        isin = str(rec.get("isin","") or "").strip().upper()
+        name = str(rec.get("name","") or "").strip()
+        amount = rec.get("amount", None)
+        buy_date = rec.get("buy_date", None)
+        buy_price = rec.get("buy_price", None)
+
+        if (not isin and not name) or amount is None:
+            continue
+        try:
+            amount = float(amount)
+        except Exception:
+            continue
+        if amount <= 0:
+            continue
+        if not buy_date:
+            continue
+        buy_ts = pd.Timestamp(buy_date)
+
+        dfp, sym_used, note = load_price_series_any(isin or name, buy_ts, euro_rate)
+        if dfp.empty:
+            continue
+
+        if buy_price is not None and str(buy_price).strip()!="":
+            try:
+                px = float(str(buy_price).replace(",", "."))
+            except Exception:
+                px = _get_close_on(dfp, buy_ts)
+        else:
+            px = _get_close_on(dfp, buy_ts)
+        if not px or px <= 0:
+            continue
+
+        qty = float(amount) / float(px)
+        if not name and isin:
+            name = _auto_name_from_isin(isin) or isin
+
+        out.append({
+            "name": name or "—",
+            "isin": isin or "",
+            "amount": float(amount),
+            "qty_calc": float(qty),
+            "buy_date": buy_ts,
+            "buy_px": float(px),
+            "sym_used": sym_used,
+            "note": note,
+        })
+    return out
+
 # ---------- UI : ajout de lignes ----------
 def _add_line_ui(port_key: str, title: str, euro_rate: float):
     st.subheader(title)
@@ -443,24 +497,88 @@ def _add_line_ui(port_key: str, title: str, euro_rate: float):
         st.success(f"Ligne ajoutée ({name or isin})")
 
 def _line_card(line: Dict[str,Any], idx:int, port_key:str):
+    state_key = f"edit_mode_{port_key}_{idx}"
+    if state_key not in st.session_state:
+        st.session_state[state_key] = False
+
     with st.container(border=True):
-        c0,c1,c2,c3 = st.columns([3,2,2,2])
-        with c0:
+        header = st.columns([3,2,2,2,1])
+        with header[0]:
             st.markdown(f"**{line.get('name','—')}**")
             st.caption(f"ISIN : `{line.get('isin','—')}` • Symbole : ")
-            st.code(line.get("sym_used","—"))
-        with c1:
+            st.code(line.get('sym_used','—'))
+        with header[1]:
             st.markdown(f"Investi\n\n**{to_eur(line.get('amount',0.0))}**")
             st.caption(f"le {fmt_date(line.get('buy_date'))}")
             st.caption(f"Quantité : {line.get('qty_calc'):.6f}")
-        with c2:
+        with header[2]:
             st.markdown(f"Prix achat\n\n**{to_eur(line.get('buy_px'))}**")
             st.caption(f"le {fmt_date(line.get('buy_date'))}")
             if line.get("note"): st.caption(line["note"])
-        with c3:
-            if st.button("🗑️ Supprimer", key=f"del_{port_key}_{idx}"):
+        with header[3]:
+            try:
+                df_last,_,_ = load_price_series_any(line.get("isin") or line.get("name"), None, EURO_RATE)
+                last = float(df_last["Close"].iloc[-1]) if not df_last.empty else np.nan
+                st.markdown(f"Dernier : **{to_eur(last)}**")
+            except Exception:
+                pass
+        with header[4]:
+            if not st.session_state[state_key]:
+                if st.button("✏️", key=f"edit_{port_key}_{idx}", help="Modifier"):
+                    st.session_state[state_key] = True
+                    st.experimental_rerun()
+            if st.button("🗑️", key=f"del_{port_key}_{idx}", help="Supprimer"):
                 st.session_state[port_key].pop(idx)
                 st.experimental_rerun()
+
+        # Edition inline
+        if st.session_state[state_key]:
+            with st.form(key=f"form_edit_{port_key}_{idx}", clear_on_submit=False):
+                c1,c2,c3,c4 = st.columns([2,2,2,1])
+                with c1:
+                    new_amount = st.text_input("Montant investi (€)", value=str(line.get("amount","")))
+                with c2:
+                    new_date = st.date_input("Date d’achat", value=pd.Timestamp(line.get("buy_date")).date())
+                with c3:
+                    new_px = st.text_input("Prix d’achat (optionnel)", value=str(line.get("buy_px","")))
+                with c4:
+                    st.caption(" ")
+                    submitted = st.form_submit_button("💾 Enregistrer")
+
+                if submitted:
+                    try:
+                        amt = float(str(new_amount).replace(" ","").replace(",","."))
+                        assert amt>0
+                    except Exception:
+                        st.warning("Montant invalide."); st.stop()
+
+                    buy_ts = pd.Timestamp(new_date)
+                    dfp,_,_ = load_price_series_any(line.get("isin") or line.get("name"), buy_ts, EURO_RATE)
+                    if dfp.empty:
+                        st.error("Impossible de recalculer la VL au jour choisi."); st.stop()
+
+                    if new_px.strip():
+                        try:
+                            px = float(str(new_px).replace(",","."))
+                        except Exception:
+                            px = _get_close_on(dfp, buy_ts)
+                    else:
+                        px = _get_close_on(dfp, buy_ts)
+
+                    if not px or px<=0:
+                        st.error("Prix d’achat non déterminable."); st.stop()
+
+                    qty = float(amt)/float(px)
+
+                    # mise à jour en place
+                    line["amount"] = float(amt)
+                    line["buy_date"] = buy_ts
+                    line["buy_px"] = float(px)
+                    line["qty_calc"] = float(qty)
+
+                    st.session_state[state_key] = False
+                    st.success("Ligne mise à jour.")
+                    st.experimental_rerun()
 
 # ---------- UI deux portefeuilles ----------
 st.title("🟣 Comparer deux portefeuilles (Client vs Vous)")
@@ -469,11 +587,43 @@ with st.sidebar:
     st.header("💶 Fonds en euros — Paramètre global")
     EURO_RATE = st.number_input("Taux annuel du fonds en euros (%)",
                                 min_value=0.0, max_value=10.0, value=2.0, step=0.1,
-                                help="Intérêts capitalisés le 31/12.")
+                                help="Intérêts capitalisés le 31/12 (série rebasée à 1 au départ).")
 
 tabA, tabB = st.tabs(["📁 Portefeuille 1 — Client","🟣 Portefeuille 2 — Vous"])
 with tabA:
     _add_line_ui("A_lines","Portefeuille 1 — Client", EURO_RATE)
+
+    # ---- Saisie multiple (ajout en lot) ----
+    with st.expander("🧾 Saisie multiple (ajout en lot)"):
+        st.caption("Renseigne plusieurs lignes d’un coup : Nom (ou ISIN), Montant, Date d’achat, Prix d’achat (optionnel).")
+        df_multi_A = st.data_editor(
+            pd.DataFrame([{
+                "name": "",
+                "isin": "",
+                "amount": "",
+                "buy_date": date(2024,1,2),
+                "buy_price": ""
+            }]),
+            num_rows="dynamic",
+            use_container_width=True,
+            column_config={
+                "name": st.column_config.TextColumn("Nom du fonds"),
+                "isin": st.column_config.TextColumn("ISIN"),
+                "amount": st.column_config.NumberColumn("Montant (€)", step=100.0),
+                "buy_date": st.column_config.DateColumn("Date d’achat", format="DD/MM/YYYY"),
+                "buy_price": st.column_config.NumberColumn("Prix d’achat (opt.)", step=0.01),
+            },
+            key="multi_A"
+        )
+        if st.button("➕ Ajouter ces lignes au portefeuille client"):
+            recs = df_multi_A.replace("", np.nan).dropna(how="all").to_dict("records")
+            new_lines = _records_to_lines(recs, EURO_RATE)
+            if not new_lines:
+                st.warning("Aucune ligne valide à ajouter.")
+            else:
+                st.session_state["A_lines"].extend(new_lines)
+                st.success(f"{len(new_lines)} ligne(s) ajoutée(s).")
+                st.experimental_rerun()
 
     # ---- Import portefeuille (Excel/CSV) ----
     with st.expander("📥 Importer un portefeuille client (Excel/CSV)"):
@@ -516,6 +666,39 @@ with tabA:
 
 with tabB:
     _add_line_ui("B_lines","Portefeuille 2 — Vous", EURO_RATE)
+
+    # ---- Saisie multiple (ajout en lot) ----
+    with st.expander("🧾 Saisie multiple (ajout en lot)"):
+        st.caption("Renseigne plusieurs lignes d’un coup : Nom (ou ISIN), Montant, Date d’achat, Prix d’achat (optionnel).")
+        df_multi_B = st.data_editor(
+            pd.DataFrame([{
+                "name": "",
+                "isin": "",
+                "amount": "",
+                "buy_date": date(2024,1,2),
+                "buy_price": ""
+            }]),
+            num_rows="dynamic",
+            use_container_width=True,
+            column_config={
+                "name": st.column_config.TextColumn("Nom du fonds"),
+                "isin": st.column_config.TextColumn("ISIN"),
+                "amount": st.column_config.NumberColumn("Montant (€)", step=100.0),
+                "buy_date": st.column_config.DateColumn("Date d’achat", format="DD/MM/YYYY"),
+                "buy_price": st.column_config.NumberColumn("Prix d’achat (opt.)", step=0.01),
+            },
+            key="multi_B"
+        )
+        if st.button("➕ Ajouter ces lignes à votre portefeuille"):
+            recs = df_multi_B.replace("", np.nan).dropna(how="all").to_dict("records")
+            new_lines = _records_to_lines(recs, EURO_RATE)
+            if not new_lines:
+                st.warning("Aucune ligne valide à ajouter.")
+            else:
+                st.session_state["B_lines"].extend(new_lines)
+                st.success(f"{len(new_lines)} ligne(s) ajoutée(s).")
+                st.experimental_rerun()
+
     for i,ln in enumerate(st.session_state["B_lines"]): _line_card(ln,i,"B_lines")
 
 # ---------- Paramètres de versements & AFFECTATION ----------
@@ -727,15 +910,11 @@ if run:
 
         y_label = "Indice (base 100)" if rebase_100 else "Valeur (€)"
 
-        # Axe Y calé au niveau d'investissement initial (±5%)
+        # Axe Y calé autour du niveau d'investissement initial (±5%)
         starts = []
         if not dfA_plot.empty: starts.append(float(dfA_plot["Valeur"].iloc[0]))
         if not dfB_plot.empty: starts.append(float(dfB_plot["Valeur"].iloc[0]))
-        if starts:
-            base_min = min(starts)
-        else:
-            base_min = min(df_plot.min()) if not df_plot.empty else 0.0
-
+        base_min = min(starts) if starts else (min(df_plot.min()) if not df_plot.empty else 0.0)
         y_max = max(df_plot.max()) if not df_plot.empty else 1.0
         y_margin = (y_max - base_min) * 0.05
         y_min_adj = max(0.0, base_min - y_margin)
@@ -810,7 +989,7 @@ if run:
     with d1: _detail_table(st.session_state["A_lines"], "Portefeuille 1 — Client (positions)")
     with d2: _detail_table(st.session_state["B_lines"], "Portefeuille 2 — Vous (positions)")
 else:
-    st.info("Renseigne tes lignes, paramètre **où** investir les versements dans la barre latérale, puis clique **Lancer la comparaison**.")
+    st.info("Renseigne tes lignes, utilise la saisie multiple si besoin, paramètre **où** investir les versements dans la barre latérale, puis clique **Lancer la comparaison**.")
 
 # ---------- Debug (optionnel) ----------
 with st.expander("🔧 Debug EODHD (optionnel)"):

@@ -1,11 +1,6 @@
 # =========================================
 # app.py — Comparateur Portefeuilles CGP
-# - Fonds en euros (simulé) comme support standard (EUROFUND)
-# - Taux annuel paramétrable (sidebar), intérêts capitalisés le 31/12 (rebasé à 1 au départ)
-# - Départ du graphe = "premier euro investi"
-# - Import CSV/Excel* + "Coller un tableau" (Nom | ISIN | Montant | [Date] | [Prix])
-# - Edition inline des lignes (montant/date/prix)
-# - Aucune écriture forcée dans st.session_state pour les widgets => plus d'erreur Streamlit
+# (correctifs : collage "Ajouter ces lignes" + fallback 404 EODHD)
 # =========================================
 import os, re, math, requests, calendar
 from datetime import date
@@ -19,7 +14,7 @@ import plotly.express as px
 st.set_page_config(page_title="Comparateur Portefeuilles CGP", page_icon="🦉", layout="wide")
 TODAY = pd.Timestamp.today().normalize()
 
-# ---------- Utils: secrets & formats ----------
+# ---------- Utils ----------
 def Secret_Token(name: str) -> str:
     v = os.getenv(name) or str(st.secrets.get(name, "")).strip()  # type: ignore[attr-defined]
     if not v:
@@ -41,7 +36,7 @@ def fmt_date(d: pd.Timestamp | date | None) -> str:
         d = pd.Timestamp(d)
     return d.strftime("%d/%m/%Y")
 
-# ---------- EODHD client ----------
+# ---------- EODHD ----------
 EODHD_BASE = "https://eodhd.com/api"
 
 def eodhd_get(path: str, params: Optional[Dict[str, Any]] = None) -> Any:
@@ -118,11 +113,10 @@ def resolve_symbol(q: str) -> Optional[str]:
             if code and _eod_ok(code): return code
     return None
 
-# ---------- Fonds en euros : série simulée ----------
+# ---------- EUROFUND simulé ----------
 def _eurofund_series(euro_rate: float,
                      start: pd.Timestamp = pd.Timestamp("1990-01-01"),
                      end: pd.Timestamp = TODAY) -> pd.Series:
-    """NAV quotidienne constante, crédit d'intérêt le 31/12."""
     idx = pd.date_range(start=start, end=end, freq="D")
     vals = [1.0]
     for i in range(1, len(idx)):
@@ -133,51 +127,54 @@ def _eurofund_series(euro_rate: float,
         vals.append(v)
     return pd.Series(vals, index=idx, name="Close")
 
-# ---------- Prix (fonds classiques via EODHD, fonds euros simulé) ----------
+# ---------- Prix (avec fallback robuste) ----------
 @st.cache_data(ttl=3*3600, show_spinner=False)
 def eod_prices_any(symbol_or_isin: str,
                    start_dt: Optional[pd.Timestamp],
                    euro_rate: float) -> Tuple[pd.DataFrame, str, str]:
-    """df, symbol_used, note. EUROFUND simulé (rebasé à 1 au départ réel)."""
     q = (symbol_or_isin or "").strip()
     if not q:
         return pd.DataFrame(), q, "⚠️ identifiant vide."
 
-    # --- Cas Fonds en euros (simulé) ---
+    # Cas euros simulé
     if q.upper() in {"EUROFUND", "FONDS EN EUROS", "FONDS EN EUROS (SIMULÉ)"}:
-        ser = _eurofund_series(euro_rate=euro_rate,
-                               start=pd.Timestamp("1990-01-01"),
-                               end=TODAY)
+        ser = _eurofund_series(euro_rate=euro_rate, start=pd.Timestamp("1990-01-01"), end=TODAY)
         if start_dt is not None:
             ser = ser.loc[ser.index >= start_dt]
-        if not ser.empty:
-            ser = ser / ser.iloc[0]  # rebase à 1 au jour d'achat (affichage intuitif)
-        df = ser.to_frame()
-        note = f"Fonds en euros simulé — intérêts le 31/12 au taux {euro_rate:.2f}%/an (rebasé à 1 au départ)."
-        return df, "EUROFUND", note
+        if not ser.empty: ser = ser / ser.iloc[0]
+        return ser.to_frame(), "EUROFUND", f"Fonds en euros simulé — intérêts le 31/12 au taux {euro_rate:.2f}%/an (rebasé à 1 au départ)."
 
-    # --- Sinon : flux EODHD (fonds/ETF réels) ---
     qU = q.upper()
     note = ""
+
     def _fetch(sym: str, from_dt: Optional[str]) -> pd.DataFrame:
-        params={"period":"d"}
-        if from_dt: params["from"]=from_dt
-        js = eodhd_get(f"/eod/{sym}", params=params)
-        df = pd.DataFrame(js)
-        if df.empty: return pd.DataFrame()
-        df["date"]=pd.to_datetime(df["date"]); df=df.set_index("date").sort_index()
-        df["close"]=pd.to_numeric(df["close"], errors="coerce")
-        return df[["close"]].rename(columns={"close":"Close"})
+        try:
+            params={"period":"d"}
+            if from_dt: params["from"]=from_dt
+            js = eodhd_get(f"/eod/{sym}", params=params)
+            df = pd.DataFrame(js)
+            if df.empty: return pd.DataFrame()
+            df["date"]=pd.to_datetime(df["date"]); df=df.set_index("date").sort_index()
+            df["close"]=pd.to_numeric(df["close"], errors="coerce")
+            return df[["close"]].rename(columns={"close":"Close"})
+        except Exception:
+            # *** IMPORTANT *** : si /eod renvoie 404 ou autre, on renvoie un DF vide
+            # pour permettre le fallback /search (previousClose).
+            return pd.DataFrame()
+
     def _try(sym: str, from_ts: Optional[pd.Timestamp]) -> Optional[pd.DataFrame]:
-        df=_fetch(sym, None)
+        # 1) sans 'from' (pour forcer EODHD à renvoyer quelque chose si possible)
+        df = _fetch(sym, None)
         if not df.empty:
-            if from_ts is not None: df=df.loc[df.index>=from_ts]
+            if from_ts is not None: df = df.loc[df.index >= from_ts]
             if not df.empty: return df
-        f=from_ts.strftime("%Y-%m-%d") if from_ts is not None else None
-        df=_fetch(sym, f)
+        # 2) avec 'from' (si jamais le DF complet est trop gros côté EODHD)
+        f = from_ts.strftime("%Y-%m-%d") if from_ts is not None else None
+        df = _fetch(sym, f)
         if not df.empty: return df
         return None
 
+    # Si déjà un symbole "code.exchange"
     if "." in qU and not _looks_like_isin(qU.split(".")[0]):
         df=_try(qU,start_dt)
         if df is not None: return df,qU,note
@@ -195,7 +192,7 @@ def eod_prices_any(symbol_or_isin: str,
             df=_try(f"{base}{suf}", start_dt)
             if df is not None: return df,f"{base}{suf}",note
 
-    # fallback /search dernier cours
+    # ---- Fallback /search (dernier cours)
     srch=eod_search(base if _looks_like_isin(base) else qU)
     last_px,last_dt=None,None
     if srch:
@@ -230,7 +227,7 @@ def xirr(cash_flows: List[Tuple[pd.Timestamp, float]]) -> Optional[float]:
         else: lo=mid
     return None
 
-# ---------- Univers pré-rempli ----------
+# ---------- Univers ----------
 UNIVERSE_GENERALI = [
     {"name":"Fonds en euros (simulé)","isin":"EUROFUND","type":"Fonds en euros"},
     {"name":"R-co Valor C EUR","isin":"FR0011253624","type":"Actions Monde"},
@@ -248,7 +245,7 @@ UNI_OPTIONS = ["— Saisie libre —"] + [f"{r['name']} — {r['isin']}" for r i
 for key in ["A_lines","B_lines"]:
     if key not in st.session_state: st.session_state[key]=[]
 
-# ---------- Helpers dates & quantités ----------
+# ---------- Helpers ----------
 def _auto_name_from_isin(isin: str) -> str:
     if not isin: return ""
     if isin.upper()=="EUROFUND": return "Fonds en euros (simulé)"
@@ -283,7 +280,7 @@ def _month_schedule(start_dt: pd.Timestamp, end_dt: pd.Timestamp) -> List[pd.Tim
         cur = pd.Timestamp(year=y, month=m, day=day)
     return dates
 
-# ---------- Import/Export & Collage ----------
+# ---------- Standardisation & Collage ----------
 def _normalize_col(s: str) -> str:
     s = (s or "").strip().lower()
     s = s.replace("€", "").replace("(", "").replace(")", "").replace(".", "").replace(",", "").replace("  ", " ")
@@ -342,11 +339,12 @@ def lines_from_dataframe(df_std: pd.DataFrame, euro_rate: float, default_dt: Opt
         if (not isin and not name) or (amount is None or pd.isna(amount) or float(amount) <= 0):
             continue
 
-        # date: si absente -> default_dt requis
         if not buy_date or pd.isna(buy_date):
             if default_dt is None:
-                continue
-            buy_ts = pd.Timestamp(default_dt)
+                # pas de date -> on ne rejette plus silencieusement : on continue mais on met TODAY
+                buy_ts = TODAY
+            else:
+                buy_ts = pd.Timestamp(default_dt)
         else:
             buy_ts = pd.Timestamp(buy_date)
 
@@ -354,7 +352,6 @@ def lines_from_dataframe(df_std: pd.DataFrame, euro_rate: float, default_dt: Opt
         if dfp.empty:
             continue
 
-        px = None
         if (buy_price is not None) and not pd.isna(buy_price) and float(buy_price) > 0:
             px = float(buy_price)
         else:
@@ -428,7 +425,7 @@ def parse_pasted_table(text: str) -> pd.DataFrame:
             df[col] = df[col].str.replace(" ", "").str.replace("€","").str.replace(",", ".")
     return df
 
-# ---------- Saisie/édition d'une ligne ----------
+# ---------- UI saisie/édition ----------
 def _add_line_ui(port_key: str, title: str, euro_rate: float):
     st.subheader(title)
     with st.form(key=f"{port_key}_form", clear_on_submit=False):
@@ -573,7 +570,7 @@ def _line_card(line: Dict[str,Any], idx:int, port_key:str):
                     st.success("Ligne mise à jour.")
                     st.experimental_rerun()
 
-# ---------- Sidebar : paramètres globaux + affectation ----------
+# ---------- Sidebar ----------
 st.title("🟣 Comparer deux portefeuilles (Client vs Vous)")
 
 with st.sidebar:
@@ -623,16 +620,16 @@ with st.sidebar:
     st.divider()
     mB, oneB_amt, oneB_date, modeB, customB, singleB = _alloc_sidebar("Portefeuille 2 — Vous", "B_lines", "B")
 
-# ---------- UI deux portefeuilles ----------
+# ---------- Tabs saisie ----------
 tabA, tabB = st.tabs(["📁 Portefeuille 1 — Client","🟣 Portefeuille 2 — Vous"])
 
 with tabA:
     _add_line_ui("A_lines","Portefeuille 1 — Client", EURO_RATE)
 
-    # ---- Coller un tableau ----
     with st.expander("📋 Coller un tableau (Nom | ISIN | Montant | [Date] | [Prix])"):
         default_dt_A = st.date_input("Date d’achat par défaut (si absente dans le tableau)", value=date(2024,1,2), key="default_dt_A")
         pasteA = st.text_area("Colle ici depuis Excel/Sheets", height=180, key="pasteA")
+
         if st.button("🔎 Prévisualiser (Client)"):
             if not pasteA.strip():
                 st.warning("Rien à parser.")
@@ -642,12 +639,17 @@ with tabA:
                     st.warning("Impossible de détecter un tableau.")
                 else:
                     st.write("Aperçu :", dfp)
+                    # on **mémorise** l'aperçu ET la date par défaut pour l'ajout
                     st.session_state["pasteA_preview"] = dfp
                     st.session_state["pasteA_default_dt"] = pd.Timestamp(default_dt_A)
 
         if st.button("➕ Ajouter ces lignes (Client)"):
             dfp = st.session_state.get("pasteA_preview", pd.DataFrame())
             default_dt_saved = st.session_state.get("pasteA_default_dt", None)
+            # filet de sécu : si pas mémorisé (pas de clic prévisualiser), on prend la valeur du widget
+            if default_dt_saved is None:
+                default_dt_saved = pd.Timestamp(default_dt_A)
+
             if dfp.empty:
                 st.warning("Fais d’abord la prévisualisation.")
             else:
@@ -655,15 +657,14 @@ with tabA:
                 for col in ["amount","buy_price"]:
                     if col in dfp.columns:
                         dfp[col] = pd.to_numeric(dfp[col], errors="coerce")
-                new_lines = lines_from_dataframe(dfp, EURO_RATE, default_dt=default_dt_saved)
+                new_lines = lines_from_dataframe(dfp, st.session_state["EURO_RATE_PREVIEW"], default_dt=default_dt_saved)
                 if not new_lines:
-                    st.warning("Aucune ligne valide à ajouter (vérifie ISIN/nom, montant, date par défaut).")
+                    st.warning("Aucune ligne valide à ajouter (vérifie ISIN/nom, montant, et/ou la date par défaut).")
                 else:
                     st.session_state["A_lines"].extend(new_lines)
                     st.success(f"{len(new_lines)} ligne(s) ajoutée(s).")
                     st.experimental_rerun()
 
-    # ---- Import portefeuille (Excel/CSV) ----
     with st.expander("📥 Importer un portefeuille client (Excel/CSV)"):
         cta1, cta2 = st.columns(2)
         with cta1:
@@ -675,10 +676,11 @@ with tabA:
             )
         with cta2:
             st.caption("Colonnes : **name**, **isin**, **amount**, **buy_price** (opt.), **buy_date** (YYYY-MM-DD).")
-        default_dt_file_A = st.date_input("Date d’achat par défaut pour l’import (si absente)", value=date(2024,1,2), key="default_dt_file_A")
 
+        default_dt_file_A = st.date_input("Date d’achat par défaut pour l’import (si absente)", value=date(2024,1,2), key="default_dt_file_A")
         up = st.file_uploader("Choisir un fichier .xlsx/.xls/.csv", type=["xlsx","xls","csv"], key="uploader_A")
         replace_mode = st.radio("Mode d’import", ["Remplacer le portefeuille client", "Ajouter aux lignes existantes"], horizontal=True, key="import_mode_A")
+
         if up is not None:
             try:
                 if up.name.lower().endswith(".csv"):
@@ -694,7 +696,7 @@ with tabA:
                     df_std = _standardize_df(df_raw)
                     st.write("Aperçu détecté :", df_std.head())
                     if st.button("Importer ces lignes", type="primary", key="btn_import_A"):
-                        new_lines = lines_from_dataframe(df_std, EURO_RATE, default_dt=pd.Timestamp(default_dt_file_A))
+                        new_lines = lines_from_dataframe(df_std, st.session_state["EURO_RATE_PREVIEW"], default_dt=pd.Timestamp(default_dt_file_A))
                         if not new_lines:
                             st.warning("Aucune ligne valide détectée dans le fichier.")
                         else:
@@ -715,6 +717,7 @@ with tabB:
     with st.expander("📋 Coller un tableau (Nom | ISIN | Montant | [Date] | [Prix])"):
         default_dt_B = st.date_input("Date d’achat par défaut (si absente dans le tableau)", value=date(2024,1,2), key="default_dt_B")
         pasteB = st.text_area("Colle ici depuis Excel/Sheets", height=180, key="pasteB")
+
         if st.button("🔎 Prévisualiser (Vous)"):
             if not pasteB.strip():
                 st.warning("Rien à parser.")
@@ -730,6 +733,9 @@ with tabB:
         if st.button("➕ Ajouter ces lignes (Vous)"):
             dfp = st.session_state.get("pasteB_preview", pd.DataFrame())
             default_dt_saved = st.session_state.get("pasteB_default_dt", None)
+            if default_dt_saved is None:
+                default_dt_saved = pd.Timestamp(default_dt_B)
+
             if dfp.empty:
                 st.warning("Fais d’abord la prévisualisation.")
             else:
@@ -737,9 +743,9 @@ with tabB:
                 for col in ["amount","buy_price"]:
                     if col in dfp.columns:
                         dfp[col] = pd.to_numeric(dfp[col], errors="coerce")
-                new_lines = lines_from_dataframe(dfp, EURO_RATE, default_dt=default_dt_saved)
+                new_lines = lines_from_dataframe(dfp, st.session_state["EURO_RATE_PREVIEW"], default_dt=default_dt_saved)
                 if not new_lines:
-                    st.warning("Aucune ligne valide à ajouter (vérifie ISIN/nom, montant, date par défaut).")
+                    st.warning("Aucune ligne valide à ajouter (vérifie ISIN/nom, montant, et/ou la date par défaut).")
                 else:
                     st.session_state["B_lines"].extend(new_lines)
                     st.success(f"{len(new_lines)} ligne(s) ajoutée(s).")
@@ -747,7 +753,7 @@ with tabB:
 
     for i,ln in enumerate(st.session_state["B_lines"]): _line_card(ln,i,"B_lines")
 
-# ---------- AFFECTATION & CONSTRUCTION SÉRIES ----------
+# ---------- Pondérations & Simulation ----------
 def _weights_for(lines: List[Dict[str,Any]], mode: str, custom: Dict[int,float], single_id: Optional[int]) -> Dict[int,float]:
     if not lines:
         return {}
@@ -763,19 +769,16 @@ def _weights_for(lines: List[Dict[str,Any]], mode: str, custom: Dict[int,float],
         return {id(ln): float(ln["amount"])/total for ln in lines}
     return {id(ln): 1.0/len(lines) for ln in lines}
 
-@st.cache_data(ttl=1800, show_spinner=False)
-def build_portfolio_series(lines: List[Dict[str,Any]],
-                           monthly_amt: float,
-                           one_amt: float, one_date: date,
-                           alloc_mode: str,
-                           custom_weights: Dict[int,float],
-                           single_target: Optional[int],
-                           euro_rate: float
-                           ) -> Tuple[pd.DataFrame, float, float, Optional[float], pd.Timestamp, pd.Timestamp]:
+def simulate_portfolio(lines: List[Dict[str,Any]],
+                       monthly_amt: float,
+                       one_amt: float, one_date: date,
+                       alloc_mode: str,
+                       custom_weights: Dict[int,float],
+                       single_target: Optional[int],
+                       euro_rate: float) -> Tuple[pd.DataFrame, float, float, Optional[float], pd.Timestamp, pd.Timestamp]:
     if not lines:
         return pd.DataFrame(), 0.0, 0.0, None, TODAY, TODAY
 
-    # Prix
     series: Dict[int, pd.Series] = {}
     for ln in lines:
         df,_,_ = load_price_series_any(ln.get("isin") or ln.get("name"), None, euro_rate)
@@ -784,7 +787,6 @@ def build_portfolio_series(lines: List[Dict[str,Any]],
     if not series:
         return pd.DataFrame(), 0.0, 0.0, None, TODAY, TODAY
 
-    # Dates effectives & quantités initiales
     eff_buy_date: Dict[int, pd.Timestamp] = {}
     qty_init: Dict[int, float] = {}
     for ln in lines:
@@ -815,7 +817,6 @@ def build_portfolio_series(lines: List[Dict[str,Any]],
     qty_curr: Dict[int, float] = {id(ln): 0.0 for ln in lines}
     weights = _weights_for(lines, alloc_mode, custom_weights, single_target)
 
-    # Cash-flows XIRR
     cash_flows: List[Tuple[pd.Timestamp, float]] = []
     for ln in lines:
         sid=id(ln)
@@ -827,13 +828,11 @@ def build_portfolio_series(lines: List[Dict[str,Any]],
 
     values=[]
     for d in idx:
-        # Ajout quantités initiales
         for ln in lines:
             sid=id(ln)
             if sid in eff_buy_date and d == eff_buy_date[sid]:
                 qty_curr[sid] += qty_init[sid]
 
-        # Versement ponctuel
         if one_dt is not None and d==one_dt and one_amt>0:
             for ln in lines:
                 sid=id(ln); s=series.get(sid)
@@ -844,7 +843,6 @@ def build_portfolio_series(lines: List[Dict[str,Any]],
                 qty_curr[sid] += (one_amt*w)/px
             cash_flows.append((d, -float(one_amt)))
 
-        # Versements mensuels
         if d in sched and monthly_amt>0:
             for ln in lines:
                 sid=id(ln); s=series.get(sid)
@@ -855,7 +853,6 @@ def build_portfolio_series(lines: List[Dict[str,Any]],
                 qty_curr[sid] += (monthly_amt*w)/px
             cash_flows.append((d, -float(monthly_amt)))
 
-        # Valorisation
         v=0.0
         for ln in lines:
             sid=id(ln); s=series.get(sid)
@@ -875,18 +872,16 @@ def build_portfolio_series(lines: List[Dict[str,Any]],
     irr = xirr(cash_flows)
     return df_val, total_invested, final_val, (irr*100.0 if irr is not None else None), start_min, start_full
 
-# ---------- Contrôles d’affichage ----------
+# ---------- Affichage & run ----------
 rebase_100 = st.checkbox("Normaliser les courbes à 100 au départ", value=False)
-
-# ---------- Action : Calcul & affichages ----------
 st.divider()
 run = st.button("🚀 Lancer la comparaison", type="primary")
 
 if run:
-    dfA, investA, valA, xirrA, A_first, A_full = build_portfolio_series(
+    dfA, investA, valA, xirrA, A_first, A_full = simulate_portfolio(
         st.session_state["A_lines"], mA, oneA_amt, oneA_date, modeA, customA, singleA, st.session_state.get("EURO_RATE_PREVIEW", 2.0)
     )
-    dfB, investB, valB, xirrB, B_first, B_full = build_portfolio_series(
+    dfB, investB, valB, xirrB, B_first, B_full = simulate_portfolio(
         st.session_state["B_lines"], mB, oneB_amt, oneB_date, modeB, customB, singleB, st.session_state.get("EURO_RATE_PREVIEW", 2.0)
     )
 
@@ -895,10 +890,8 @@ if run:
     dfB_plot = dfB.loc[dfB.index >= B_start].copy() if not dfB.empty else dfB
 
     if rebase_100:
-        if not dfA_plot.empty:
-            dfA_plot["Valeur"] = 100 * dfA_plot["Valeur"] / dfA_plot["Valeur"].iloc[0]
-        if not dfB_plot.empty:
-            dfB_plot["Valeur"] = 100 * dfB_plot["Valeur"] / dfB_plot["Valeur"].iloc[0]
+        if not dfA_plot.empty: dfA_plot["Valeur"] = 100 * dfA_plot["Valeur"] / dfA_plot["Valeur"].iloc[0]
+        if not dfB_plot.empty: dfB_plot["Valeur"] = 100 * dfB_plot["Valeur"] / dfB_plot["Valeur"].iloc[0]
 
     st.subheader("📈 Évolution de la valeur des portefeuilles")
     if not dfA_plot.empty or not dfB_plot.empty:
@@ -981,7 +974,7 @@ if run:
 else:
     st.info("Ajoute des lignes (formulaire ou **Coller un tableau**), règle les versements dans la barre latérale, puis clique **Lancer la comparaison**.")
 
-# ---------- Debug (optionnel) ----------
+# ---------- Debug ----------
 with st.expander("🔧 Debug EODHD (optionnel)"):
     test_q = st.text_input("Tester une recherche (ISIN, nom ou EUROFUND)")
     if test_q:

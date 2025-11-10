@@ -1,8 +1,12 @@
 # =========================================
 # app.py — Comparateur Portefeuilles CGP
-# (correctifs : collage "Ajouter ces lignes" + fallback 404 EODHD)
+# - EODHD + VL synthétiques si historique indisponible
+# - Fonds en euros simulé (intérêts au 31/12)
+# - Coller un tableau / Import CSV
+# - Versements mensuels & ponctuels avec affectation
+# - Comparaison Client vs Vous (XIRR, courbes, delta de gains)
 # =========================================
-import os, re, math, requests, calendar
+import os, re, math, requests, calendar, random
 from datetime import date
 from typing import Optional, List, Dict, Any, Tuple
 
@@ -127,11 +131,11 @@ def _eurofund_series(euro_rate: float,
         vals.append(v)
     return pd.Series(vals, index=idx, name="Close")
 
-# ---------- Prix (avec fallback robuste) ----------
+# ---------- VL via EODHD (fallback /search) ----------
 @st.cache_data(ttl=3*3600, show_spinner=False)
 def eod_prices_any(symbol_or_isin: str,
                    start_dt: Optional[pd.Timestamp],
-                   euro_rate: float) -> Tuple[pd.DataFrame, str, str]:
+                   euro_rate: float) -> Tuple(pd.DataFrame, str, str):
     q = (symbol_or_isin or "").strip()
     if not q:
         return pd.DataFrame(), q, "⚠️ identifiant vide."
@@ -158,23 +162,18 @@ def eod_prices_any(symbol_or_isin: str,
             df["close"]=pd.to_numeric(df["close"], errors="coerce")
             return df[["close"]].rename(columns={"close":"Close"})
         except Exception:
-            # *** IMPORTANT *** : si /eod renvoie 404 ou autre, on renvoie un DF vide
-            # pour permettre le fallback /search (previousClose).
             return pd.DataFrame()
 
     def _try(sym: str, from_ts: Optional[pd.Timestamp]) -> Optional[pd.DataFrame]:
-        # 1) sans 'from' (pour forcer EODHD à renvoyer quelque chose si possible)
         df = _fetch(sym, None)
         if not df.empty:
             if from_ts is not None: df = df.loc[df.index >= from_ts]
             if not df.empty: return df
-        # 2) avec 'from' (si jamais le DF complet est trop gros côté EODHD)
         f = from_ts.strftime("%Y-%m-%d") if from_ts is not None else None
         df = _fetch(sym, f)
         if not df.empty: return df
         return None
 
-    # Si déjà un symbole "code.exchange"
     if "." in qU and not _looks_like_isin(qU.split(".")[0]):
         df=_try(qU,start_dt)
         if df is not None: return df,qU,note
@@ -192,7 +191,7 @@ def eod_prices_any(symbol_or_isin: str,
             df=_try(f"{base}{suf}", start_dt)
             if df is not None: return df,f"{base}{suf}",note
 
-    # ---- Fallback /search (dernier cours)
+    # Fallback /search (dernier cours)
     srch=eod_search(base if _looks_like_isin(base) else qU)
     last_px,last_dt=None,None
     if srch:
@@ -209,8 +208,69 @@ def eod_prices_any(symbol_or_isin: str,
     return pd.DataFrame(), qU, "⚠️ Aucune VL récupérée."
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def load_price_series_any(symbol_or_isin: str, from_dt: Optional[pd.Timestamp], euro_rate: float) -> Tuple[pd.DataFrame, str, str]:
+def load_price_series_any(symbol_or_isin: str, from_dt: Optional[pd.Timestamp], euro_rate: float):
     return eod_prices_any(symbol_or_isin, from_dt, euro_rate)
+
+# ---------- VL synthétique ----------
+if "SYNTH_NAV" not in st.session_state:
+    st.session_state["SYNTH_NAV"] = {}  # key -> DataFrame Close (index dates)
+
+def _best_annual_rate(perf_1y: Optional[float], perf_3y: Optional[float],
+                      perf_5y: Optional[float], perf_10y: Optional[float]) -> float:
+    vals = [v for v in [perf_1y, perf_3y, perf_5y, perf_10y] if v is not None]
+    if not vals: return 0.0
+    return float(np.mean(vals))
+
+def _simulate_nav_series(start_dt: pd.Timestamp, end_dt: pd.Timestamp,
+                         annual_perf_pct: float = 5.0,
+                         vol_pct: float = 10.0,
+                         seed: Optional[int] = 42) -> pd.DataFrame:
+    """Série log-normale base 100 (jours ouvrés)."""
+    if seed is not None:
+        np.random.seed(int(seed))
+        random.seed(int(seed))
+    dates = pd.bdate_range(start=start_dt, end=end_dt)
+    n = len(dates)
+    if n <= 1:
+        return pd.DataFrame({"Close":[100.0]}, index=[start_dt])
+    mu = (annual_perf_pct/100.0)/252.0
+    sigma = (vol_pct/100.0)/np.sqrt(252.0)
+    rnd = np.random.normal(mu, sigma, n)
+    prices = 100.0*np.exp(np.cumsum(rnd))
+    df = pd.DataFrame({"Close": prices}, index=dates)
+    return df
+
+def save_synth_series(key: str, df: pd.DataFrame):
+    keyU = (key or "").strip().upper()
+    if keyU:
+        st.session_state["SYNTH_NAV"][keyU] = df[["Close"]].copy()
+
+def get_synth_series(key: str, from_dt: Optional[pd.Timestamp]) -> pd.DataFrame:
+    keyU = (key or "").strip().upper()
+    if not keyU: return pd.DataFrame()
+    df = st.session_state["SYNTH_NAV"].get(keyU, pd.DataFrame())
+    if df.empty: return df
+    if from_dt is not None:
+        df = df.loc[df.index >= from_dt]
+    return df
+
+def get_price_series(symbol_or_isin: str, from_dt: Optional[pd.Timestamp], euro_rate: float) -> Tuple[pd.DataFrame, str, str]:
+    """Essaie EODHD, sinon VL synthétique si présente."""
+    df, sym, note = load_price_series_any(symbol_or_isin, from_dt, euro_rate)
+    if not df.empty:
+        return df, sym, note
+    # VL synthétique existante ?
+    sdf = get_synth_series(symbol_or_isin, from_dt)
+    if not sdf.empty:
+        return sdf.copy(), f"{symbol_or_isin.upper()}.SYNTH", "VL synthétique utilisée."
+    # Essai via nom résolu (ISIN -> synth déjà créée sous ISIN ?)
+    base = (symbol_or_isin or "").strip().upper()
+    if "." in base:
+        base = base.split(".")[0]
+    sdf2 = get_synth_series(base, from_dt)
+    if not sdf2.empty:
+        return sdf2.copy(), f"{base}.SYNTH", "VL synthétique utilisée."
+    return pd.DataFrame(), sym, note
 
 # ---------- XIRR ----------
 def xnpv(rate: float, cash_flows: List[Tuple[pd.Timestamp, float]]) -> float:
@@ -327,6 +387,7 @@ def build_import_template_df() -> pd.DataFrame:
 def export_template_csv_bytes() -> bytes:
     return build_import_template_df().to_csv(index=False).encode("utf-8")
 
+# ---------- Prise en compte EODHD + Synth dans les flux ----------
 def lines_from_dataframe(df_std: pd.DataFrame, euro_rate: float, default_dt: Optional[pd.Timestamp]=None) -> List[Dict[str, Any]]:
     lines: List[Dict[str, Any]] = []
     for _, row in df_std.iterrows():
@@ -340,16 +401,13 @@ def lines_from_dataframe(df_std: pd.DataFrame, euro_rate: float, default_dt: Opt
             continue
 
         if not buy_date or pd.isna(buy_date):
-            if default_dt is None:
-                # pas de date -> on ne rejette plus silencieusement : on continue mais on met TODAY
-                buy_ts = TODAY
-            else:
-                buy_ts = pd.Timestamp(default_dt)
+            buy_ts = pd.Timestamp(default_dt) if default_dt is not None else TODAY
         else:
             buy_ts = pd.Timestamp(buy_date)
 
-        dfp, sym_used, note = load_price_series_any(isin or name, buy_ts, euro_rate)
+        dfp, sym_used, note = get_price_series(isin or name, buy_ts, euro_rate)
         if dfp.empty:
+            # si pas de série (ni EODHD ni synth), on ignore — l’utilisateur peut créer une synth dans la sidebar
             continue
 
         if (buy_price is not None) and not pd.isna(buy_price) and float(buy_price) > 0:
@@ -425,6 +483,31 @@ def parse_pasted_table(text: str) -> pd.DataFrame:
             df[col] = df[col].str.replace(" ", "").str.replace("€","").str.replace(",", ".")
     return df
 
+# ---------- UI : VL synthétique (création) ----------
+with st.sidebar:
+    st.header("🧮 VL synthétique (si VL absente)")
+    synth_key = st.text_input("ISIN ou Nom (clé de stockage)")
+    col_a, col_b = st.columns(2)
+    with col_a:
+        base_date = st.date_input("Date de départ", value=date(2018,1,1))
+        vol_pct = st.number_input("Volatilité annuelle (%)", min_value=0.0, max_value=50.0, value=10.0, step=0.5)
+    with col_b:
+        seed = st.number_input("Seed (réplicabilité)", min_value=0, max_value=10_000, value=42, step=1)
+        perf_1y = st.number_input("Perf 1 an (%)", value=3.0, step=0.1)
+    perf_3y = st.number_input("Perf 3 ans (%)", value=4.0, step=0.1)
+    perf_5y = st.number_input("Perf 5 ans (%)", value=5.0, step=0.1)
+    perf_10y = st.number_input("Perf 10 ans (%)", value=5.0, step=0.1)
+
+    if st.button("✅ Créer / Mettre à jour la VL synthétique"):
+        key = (synth_key or "").strip()
+        if not key:
+            st.warning("Saisis une clé (ISIN ou Nom) pour identifier le fonds.")
+        else:
+            rate = _best_annual_rate(perf_1y, perf_3y, perf_5y, perf_10y)
+            df_syn = _simulate_nav_series(pd.Timestamp(base_date), TODAY, annual_perf_pct=rate, vol_pct=vol_pct, seed=int(seed))
+            save_synth_series(key, df_syn)
+            st.success(f"VL synthétique créée pour « {key} » (µ≈{rate:.2f}%/an, σ≈{vol_pct:.2f}%/an).")
+
 # ---------- UI saisie/édition ----------
 def _add_line_ui(port_key: str, title: str, euro_rate: float):
     st.subheader(title)
@@ -459,9 +542,10 @@ def _add_line_ui(port_key: str, title: str, euro_rate: float):
         if not isin and not name:
             st.warning("Indique au minimum l’**ISIN** ou le **nom** du fonds."); st.stop()
 
-        dfp, sym_used, note = load_price_series_any(isin or name, pd.Timestamp(dt), euro_rate)
+        # -> tente EODHD puis synth si dispo
+        dfp, sym_used, note = get_price_series(isin or name, pd.Timestamp(dt), euro_rate)
         if dfp.empty:
-            st.error("Impossible de récupérer des VL pour ce fonds."); st.stop()
+            st.error("Impossible de récupérer des VL (EODHD ni synth). Crée une VL synthétique dans la barre latérale « VL synthétique »."); st.stop()
 
         px = None
         if px_opt:
@@ -509,7 +593,7 @@ def _line_card(line: Dict[str,Any], idx:int, port_key:str):
             if line.get("note"): st.caption(line["note"])
         with header[3]:
             try:
-                df_last,_,_ = load_price_series_any(line.get("isin") or line.get("name"), None, st.session_state.get("EURO_RATE_PREVIEW", 2.0))
+                df_last,_,_ = get_price_series(line.get("isin") or line.get("name"), None, st.session_state.get("EURO_RATE_PREVIEW", 2.0))
                 last = float(df_last["Close"].iloc[-1]) if not df_last.empty else np.nan
                 st.markdown(f"Dernier : **{to_eur(last)}**")
             except Exception:
@@ -544,7 +628,7 @@ def _line_card(line: Dict[str,Any], idx:int, port_key:str):
                         st.warning("Montant invalide."); st.stop()
 
                     buy_ts = pd.Timestamp(new_date)
-                    dfp,_,_ = load_price_series_any(line.get("isin") or line.get("name"), buy_ts, st.session_state.get("EURO_RATE_PREVIEW", 2.0))
+                    dfp,_,_ = get_price_series(line.get("isin") or line.get("name"), buy_ts, st.session_state.get("EURO_RATE_PREVIEW", 2.0))
                     if dfp.empty:
                         st.error("Impossible de recalculer la VL au jour choisi."); st.stop()
 
@@ -570,7 +654,7 @@ def _line_card(line: Dict[str,Any], idx:int, port_key:str):
                     st.success("Ligne mise à jour.")
                     st.experimental_rerun()
 
-# ---------- Sidebar ----------
+# ---------- Sidebar principal ----------
 st.title("🟣 Comparer deux portefeuilles (Client vs Vous)")
 
 with st.sidebar:
@@ -621,35 +705,27 @@ with st.sidebar:
     mB, oneB_amt, oneB_date, modeB, customB, singleB = _alloc_sidebar("Portefeuille 2 — Vous", "B_lines", "B")
 
 # ---------- Tabs saisie ----------
-tabA, tabB = st.tabs(["📁 Portefeuille 1 — Client","🟣 Portefeuille 2 — Vous"])
-
-with tabA:
-    _add_line_ui("A_lines","Portefeuille 1 — Client", EURO_RATE)
-
-    with st.expander("📋 Coller un tableau (Nom | ISIN | Montant | [Date] | [Prix])"):
-        default_dt_A = st.date_input("Date d’achat par défaut (si absente dans le tableau)", value=date(2024,1,2), key="default_dt_A")
-        pasteA = st.text_area("Colle ici depuis Excel/Sheets", height=180, key="pasteA")
-
-        if st.button("🔎 Prévisualiser (Client)"):
-            if not pasteA.strip():
+def _expander_paste_block(who_label: str, paste_key_prefix: str, lines_key: str):
+    with st.expander(f"📋 Coller un tableau (Nom | ISIN | Montant | [Date] | [Prix]) — {who_label}"):
+        default_dt = st.date_input("Date d’achat par défaut (si absente)", value=date(2024,1,2), key=f"default_dt_{paste_key_prefix}")
+        text = st.text_area("Colle ici depuis Excel/Sheets", height=180, key=f"paste_{paste_key_prefix}")
+        if st.button(f"🔎 Prévisualiser ({who_label})"):
+            if not text.strip():
                 st.warning("Rien à parser.")
             else:
-                dfp = parse_pasted_table(pasteA)
+                dfp = parse_pasted_table(text)
                 if dfp.empty:
                     st.warning("Impossible de détecter un tableau.")
                 else:
                     st.write("Aperçu :", dfp)
-                    # on **mémorise** l'aperçu ET la date par défaut pour l'ajout
-                    st.session_state["pasteA_preview"] = dfp
-                    st.session_state["pasteA_default_dt"] = pd.Timestamp(default_dt_A)
+                    st.session_state[f"paste_preview_{paste_key_prefix}"] = dfp
+                    st.session_state[f"paste_default_dt_{paste_key_prefix}"] = pd.Timestamp(default_dt)
 
-        if st.button("➕ Ajouter ces lignes (Client)"):
-            dfp = st.session_state.get("pasteA_preview", pd.DataFrame())
-            default_dt_saved = st.session_state.get("pasteA_default_dt", None)
-            # filet de sécu : si pas mémorisé (pas de clic prévisualiser), on prend la valeur du widget
+        if st.button(f"➕ Ajouter ces lignes ({who_label})"):
+            dfp = st.session_state.get(f"paste_preview_{paste_key_prefix}", pd.DataFrame())
+            default_dt_saved = st.session_state.get(f"paste_default_dt_{paste_key_prefix}", None)
             if default_dt_saved is None:
-                default_dt_saved = pd.Timestamp(default_dt_A)
-
+                default_dt_saved = pd.Timestamp(default_dt)
             if dfp.empty:
                 st.warning("Fais d’abord la prévisualisation.")
             else:
@@ -659,11 +735,17 @@ with tabA:
                         dfp[col] = pd.to_numeric(dfp[col], errors="coerce")
                 new_lines = lines_from_dataframe(dfp, st.session_state["EURO_RATE_PREVIEW"], default_dt=default_dt_saved)
                 if not new_lines:
-                    st.warning("Aucune ligne valide à ajouter (vérifie ISIN/nom, montant, et/ou la date par défaut).")
+                    st.warning("Aucune ligne valide à ajouter. Astuce : si un fonds n’a pas de VL, crée une **VL synthétique** dans la barre latérale puis recommence.")
                 else:
-                    st.session_state["A_lines"].extend(new_lines)
+                    st.session_state[lines_key].extend(new_lines)
                     st.success(f"{len(new_lines)} ligne(s) ajoutée(s).")
                     st.experimental_rerun()
+
+tabA, tabB = st.tabs(["📁 Portefeuille 1 — Client","🟣 Portefeuille 2 — Vous"])
+
+with tabA:
+    _add_line_ui("A_lines","Portefeuille 1 — Client", st.session_state.get("EURO_RATE_PREVIEW", 2.0))
+    _expander_paste_block("Client","A","A_lines")
 
     with st.expander("📥 Importer un portefeuille client (Excel/CSV)"):
         cta1, cta2 = st.columns(2)
@@ -676,11 +758,9 @@ with tabA:
             )
         with cta2:
             st.caption("Colonnes : **name**, **isin**, **amount**, **buy_price** (opt.), **buy_date** (YYYY-MM-DD).")
-
         default_dt_file_A = st.date_input("Date d’achat par défaut pour l’import (si absente)", value=date(2024,1,2), key="default_dt_file_A")
         up = st.file_uploader("Choisir un fichier .xlsx/.xls/.csv", type=["xlsx","xls","csv"], key="uploader_A")
         replace_mode = st.radio("Mode d’import", ["Remplacer le portefeuille client", "Ajouter aux lignes existantes"], horizontal=True, key="import_mode_A")
-
         if up is not None:
             try:
                 if up.name.lower().endswith(".csv"):
@@ -698,7 +778,7 @@ with tabA:
                     if st.button("Importer ces lignes", type="primary", key="btn_import_A"):
                         new_lines = lines_from_dataframe(df_std, st.session_state["EURO_RATE_PREVIEW"], default_dt=pd.Timestamp(default_dt_file_A))
                         if not new_lines:
-                            st.warning("Aucune ligne valide détectée dans le fichier.")
+                            st.warning("Aucune ligne valide détectée. Astuce : crée d’abord des **VL synthétiques** pour les fonds non couverts.")
                         else:
                             if replace_mode.startswith("Remplacer"):
                                 st.session_state["A_lines"] = new_lines
@@ -712,45 +792,8 @@ with tabA:
     for i,ln in enumerate(st.session_state["A_lines"]): _line_card(ln,i,"A_lines")
 
 with tabB:
-    _add_line_ui("B_lines","Portefeuille 2 — Vous", EURO_RATE)
-
-    with st.expander("📋 Coller un tableau (Nom | ISIN | Montant | [Date] | [Prix])"):
-        default_dt_B = st.date_input("Date d’achat par défaut (si absente dans le tableau)", value=date(2024,1,2), key="default_dt_B")
-        pasteB = st.text_area("Colle ici depuis Excel/Sheets", height=180, key="pasteB")
-
-        if st.button("🔎 Prévisualiser (Vous)"):
-            if not pasteB.strip():
-                st.warning("Rien à parser.")
-            else:
-                dfp = parse_pasted_table(pasteB)
-                if dfp.empty:
-                    st.warning("Impossible de détecter un tableau.")
-                else:
-                    st.write("Aperçu :", dfp)
-                    st.session_state["pasteB_preview"] = dfp
-                    st.session_state["pasteB_default_dt"] = pd.Timestamp(default_dt_B)
-
-        if st.button("➕ Ajouter ces lignes (Vous)"):
-            dfp = st.session_state.get("pasteB_preview", pd.DataFrame())
-            default_dt_saved = st.session_state.get("pasteB_default_dt", None)
-            if default_dt_saved is None:
-                default_dt_saved = pd.Timestamp(default_dt_B)
-
-            if dfp.empty:
-                st.warning("Fais d’abord la prévisualisation.")
-            else:
-                dfp = dfp.replace("", np.nan)
-                for col in ["amount","buy_price"]:
-                    if col in dfp.columns:
-                        dfp[col] = pd.to_numeric(dfp[col], errors="coerce")
-                new_lines = lines_from_dataframe(dfp, st.session_state["EURO_RATE_PREVIEW"], default_dt=default_dt_saved)
-                if not new_lines:
-                    st.warning("Aucune ligne valide à ajouter (vérifie ISIN/nom, montant, et/ou la date par défaut).")
-                else:
-                    st.session_state["B_lines"].extend(new_lines)
-                    st.success(f"{len(new_lines)} ligne(s) ajoutée(s).")
-                    st.experimental_rerun()
-
+    _add_line_ui("B_lines","Portefeuille 2 — Vous", st.session_state.get("EURO_RATE_PREVIEW", 2.0))
+    _expander_paste_block("Vous","B","B_lines")
     for i,ln in enumerate(st.session_state["B_lines"]): _line_card(ln,i,"B_lines")
 
 # ---------- Pondérations & Simulation ----------
@@ -781,7 +824,7 @@ def simulate_portfolio(lines: List[Dict[str,Any]],
 
     series: Dict[int, pd.Series] = {}
     for ln in lines:
-        df,_,_ = load_price_series_any(ln.get("isin") or ln.get("name"), None, euro_rate)
+        df,_,_ = get_price_series(ln.get("isin") or ln.get("name"), None, euro_rate)
         if not df.empty:
             series[id(ln)] = df["Close"]
     if not series:
@@ -856,7 +899,6 @@ def simulate_portfolio(lines: List[Dict[str,Any]],
         v=0.0
         for ln in lines:
             sid=id(ln); s=series.get(sid)
-            if s is None or s.empty: continue
             if d in s.index: px=float(s.loc[d])
             else:
                 before=s.loc[s.index<=d]
@@ -879,10 +921,24 @@ run = st.button("🚀 Lancer la comparaison", type="primary")
 
 if run:
     dfA, investA, valA, xirrA, A_first, A_full = simulate_portfolio(
-        st.session_state["A_lines"], mA, oneA_amt, oneA_date, modeA, customA, singleA, st.session_state.get("EURO_RATE_PREVIEW", 2.0)
+        st.session_state["A_lines"], 
+        st.session_state.get("m_A", 0.0), 
+        st.session_state.get("one_A_amt", 0.0), 
+        st.session_state.get("one_A_date", date.today()), 
+        st.session_state.get("mode_A", "Pro-rata montants initiaux"),
+        {k:v for k,v in st.session_state.items() if str(k).startswith("A_") and isinstance(v, float)},
+        st.session_state.get("A_single_pick", None),
+        st.session_state.get("EURO_RATE_PREVIEW", 2.0)
     )
     dfB, investB, valB, xirrB, B_first, B_full = simulate_portfolio(
-        st.session_state["B_lines"], mB, oneB_amt, oneB_date, modeB, customB, singleB, st.session_state.get("EURO_RATE_PREVIEW", 2.0)
+        st.session_state["B_lines"], 
+        st.session_state.get("m_B", 0.0), 
+        st.session_state.get("one_B_amt", 0.0), 
+        st.session_state.get("one_B_date", date.today()), 
+        st.session_state.get("mode_B", "Pro-rata montants initiaux"),
+        {k:v for k,v in st.session_state.items() if str(k).startswith("B_") and isinstance(v, float)},
+        st.session_state.get("B_single_pick", None),
+        st.session_state.get("EURO_RATE_PREVIEW", 2.0)
     )
 
     A_start, B_start = A_first, B_first
@@ -946,7 +1002,7 @@ if run:
             return
         rows=[]
         for ln in lines:
-            df,_,_ = load_price_series_any(ln.get("isin") or ln.get("name"), None, st.session_state.get("EURO_RATE_PREVIEW", 2.0))
+            df,_,_ = get_price_series(ln.get("isin") or ln.get("name"), None, st.session_state.get("EURO_RATE_PREVIEW", 2.0))
             last = float(df["Close"].iloc[-1]) if not df.empty else np.nan
             rows.append({
                 "Nom": ln.get("name","—"),
@@ -975,12 +1031,12 @@ else:
     st.info("Ajoute des lignes (formulaire ou **Coller un tableau**), règle les versements dans la barre latérale, puis clique **Lancer la comparaison**.")
 
 # ---------- Debug ----------
-with st.expander("🔧 Debug EODHD (optionnel)"):
+with st.expander("🔧 Debug EODHD / Synth (optionnel)"):
     test_q = st.text_input("Tester une recherche (ISIN, nom ou EUROFUND)")
     if test_q:
         st.write("Résultat /search :", eod_search(test_q))
-        df_dbg, sym_dbg, note_dbg = load_price_series_any(test_q, None, st.session_state.get("EURO_RATE_PREVIEW", 2.0))
+        df_dbg, sym_dbg, note_dbg = get_price_series(test_q, None, st.session_state.get("EURO_RATE_PREVIEW", 2.0))
         st.write("Symbole testé :", sym_dbg)
         if note_dbg: st.caption(note_dbg)
         if not df_dbg.empty: st.dataframe(df_dbg.tail(5))
-        else: st.warning("Aucune VL trouvée.")
+        else: st.warning("Aucune VL trouvée (ni synth).")

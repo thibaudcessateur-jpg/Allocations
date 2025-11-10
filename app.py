@@ -1,9 +1,10 @@
 # =========================================
 # app.py — Comparateur Portefeuilles CGP
-# - EODHD + VL synthétiques auto (selon horizon réel)
-# - Fonds en euros simulé (taux paramétrable)
-# - Coller un tableau / Import CSV
-# - Versements mensuels & ponctuels avec affectation
+# - VL manuelle (Excel/CSV) prioritaire
+# - EODHD ensuite, puis VL synthétique (perf auto selon horizon)
+# - Fonds en euros simulé (taux paramétrable, intérêts le 31/12)
+# - Coller un tableau / Import CSV-Excel
+# - Versements mensuels & ponctuels (modes d’affectation)
 # - Comparaison Client vs Vous (XIRR, courbes, delta de gains)
 # =========================================
 import os, re, math, requests, calendar
@@ -17,6 +18,14 @@ import plotly.express as px
 
 st.set_page_config(page_title="Comparateur Portefeuilles CGP", page_icon="🦉", layout="wide")
 TODAY = pd.Timestamp.today().normalize()
+
+# ---------- États globaux nav custom/synth ----------
+if "SYNTH_PARAMS" not in st.session_state:
+    # keyU -> {"base_date": ts, "vol": float, "p1":float, "p3":opt, "p5":opt, "p10":opt, "buy_px":opt, "last_px":opt}
+    st.session_state["SYNTH_PARAMS"] = {}
+if "CUSTOM_NAVS" not in st.session_state:
+    # keyU -> DataFrame(index datetime, col "Close")
+    st.session_state["CUSTOM_NAVS"] = {}
 
 # ---------- Utils ----------
 def Secret_Token(name: str) -> str:
@@ -92,7 +101,7 @@ def resolve_symbol(q: str) -> Optional[str]:
                 return code
     return None
 
-# ---------- Fonds euros ----------
+# ---------- Fonds en euros ----------
 def _eurofund_series(euro_rate: float,
                      start: pd.Timestamp = pd.Timestamp("1990-01-01"),
                      end: pd.Timestamp = TODAY) -> pd.Series:
@@ -156,10 +165,7 @@ def eod_prices_any(symbol_or_isin: str,
 def load_price_series_any(symbol_or_isin: str, from_dt: Optional[pd.Timestamp], euro_rate: float):
     return eod_prices_any(symbol_or_isin, from_dt, euro_rate)
 
-# ---------- VL synthétique automatique ----------
-if "SYNTH_PARAMS" not in st.session_state:
-    st.session_state["SYNTH_PARAMS"] = {}  # keyU -> {"base_date": ts, "vol": float, "p1":float, "p3":opt, "p5":opt, "p10":opt}
-
+# ---------- VL synthétique ----------
 def _simulate_nav_series(start_dt: pd.Timestamp, end_dt: pd.Timestamp,
                          annual_perf_pct: float, vol_pct: float) -> pd.DataFrame:
     dates = pd.bdate_range(start=start_dt, end=end_dt)
@@ -183,13 +189,17 @@ def _select_annual_rate(h_years: float,
     return float(sorted(order, key=lambda x: x[1])[0][0])
 
 def set_synth_params(key: str, base_date: pd.Timestamp, vol_pct: float,
-                     p1: float, p3: Optional[float], p5: Optional[float], p10: Optional[float]) -> None:
+                     p1: float, p3: Optional[float], p5: Optional[float], p10: Optional[float],
+                     buy_px: Optional[float], last_px: Optional[float]) -> None:
     st.session_state["SYNTH_PARAMS"][key.upper()] = {
-        "base_date": pd.Timestamp(base_date), "vol": float(vol_pct),
+        "base_date": pd.Timestamp(base_date),
+        "vol": float(vol_pct),
         "p1": float(p1),
         "p3": (None if p3 is None else float(p3)),
         "p5": (None if p5 is None else float(p5)),
         "p10": (None if p10 is None else float(p10)),
+        "buy_px": (None if buy_px in (None, "", 0) else float(buy_px)),
+        "last_px": (None if last_px in (None, "", 0) else float(last_px)),
     }
 
 def get_synth_series(key: str, from_dt: Optional[pd.Timestamp]) -> pd.DataFrame:
@@ -197,31 +207,93 @@ def get_synth_series(key: str, from_dt: Optional[pd.Timestamp]) -> pd.DataFrame:
     params = st.session_state["SYNTH_PARAMS"].get(keyU)
     if not params:
         return pd.DataFrame()
-    start = params["base_date"]
-    if from_dt is not None:
-        start = max(start, pd.Timestamp(from_dt))
+
+    start0 = params["base_date"]
+    start = max(start0, pd.Timestamp(from_dt)) if from_dt is not None else start0
+
     horizon_years = max(1e-9, (TODAY - start).days / 365.25)
     rate = _select_annual_rate(horizon_years, params["p1"], params["p3"], params["p5"], params["p10"])
-    return _simulate_nav_series(start, TODAY, annual_perf_pct=rate, vol_pct=params["vol"])
 
+    df = _simulate_nav_series(start, TODAY, annual_perf_pct=rate, vol_pct=params["vol"])
+    if df.empty:
+        return df
+
+    first = float(df["Close"].iloc[0])
+    last = float(df["Close"].iloc[-1])
+    scaled = df["Close"].copy()
+
+    if params.get("buy_px") not in (None, 0):
+        scaled *= (params["buy_px"] / first)
+    elif params.get("last_px") not in (None, 0):
+        scaled *= (params["last_px"] / last)
+
+    out = df.copy()
+    out["Close"] = scaled
+    return out
+
+# ---------- NAV manuelle (Excel/CSV) ----------
+def set_custom_nav(key: str, df: pd.DataFrame) -> None:
+    """
+    df attendu: colonnes ['date','close'] ou ['Date','Close'] ; index datetime; trié.
+    """
+    if "date" in df.columns and "close" in df.columns:
+        d = df.copy()
+    elif "Date" in df.columns and "Close" in df.columns:
+        d = df.rename(columns={"Date": "date", "Close": "close"}).copy()
+    else:
+        raise ValueError("Colonnes attendues: Date/Close ou date/close")
+    d["date"] = pd.to_datetime(d["date"], errors="coerce")
+    d = d.dropna(subset=["date"])
+    d = d.sort_values("date").set_index("date")
+    d["close"] = pd.to_numeric(d["close"], errors="coerce")
+    d = d.dropna(subset=["close"])
+    d = d.rename(columns={"close": "Close"})[["Close"]]
+    if d.empty:
+        raise ValueError("Série vide après nettoyage.")
+    st.session_state["CUSTOM_NAVS"][key.upper()] = d
+
+def get_custom_nav_series(key: str, from_dt: Optional[pd.Timestamp]) -> pd.DataFrame:
+    d = st.session_state["CUSTOM_NAVS"].get(key.upper())
+    if d is None or d.empty:
+        return pd.DataFrame()
+    if from_dt is not None:
+        d2 = d.loc[d.index >= pd.Timestamp(from_dt)]
+        return d2.copy()
+    return d.copy()
+
+# ---------- get_price_series (ordre: custom > EODHD > synth) ----------
 def get_price_series(symbol_or_isin: str, from_dt: Optional[pd.Timestamp], euro_rate: float) -> Tuple[pd.DataFrame, str, str]:
-    df, sym, note = load_price_series_any(symbol_or_isin, from_dt, euro_rate)
+    key = (symbol_or_isin or "").strip()
+    if not key:
+        return pd.DataFrame(), "", "⚠️ identifiant vide."
+
+    # 1) VL manuelle prioritaire
+    dfc = get_custom_nav_series(key, from_dt)
+    if not dfc.empty:
+        return dfc, f"{key.upper()}.CUSTOM", "VL manuelle (fichier) utilisée."
+    base = key.upper().split(".")[0]
+    if base != key.upper():
+        dfc2 = get_custom_nav_series(base, from_dt)
+        if not dfc2.empty:
+            return dfc2, f"{base}.CUSTOM", "VL manuelle (fichier) utilisée."
+
+    # 2) EODHD
+    df, sym, note = load_price_series_any(key, from_dt, euro_rate)
     if not df.empty:
         return df, sym, note
-    # VL synthétique si paramétrée
-    sdf = get_synth_series(symbol_or_isin, from_dt)
+
+    # 3) Synthétique
+    sdf = get_synth_series(key, from_dt)
     if not sdf.empty:
-        return sdf.copy(), f"{(symbol_or_isin or '').strip().upper()}.SYNTH", "VL synthétique utilisée."
-    # Essai via base ISIN si on avait fourni 'FR..EUFUND'
-    base = (symbol_or_isin or "").strip().upper()
+        return sdf, f"{key.upper()}.SYNTH", "VL synthétique utilisée."
     if "." in base:
-        base = base.split(".")[0]
-    sdf2 = get_synth_series(base, from_dt)
-    if not sdf2.empty:
-        return sdf2.copy(), f"{base}.SYNTH", "VL synthétique utilisée."
+        sdf2 = get_synth_series(base, from_dt)
+        if not sdf2.empty:
+            return sdf2, f"{base}.SYNTH", "VL synthétique utilisée."
+
     return pd.DataFrame(), sym, note
 
-# ---------- Univers (exemples courants) ----------
+# ---------- Univers (exemples) ----------
 UNIVERSE_GENERALI = [
     {"name":"Fonds en euros (simulé)","isin":"EUROFUND","type":"Fonds en euros"},
     {"name":"R-co Valor C EUR","isin":"FR0011253624","type":"Actions Monde"},
@@ -235,12 +307,12 @@ UNIVERSE_GENERALI = [
 ]
 UNI_OPTIONS = ["— Saisie libre —"] + [f"{r['name']} — {r['isin']}" for r in UNIVERSE_GENERALI]
 
-# ---------- Etat ----------
-for key in ["A_lines", "B_lines"]:
-    if key not in st.session_state:
-        st.session_state[key] = []
+# ---------- État lignes ----------
+for key_ in ["A_lines", "B_lines"]:
+    if key_ not in st.session_state:
+        st.session_state[key_] = []
 
-# ---------- Helpers ----------
+# ---------- Helpers divers ----------
 def _auto_name_from_isin(isin: str) -> str:
     if not isin:
         return ""
@@ -421,7 +493,7 @@ def parse_pasted_table(text: str) -> pd.DataFrame:
             df[col] = df[col].str.replace(" ", "").str.replace("€", "").str.replace(",", ".")
     return df
 
-# ---------- UI : VL synthétique (barre latérale) ----------
+# ---------- Sidebar : VL synthétique ----------
 with st.sidebar:
     st.header("🧮 VL synthétique (si VL absente)")
     synth_key = st.text_input("ISIN ou Nom (clé)")
@@ -429,30 +501,45 @@ with st.sidebar:
     with c1:
         base_date = st.date_input("Date de départ", value=date(2018, 1, 1))
         vol_pct = st.number_input("Volatilité annuelle (%)", min_value=0.0, max_value=50.0, value=10.0, step=0.5)
+        buy_px_opt = st.text_input("Prix d’achat (optionnel)", value="")
     with c2:
         perf_1y = st.number_input("Perf 1 an (%)", value=3.0, step=0.1)  # obligatoire
         perf_3y = st.number_input("Perf 3 ans (%) (opt.)", value=0.0, step=0.1)
         perf_5y = st.number_input("Perf 5 ans (%) (opt.)", value=0.0, step=0.1)
         perf_10y = st.number_input("Perf 10 ans (%) (opt.)", value=0.0, step=0.1)
+        last_px_opt = st.text_input("Dernier prix (optionnel)", value="")
+
+    def _as_float_or_none(x: str) -> Optional[float]:
+        x = (x or "").strip().replace(",", ".").replace(" ", "")
+        if not x:
+            return None
+        try:
+            v = float(x)
+            return v if v > 0 else None
+        except:
+            return None
+
     p3 = None if perf_3y == 0.0 else perf_3y
     p5 = None if perf_5y == 0.0 else perf_5y
     p10 = None if perf_10y == 0.0 else perf_10y
+    buy_px_val = _as_float_or_none(buy_px_opt)
+    last_px_val = _as_float_or_none(last_px_opt)
 
     if st.button("✅ Enregistrer la VL synthétique"):
-        key = (synth_key or "").strip()
-        if not key:
+        key_in = (synth_key or "").strip()
+        if not key_in:
             st.warning("Saisis une clé (ISIN ou Nom).")
         else:
             set_synth_params(
-                key=key,
+                key=key_in,
                 base_date=pd.Timestamp(base_date),
                 vol_pct=vol_pct,
-                p1=perf_1y,
-                p3=p3, p5=p5, p10=p10
+                p1=perf_1y, p3=p3, p5=p5, p10=p10,
+                buy_px=buy_px_val, last_px=last_px_val
             )
-            st.success(f"Paramètres enregistrés pour « {key.upper()} ». La courbe s’adaptera automatiquement à la date d’achat.")
+            st.success(f"Paramètres enregistrés pour « {key_in.upper()} ».")
 
-# ---------- UI : Paramètre Fonds en euros ----------
+# ---------- Sidebar : Fonds en euros ----------
 with st.sidebar:
     st.header("💶 Fonds en euros — Paramètre global")
     EURO_RATE = st.number_input(
@@ -522,7 +609,7 @@ def _add_line_ui(port_key: str, title: str, euro_rate: float):
 
         dfp, sym_used, note = get_price_series(isin or name, pd.Timestamp(dt), euro_rate)
         if dfp.empty:
-            st.error("Impossible de récupérer des VL (EODHD ni synth). Crée une VL synthétique dans la barre latérale « VL synthétique ».") 
+            st.error("Impossible de récupérer des VL (manuelle/EODHD/synth). Charge une **VL manuelle** ou crée une **VL synthétique**.")
             st.stop()
 
         px = None
@@ -713,7 +800,7 @@ def _expander_paste_block(who_label: str, paste_key_prefix: str, lines_key: str)
                         dfp[col] = pd.to_numeric(dfp[col], errors="coerce")
                 new_lines = lines_from_dataframe(dfp, st.session_state["EURO_RATE_PREVIEW"], default_dt=default_dt_saved)
                 if not new_lines:
-                    st.warning("Aucune ligne valide à ajouter. Astuce : si un fonds n’a pas de VL, crée une **VL synthétique** dans la barre latérale puis recommence.")
+                    st.warning("Aucune ligne valide à ajouter. Astuce : si un fonds n’a pas de VL, charge une **VL manuelle** ou crée une **VL synthétique**.")
                 else:
                     st.session_state[lines_key].extend(new_lines)
                     st.success(f"{len(new_lines)} ligne(s) ajoutée(s).")
@@ -747,10 +834,10 @@ with tabA:
                     df_raw = pd.read_csv(up)
                 else:
                     try:
-                        import openpyxl  # noqa
+                        import openpyxl  # noqa: F401
                         df_raw = pd.read_excel(up)
                     except Exception:
-                        st.error("Lecture Excel indisponible (openpyxl manquant). Utilise plutôt un **CSV** ou **Coller un tableau**.")
+                        st.error("Lecture Excel indisponible (openpyxl manquant). Utilise plutôt un **CSV**.")
                         df_raw = None
                 if df_raw is not None:
                     df_std = _standardize_df(df_raw)
@@ -758,7 +845,7 @@ with tabA:
                     if st.button("Importer ces lignes", type="primary", key="btn_import_A"):
                         new_lines = lines_from_dataframe(df_std, st.session_state["EURO_RATE_PREVIEW"], default_dt=pd.Timestamp(default_dt_file_A))
                         if not new_lines:
-                            st.warning("Aucune ligne valide détectée. Astuce : crée d’abord des **VL synthétiques** pour les fonds non couverts.")
+                            st.warning("Aucune ligne valide détectée. Astuce : charge une **VL manuelle** ou crée une **VL synthétique** puis recommence.")
                         else:
                             if replace_mode.startswith("Remplacer"):
                                 st.session_state["A_lines"] = new_lines
@@ -777,6 +864,33 @@ with tabB:
     _expander_paste_block("Vous", "B", "B_lines")
     for i, ln in enumerate(st.session_state["B_lines"]):
         _line_card(ln, i, "B_lines")
+
+# ---------- Importer une VL manuelle (fichier unique) ----------
+with st.expander("📤 Importer une VL manuelle (Excel/CSV) pour un fonds"):
+    key_up = st.text_input("ISIN ou Nom (clé) — pour associer la série importée")
+    up_nav = st.file_uploader("Fichier (.xlsx / .csv) avec colonnes Date, Close", type=["xlsx", "xls", "csv"])
+    sheet = st.text_input("Nom de feuille (Excel, optionnel)", value="")
+    if st.button("Importer cette VL"):
+        if not key_up.strip():
+            st.warning("Renseigne la clé (ISIN ou Nom).")
+        elif up_nav is None:
+            st.warning("Choisis un fichier.")
+        else:
+            try:
+                if up_nav.name.lower().endswith(".csv"):
+                    df_raw = pd.read_csv(up_nav)
+                else:
+                    try:
+                        import openpyxl  # noqa: F401
+                        df_raw = pd.read_excel(up_nav, sheet_name=(sheet or None))
+                    except Exception:
+                        st.error("Lecture Excel indisponible (openpyxl manquant). Utilise un CSV.")
+                        df_raw = None
+                if df_raw is not None:
+                    set_custom_nav(key_up, df_raw)
+                    st.success(f"VL importée pour « {key_up.upper()} ». Elle sera utilisée **en priorité**.")
+            except Exception as e:
+                st.error(f"Échec import VL: {e}\nAttendu: colonnes Date, Close (ou date, close).")
 
 # ---------- Pondérations & Simulation ----------
 def _weights_for(lines: List[Dict[str, Any]], mode: str, custom: Dict[int, float], single_id: Optional[int]) -> Dict[int, float]:
@@ -887,7 +1001,7 @@ def simulate_portfolio(lines: List[Dict[str, Any]],
                 px = float(s.loc[d])
             else:
                 before = s.loc[s.index <= d]
-                if before.empty: 
+                if before.empty:
                     continue
                 px = float(before.iloc[-1])
             v += qty_curr[sid] * px
@@ -988,9 +1102,9 @@ if run:
             return
         rows = []
         for ln in lines:
-            df, _, _ = get_price_series(ln.get("isin") or ln.get("name"),
-                                        None, st.session_state.get("EURO_RATE_PREVIEW", 2.0))
-            last = float(df["Close"].iloc[-1]) if not df.empty else np.nan
+            df_, _, _ = get_price_series(ln.get("isin") or ln.get("name"),
+                                         None, st.session_state.get("EURO_RATE_PREVIEW", 2.0))
+            last = float(df_["Close"].iloc[-1]) if not df_.empty else np.nan
             rows.append({
                 "Nom": ln.get("name", "—"),
                 "ISIN": ln.get("isin", "—"),
@@ -1016,10 +1130,10 @@ if run:
     with d1: _detail_table(st.session_state["A_lines"], "Portefeuille 1 — Client (positions)")
     with d2: _detail_table(st.session_state["B_lines"], "Portefeuille 2 — Vous (positions)")
 else:
-    st.info("Ajoute des lignes (formulaire ou **Coller un tableau**), règle les versements dans la barre latérale, puis clique **Lancer la comparaison**.")
+    st.info("Ajoute des lignes (formulaire ou **Coller un tableau**), règle les versements, puis clique **Lancer la comparaison**.")
 
 # ---------- Debug ----------
-with st.expander("🔧 Debug EODHD / Synth (optionnel)"):
+with st.expander("🔧 Debug EODHD / Nav manuelle / Synth (optionnel)"):
     test_q = st.text_input("Tester une recherche (ISIN, nom ou EUROFUND)")
     if test_q:
         st.write("Résultat /search :", eod_search(test_q))
@@ -1027,4 +1141,4 @@ with st.expander("🔧 Debug EODHD / Synth (optionnel)"):
         st.write("Symbole testé :", sym_dbg)
         if note_dbg: st.caption(note_dbg)
         if not df_dbg.empty: st.dataframe(df_dbg.tail(5))
-        else: st.warning("Aucune VL trouvée (ni synth).")
+        else: st.warning("Aucune VL trouvée (ni manuelle, ni EODHD, ni synth).")

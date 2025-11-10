@@ -135,7 +135,7 @@ def _eurofund_series(euro_rate: float,
 @st.cache_data(ttl=3*3600, show_spinner=False)
 def eod_prices_any(symbol_or_isin: str,
                    start_dt: Optional[pd.Timestamp],
-                   euro_rate: float) -> Tuple(pd.DataFrame, str, str):
+                   euro_rate: float) -> Tuple[pd.DataFrame, str, str]:
     q = (symbol_or_isin or "").strip()
     if not q:
         return pd.DataFrame(), q, "⚠️ identifiant vide."

@@ -495,7 +495,14 @@ def _line_card(line: Dict[str, Any], idx: int, port_key: str):
     if state_key not in st.session_state:
         st.session_state[state_key] = False
 
+    # Frais dynamiques selon le portefeuille (A = client, B = vous)
     fee_pct = FEE_A if port_key == "A_lines" else FEE_B
+
+    # Montant brut & net (RECALCULÉ dynamiquement)
+    amt_brut = float(line.get("amount_gross", 0.0))
+    buy_px   = float(line.get("buy_px", 0.0)) or np.nan
+    net_amt  = amt_brut * (1.0 - fee_pct / 100.0)
+    qty_disp = (net_amt / buy_px) if (buy_px and buy_px > 0) else np.nan
 
     with st.container(border=True):
         header = st.columns([3, 2, 2, 2, 1])
@@ -504,12 +511,12 @@ def _line_card(line: Dict[str, Any], idx: int, port_key: str):
             st.caption(f"ISIN : `{line.get('isin','—')}` • Symbole : ")
             st.code(line.get('sym_used','—'))
         with header[1]:
-            st.markdown(f"Investi (brut)\n\n**{to_eur(line.get('amount_gross',0.0))}**")
-            st.caption(f"Net après frais {fee_pct:.1f}% : **{to_eur(line.get('amount_net',0.0))}**")
+            st.markdown(f"Investi (brut)\n\n**{to_eur(amt_brut)}**")
+            st.caption(f"Net après frais {fee_pct:.1f}% : **{to_eur(net_amt)}**")
             st.caption(f"le {fmt_date(line.get('buy_date'))}")
         with header[2]:
-            st.markdown(f"Prix achat\n\n**{to_eur(line.get('buy_px'))}**")
-            st.caption(f"Quantité : {line.get('qty_calc'):.6f}")
+            st.markdown(f"Prix achat\n\n**{to_eur(buy_px)}**")
+            st.caption(f"Quantité (calc) : {qty_disp:.6f}" if not np.isnan(qty_disp) else "Quantité (calc) : —")
             if line.get("note"):
                 st.caption(line["note"])
         with header[3]:
@@ -569,14 +576,10 @@ def _line_card(line: Dict[str, Any], idx: int, port_key: str):
                         st.error("Prix d’achat non déterminable.")
                         st.stop()
 
-                    net_amt = amt_gross * (1.0 - fee_pct/100.0)
-                    qty = float(net_amt) / float(px)
-
+                    # On n’enregistre plus de 'amount_net' ni de 'qty_calc' figés
                     line["amount_gross"] = float(amt_gross)
-                    line["amount_net"] = float(net_amt)
                     line["buy_date"] = buy_ts
                     line["buy_px"] = float(px)
-                    line["qty_calc"] = float(qty)
 
                     st.session_state[state_key] = False
                     st.success("Ligne mise à jour.")
@@ -759,35 +762,31 @@ def xirr(cash_flows: List[Tuple[pd.Timestamp, float]]) -> Optional[float]:
             lo = mid
     return None
 
-def simulate_portfolio(lines: List[Dict[str, Any]],
-                       monthly_amt_gross: float,
-                       one_amt_gross: float, one_date: date,
-                       alloc_mode: str,
-                       custom_weights: Dict[int, float],
-                       single_target: Optional[int],
-                       euro_rate: float,
-                       fee_pct: float) -> Tuple[pd.DataFrame, float, float, float, Optional[float], pd.Timestamp, pd.Timestamp]:
-    """
-    Retourne: (df_valeur, total_investi_brut, total_investi_net, valeur_finale, xirr%, start_min, start_full)
-    """
+def simulate_portfolio(
+    lines: List[Dict[str, Any]],
+    monthly_amt_gross: float,
+    one_amt_gross: float, one_date: date,
+    alloc_mode: str,
+    custom_weights: Dict[int, float],
+    single_target: Optional[int],
+    euro_rate: float,
+    fee_pct: float
+) -> Tuple[pd.DataFrame, float, float, float, Optional[float], pd.Timestamp, pd.Timestamp]:
     if not lines:
         return pd.DataFrame(), 0.0, 0.0, 0.0, None, TODAY, TODAY
 
-    series: Dict[int, pd.Series] = {}
-    for ln in lines:
-        df, _, _ = get_price_series(ln.get("isin") or ln.get("name"), None, euro_rate)
-        if not df.empty:
-            series[id(ln)] = df["Close"]
-    if not series:
-        return pd.DataFrame(), 0.0, 0.0, 0.0, None, TODAY, TODAY
-
+    # 1) Prix pour chaque ligne
+    price_map: Dict[int, pd.Series] = {}
     eff_buy_date: Dict[int, pd.Timestamp] = {}
-    qty_init: Dict[int, float] = {}
+    buy_price_used: Dict[int, float] = {}
+
     for ln in lines:
-        sid = id(ln)
-        s = series.get(sid)
-        if s is None or s.empty:
+        key_id = id(ln)
+        series_df, _, _ = get_price_series(ln.get("isin") or ln.get("name"), None, euro_rate)
+        s = series_df["Close"] if not series_df.empty else pd.Series(dtype=float)
+        if s.empty:
             continue
+
         d_buy = pd.Timestamp(ln["buy_date"])
         if d_buy in s.index:
             px_buy = float(s.loc[d_buy]); eff_dt = d_buy
@@ -797,97 +796,112 @@ def simulate_portfolio(lines: List[Dict[str, Any]],
                 px_buy = float(s.iloc[-1]); eff_dt = s.index[-1]
             else:
                 px_buy = float(after.iloc[0]); eff_dt = after.index[0]
+
         px_manual = ln.get("buy_px", None)
         px_for_qty = float(px_manual) if (px_manual and px_manual > 0) else px_buy
-        # qty déjà calculée lors de l’ajout (sur amount_net). On recalcule par sécurité.
-        net_amt = float(ln.get("amount_net", ln.get("amount_gross", 0.0) * (1.0 - fee_pct/100.0)))
-        qty_init[sid] = float(net_amt) / float(px_for_qty)
-        eff_buy_date[sid] = eff_dt
+
+        price_map[key_id] = s.astype(float)
+        eff_buy_date[key_id] = eff_dt
+        buy_price_used[key_id] = px_for_qty
+
+    if not price_map:
+        return pd.DataFrame(), 0.0, 0.0, 0.0, None, TODAY, TODAY
 
     start_min = min(eff_buy_date.values())
     start_full = max(eff_buy_date.values())
 
-    idx = pd.Index(sorted(set().union(*[s.index for s in series.values()])))
-    idx = idx[(idx >= start_min) & (idx <= TODAY)]
-    if len(idx) == 0:
-        return pd.DataFrame(), 0.0, 0.0, 0.0, None, start_min, start_full
+    # 2) Calendrier business-day + ffill
+    bidx = pd.bdate_range(start=start_min, end=TODAY, freq="B")
+    prices = pd.DataFrame(index=bidx)
+    for key_id, s in price_map.items():
+        prices[key_id] = s.reindex(bidx).ffill()
 
-    qty_curr: Dict[int, float] = {id(ln): 0.0 for ln in lines}
-    weights = _weights_for(lines, alloc_mode, custom_weights, single_target)
-
-    cash_flows: List[Tuple[pd.Timestamp, float]] = []
+    # 3) Événements d’achats (quantités) – TOUT recalculé avec frais ACTUELS
+    qty_events = pd.DataFrame(0.0, index=bidx, columns=prices.columns)
     total_brut = 0.0
     total_net = 0.0
+    cash_flows: List[Tuple[pd.Timestamp, float]] = []
 
-    # apports initiaux
     for ln in lines:
-        sid = id(ln)
-        if sid in eff_buy_date:
-            brut = float(ln.get("amount_gross", 0.0))
-            net = float(ln.get("amount_net", 0.0))
+        key_id = id(ln)
+        if key_id not in prices.columns:
+            continue
+        brut = float(ln.get("amount_gross", 0.0))
+        net  = brut * (1.0 - fee_pct/100.0)          # << frais dynamiques
+        px   = float(buy_price_used[key_id])
+        dt   = eff_buy_date[key_id]
+
+        if brut > 0 and px > 0:
+            q = net / px
+            if dt in qty_events.index:
+                qty_events.loc[dt, key_id] += q
+            else:
+                after = qty_events.index[qty_events.index >= dt]
+                if len(after) > 0:
+                    qty_events.loc[after[0], key_id] += q
             total_brut += brut
-            total_net += net
-            cash_flows.append((eff_buy_date[sid], -brut))
+            total_net  += net
+            cash_flows.append((dt, -brut))
 
-    # plannings
-    sched = _month_schedule(start_min, TODAY) if monthly_amt_gross > 0 else []
-    one_dt = pd.Timestamp(one_date) if one_amt_gross > 0 else None
+    # 4) Poids pour les versements
+    weights = _weights_for(lines, alloc_mode, custom_weights, single_target)
 
-    values = []
-    for d in idx:
-        # init
-        for ln in lines:
-            sid = id(ln)
-            if sid in eff_buy_date and d == eff_buy_date[sid]:
-                qty_curr[sid] += qty_init[sid]
+    # 5) Versement ponctuel
+    if one_amt_gross > 0:
+        dt = pd.Timestamp(one_date)
+        if dt in qty_events.index:
+            alloc_dt = dt
+        else:
+            after = qty_events.index[qty_events.index >= dt]
+            alloc_dt = after[0] if len(after) > 0 else None
 
-        # one-off brut -> net après frais -> acheter
-        if one_dt is not None and d == one_dt and one_amt_gross > 0:
+        if alloc_dt is not None:
             net_amt = one_amt_gross * (1.0 - fee_pct/100.0)
             for ln in lines:
-                sid = id(ln); s = series.get(sid)
-                if s is None or s.empty: continue
-                w = weights.get(sid, 0.0)
-                if w <= 0: continue
-                px = float(s.loc[d]) if d in s.index else float(s.loc[s.index >= d].iloc[0])
-                qty_curr[sid] += (net_amt * w) / px
-            cash_flows.append((d, -float(one_amt_gross)))
-            total_brut += float(one_amt_gross)
-            total_net += float(net_amt)
-
-        # mensualités
-        if d in sched and monthly_amt_gross > 0:
-            net_amt_m = monthly_amt_gross * (1.0 - fee_pct/100.0)
-            for ln in lines:
-                sid = id(ln); s = series.get(sid)
-                if s is None or s.empty: continue
-                w = weights.get(sid, 0.0)
-                if w <= 0: continue
-                px = float(s.loc[d]) if d in s.index else float(s.loc[s.index >= d].iloc[0])
-                qty_curr[sid] += (net_amt_m * w) / px
-            cash_flows.append((d, -float(monthly_amt_gross)))
-            total_brut += float(monthly_amt_gross)
-            total_net += float(net_amt_m)
-
-        # valorisation
-        v = 0.0
-        for ln in lines:
-            sid = id(ln); s = series.get(sid)
-            if d in s.index:
-                px = float(s.loc[d])
-            else:
-                before = s.loc[s.index <= d]
-                if before.empty:
+                key_id = id(ln)
+                w = weights.get(key_id, 0.0)
+                if w <= 0 or key_id not in prices.columns:
                     continue
-                px = float(before.iloc[-1])
-            v += qty_curr[sid] * px
-        values.append((d, v))
+                px = float(prices.loc[alloc_dt, key_id])
+                if px > 0:
+                    qty_events.loc[alloc_dt, key_id] += (net_amt * w) / px
+            total_brut += float(one_amt_gross)
+            total_net  += float(net_amt)
+            cash_flows.append((alloc_dt, -float(one_amt_gross)))
 
-    df_val = pd.DataFrame(values, columns=["date", "Valeur"]).set_index("date")
+    # 6) Mensualités
+    if monthly_amt_gross > 0:
+        sched = _month_schedule(start_min, TODAY)
+        for dt in sched:
+            if dt not in qty_events.index:
+                after = qty_events.index[qty_events.index >= dt]
+                if len(after) == 0:
+                    continue
+                dt = after[0]
+            net_m = monthly_amt_gross * (1.0 - fee_pct/100.0)
+            for ln in lines:
+                key_id = id(ln)
+                w = weights.get(key_id, 0.0)
+                if w <= 0 or key_id not in prices.columns:
+                    continue
+                px = float(prices.loc[dt, key_id])
+                if px > 0:
+                    qty_events.loc[dt, key_id] += (net_m * w) / px
+            total_brut += float(monthly_amt_gross)
+            total_net  += float(net_m)
+            cash_flows.append((dt, -float(monthly_amt_gross)))
+
+    # 7) Quantités cumulées et valorisation
+    qty_cum = qty_events.cumsum()
+    values = (qty_cum * prices).sum(axis=1)
+    df_val = pd.DataFrame({"Valeur": values})
+
     final_val = float(df_val["Valeur"].iloc[-1]) if not df_val.empty else 0.0
     cash_flows.append((TODAY, final_val))
     irr = xirr(cash_flows)
+
     return df_val, total_brut, total_net, final_val, (irr * 100.0 if irr is not None else None), start_min, start_full
+
 
 # -------- 19) Run & affichage --------
 rebase_100 = st.checkbox("Normaliser les courbes à 100 au départ", value=False)

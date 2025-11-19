@@ -1,533 +1,440 @@
-# =========================================
-# app.py — Comparateur Portefeuilles CGP (simplifié)
-# - Ordre des sources VL: EODHD -> VL synthétique (base_date + VL départ + VL actuelle)
-# - Fonds en euros simulé (taux paramétrable, intérêts le 31/12)
-# - Frais d’entrée (%) côté barre latérale (appliqués à tous les apports)
-# - Saisie individuelle, "Coller un tableau", édition/suppression
-# - Versements mensuels & ponctuels (modes d’affectation)
-# - Courbes (option base 100), XIRR et delta de gains
-# =========================================
+# app.py
+# ------------------------------------------------------------
+# Comparateur de deux portefeuilles (Client vs Vous)
+# - Ajout/modif de lignes (ISIN, montant brut, date, px achat optionnel)
+# - Coller un tableau (Nom;ISIN;Montant)
+# - Fonds en euros avec taux paramétrable (symbole: EUROFUND)
+# - Frais d'entrée propres à chaque portefeuille
+# - Versements (mensuels + ponctuel, allocation configurable)
+# - Moteur de valorisation vectorisé (prix x quantités)
+# - Rendu graphique + XIRR + synthèse & "Et si c'était avec nous ?"
+# - Récupération VL via EODHD (recherche robuste)
+# ------------------------------------------------------------
 
-# -------- 1) Imports & Config --------
-import os, re, math, requests, calendar
-from datetime import date
-from typing import Optional, List, Dict, Any, Tuple
+from __future__ import annotations
+
+import os
+import math
+import json
+from datetime import date, datetime
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
+import requests
 import streamlit as st
-import plotly.express as px
+import altair as alt
 
-st.set_page_config(page_title="Comparateur Portefeuilles CGP", page_icon="🦉", layout="wide")
+# ----------------------- Constantes -------------------------
 TODAY = pd.Timestamp.today().normalize()
+APP_TITLE = "Comparateur de portefeuilles"
 
-# -------- 2) Session state init --------
-if "SYNTH_PARAMS" not in st.session_state:
-    # keyU -> {"base_date": ts, "start_px": float, "last_px": float}
-    st.session_state["SYNTH_PARAMS"] = {}
-
-for key_ in ["A_lines", "B_lines"]:
-    if key_ not in st.session_state:
-        st.session_state[key_] = []
-
-# -------- 3) Utils --------
-def Secret_Token(name: str) -> str:
-    v = os.getenv(name) or str(st.secrets.get(name, "")).strip()  # type: ignore[attr-defined]
-    if not v:
-        raise RuntimeError(f"Secret manquant: {name}")
-    return v
-
-def to_eur(x: float) -> str:
+# ----------------------- Utils format -----------------------
+def to_eur(x: Any) -> str:
     try:
-        if x is None or (isinstance(x, float) and (math.isnan(x) or math.isinf(x))):
-            return ""
-        s = f"{float(x):,.2f}".replace(",", "X").replace(".", ",").replace("X", " ")
-        return f"{s} €"
+        v = float(x)
     except Exception:
-        return ""
+        return "—"
+    # format fr: espace groupe + virgule
+    s = f"{v:,.2f}".replace(",", "X").replace(".", ",").replace("X", " ")
+    return s + " €"
 
-def fmt_date(d: pd.Timestamp | date | None) -> str:
-    if d is None: return ""
-    if isinstance(d, date) and not isinstance(d, pd.Timestamp):
-        d = pd.Timestamp(d)
-    return d.strftime("%d/%m/%Y")
+def fmt_date(x: Any) -> str:
+    try:
+        return pd.Timestamp(x).strftime("%d/%m/%Y")
+    except Exception:
+        return "—"
 
-def _looks_like_isin(s: str) -> bool:
-    return bool(re.fullmatch(r"[A-Z]{2}[A-Z0-9]{9}[0-9]", (s or "").strip().upper()))
+# ----------------------- XIRR -------------------------------
+def _npv(rate: float, cfs: List[Tuple[pd.Timestamp, float]]) -> float:
+    t0 = cfs[0][0]
+    return sum(cf / ((1 + rate) ** ((t - t0).days / 365.25)) for t, cf in cfs)
 
-# -------- 4) EODHD client + resolution --------
-EODHD_BASE = "https://eodhd.com/api"
+def xirr(cash_flows: List[Tuple[pd.Timestamp, float]], guess: float = 0.1) -> Optional[float]:
+    if not cash_flows:
+        return None
+    cfs = sorted(cash_flows, key=lambda x: x[0])
+    # Brent simple / Newton hybrid
+    try:
+        r = guess
+        for _ in range(100):
+            f = _npv(r, cfs)
+            # dérivée numérique
+            h = 1e-6
+            f1 = _npv(r + h, cfs)
+            d = (f1 - f) / h
+            if abs(d) < 1e-12:
+                break
+            r2 = r - f / d
+            if abs(r2 - r) < 1e-9:
+                r = r2
+                break
+            r = r2
+        return r
+    except Exception:
+        return None
 
-def eodhd_get(path: str, params: Optional[Dict[str, Any]] = None) -> Any:
-    url = f"{EODHD_BASE.rstrip('/')}{path}"
-    p = {"api_token": Secret_Token("EODHD_API_KEY"), "fmt": "json"}
-    if params: p.update(params)
-    r = requests.get(url, params=p, timeout=25)
+# ----------------------- EODHD API --------------------------
+def _get_api_key() -> str:
+    return st.secrets.get("EODHD_API_KEY", "")
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def eodhd_get(path: str, params: Dict[str, Any] | None = None) -> Any:
+    base = "https://eodhd.com/api"
+    token = _get_api_key()
+    p = {"api_token": token, "fmt": "json"}
+    if params:
+        p.update(params)
+    r = requests.get(f"{base}{path}", params=p, timeout=20)
     r.raise_for_status()
-    js = r.json()
-    if isinstance(js, str) and js.lower().startswith("error"):
-        raise requests.HTTPError(js)
-    return js
-
-@st.cache_data(ttl=6*3600, show_spinner=False)
-def eod_search(query: str) -> List[Dict[str, Any]]:
     try:
-        js = eodhd_get(f"/search/{query.upper()}", params={})
-        return js if isinstance(js, list) else []
+        return r.json()
     except Exception:
-        return []
+        return None
 
-def _eod_ok(sym: str) -> bool:
+@st.cache_data(show_spinner=False, ttl=3600)
+def eodhd_search(q: str) -> List[Dict[str, Any]]:
     try:
-        js = eodhd_get(f"/eod/{sym}", params={"period": "d"})
-        return isinstance(js, list) and len(js) > 0
+        js = eodhd_get(f"/search/{q}")
+        if isinstance(js, list):
+            return js
     except Exception:
-        return False
+        pass
+    return []
 
-@st.cache_data(ttl=24*3600, show_spinner=False)
-def resolve_symbol(q: str) -> Optional[str]:
-    q = (q or "").strip()
-    if not q:
-        return None
-    if _looks_like_isin(q):
-        base = q.upper()
-        for suf in [".EUFUND", ".FUND"]:
-            cand = f"{base}{suf}"
-            if _eod_ok(cand):
-                return cand
-        return None
-    res = eod_search(q)
-    if res:
-        for it in res:
-            code = str(it.get("Code", "")).strip()
-            if code and _eod_ok(code):
-                return code
-    return None
-
-# -------- 5) Fonds en euros (simulé) --------
-def _eurofund_series(euro_rate: float,
-                     start: pd.Timestamp = pd.Timestamp("1990-01-01"),
-                     end: pd.Timestamp = TODAY) -> pd.Series:
-    idx = pd.date_range(start=start, end=end, freq="D")
-    vals = [1.0]
-    for i in range(1, len(idx)):
-        d = idx[i]
-        v = vals[-1]
-        if d.month == 12 and d.day == 31:
-            v *= (1.0 + euro_rate/100.0)
-        vals.append(v)
-    return pd.Series(vals, index=idx, name="Close")
-
-# -------- 6) EODHD price series (fund/etf/dol) --------
-@st.cache_data(ttl=3*3600, show_spinner=False)
-def eod_prices_any(symbol_or_isin: str,
-                   start_dt: Optional[pd.Timestamp],
-                   euro_rate: float) -> Tuple[pd.DataFrame, str, str]:
-    q = (symbol_or_isin or "").strip()
-    if not q:
-        return pd.DataFrame(), q, "⚠️ identifiant vide."
-
-    # Fonds en euros simulé
-    if q.upper() in {"EUROFUND", "FONDS EN EUROS", "FONDS EN EUROS (SIMULÉ)"}:
-        ser = _eurofund_series(euro_rate=euro_rate, start=pd.Timestamp("1990-01-01"), end=TODAY)
-        if start_dt is not None:
-            ser = ser.loc[ser.index >= start_dt]
-        if not ser.empty:
-            ser = ser / ser.iloc[0]
-        return ser.to_frame(), "EUROFUND", f"Fonds en euros simulé — intérêts le 31/12 au taux {euro_rate:.2f}%/an (rebasé à 1 au départ)."
-
-    qU = q.upper()
-    note = ""
-
-    def _fetch(sym: str, from_dt: Optional[str]) -> pd.DataFrame:
-        try:
-            params = {"period": "d"}
-            if from_dt:
-                params["from"] = from_dt
-            js = eodhd_get(f"/eod/{sym}", params=params)
-            df = pd.DataFrame(js)
-            if df.empty:
-                return pd.DataFrame()
-            df["date"] = pd.to_datetime(df["date"])
-            df = df.set_index("date").sort_index()
-            df["close"] = pd.to_numeric(df["close"], errors="coerce")
-            return df[["close"]].rename(columns={"close": "Close"})
-        except Exception:
+@st.cache_data(show_spinner=False, ttl=3600)
+def eodhd_prices_daily(symbol: str) -> pd.DataFrame:
+    """Télécharge les cours journaliers d'un symbole EODHD."""
+    try:
+        js = eodhd_get(f"/eod/{symbol}", params={"period": "d"})
+        if not isinstance(js, list) or len(js) == 0:
             return pd.DataFrame()
-
-    sym = resolve_symbol(qU) or qU
-    df = _fetch(sym, None)
-    if not df.empty:
-        if start_dt is not None:
-            df = df.loc[df.index >= start_dt]
-        return df, sym, note
-
-    return pd.DataFrame(), qU, "⚠️ Aucune VL récupérée."
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def load_price_series_any(symbol_or_isin: str, from_dt: Optional[pd.Timestamp], euro_rate: float):
-    return eod_prices_any(symbol_or_isin, from_dt, euro_rate)
-
-# -------- 7) VL synthétique (départ + actuel -> interpolation) --------
-def set_synth_params(key: str, base_date: pd.Timestamp,
-                     start_px: float, last_px: float) -> None:
-    st.session_state["SYNTH_PARAMS"][key.upper()] = {
-        "base_date": pd.Timestamp(base_date),
-        "start_px": float(start_px),
-        "last_px": float(last_px),
-    }
-
-def get_synth_series(key: str, from_dt: Optional[pd.Timestamp]) -> pd.DataFrame:
-    keyU = (key or "").strip().upper()
-    params = st.session_state["SYNTH_PARAMS"].get(keyU)
-    if not params:
+        df = pd.DataFrame(js)
+        df["date"] = pd.to_datetime(df["date"])
+        df.set_index("date", inplace=True)
+        # Normalise la colonne Close
+        if "adjusted_close" in df.columns and pd.notnull(df["adjusted_close"]).any():
+            df["Close"] = df["adjusted_close"].astype(float)
+        elif "close" in df.columns:
+            df["Close"] = df["close"].astype(float)
+        else:
+            return pd.DataFrame()
+        return df[["Close"]].sort_index()
+    except Exception:
         return pd.DataFrame()
 
-    start0: pd.Timestamp = params["base_date"]
-    s0: float = params["start_px"]
-    sT: float = params["last_px"]
+def _symbol_candidates(isin_or_name: str) -> List[str]:
+    """
+    Stratégie robuste:
+      - EUROFUND => prix 1.0 synthétique
+      - ISIN.EUFUND / .FUND / .PA / .MI etc. via /search
+      - Fallback: essayer ISIN.EUFUND et ISIN tout court
+    """
+    val = str(isin_or_name).strip()
+    if not val:
+        return []
+    if val.upper() == "EUROFUND":
+        return ["EUROFUND"]
 
-    if s0 <= 0 or sT <= 0:
-        return pd.DataFrame()
+    # Si ISIN pur
+    candidates = [f"{val}.EUFUND", f"{val}.FUND", val]
 
-    start = max(start0, pd.Timestamp(from_dt)) if from_dt is not None else start0
-    end = TODAY
-    if end <= start:
-        return pd.DataFrame({"Close": [sT]}, index=[end])
+    # Recherche EODHD
+    try:
+        res = eodhd_search(val)
+        # priorité aux fonds
+        for it in res:
+            code = it.get("Code")
+            exch = it.get("Exchange")
+            if code and exch:
+                candidates.append(f"{code}.{exch}")
+    except Exception:
+        pass
 
-    idx = pd.bdate_range(start=start, end=end)
-    total_days = (end - start).days
-    if total_days <= 0:
-        total_days = 1
+    # unicité
+    seen = set()
+    uniq = []
+    for c in candidates:
+        if c not in seen:
+            seen.add(c)
+            uniq.append(c)
+    return uniq
 
-    # interpolation géométrique déterministe: passe par (start=s0) et (end=sT)
-    growth = (sT / s0) ** (1.0 / total_days)
-    vals = [s0]
-    for i in range(1, len(idx)):
-        vals.append(vals[-1] * growth)
-    df = pd.DataFrame({"Close": vals}, index=idx)
-    return df
-
-# -------- 8) get_price_series: EODHD -> Synth --------
-def get_price_series(symbol_or_isin: str, from_dt: Optional[pd.Timestamp], euro_rate: float) -> Tuple[pd.DataFrame, str, str]:
-    key = (symbol_or_isin or "").strip()
-    if not key:
-        return pd.DataFrame(), "", "⚠️ identifiant vide."
-
-    # 1) EODHD (ou fonds € simulé)
-    df, sym, note = load_price_series_any(key, from_dt, euro_rate)
-    if not df.empty:
-        return df, sym, note
-
-    # 2) Synthétique
-    sdf = get_synth_series(key, from_dt)
-    if not sdf.empty:
-        return sdf, f"{key.upper()}.SYNTH", "VL synthétique (départ + actuelle)."
-
-    base = key.upper().split(".")[0]
-    if base != key.upper():
-        sdf2 = get_synth_series(base, from_dt)
-        if not sdf2.empty:
-            return sdf2, f"{base}.SYNTH", "VL synthétique (départ + actuelle)."
-
-    return pd.DataFrame(), sym, note
-
-# -------- 9) Univers (exemples) --------
-UNIVERSE_GENERALI = [
-    {"name":"Fonds en euros (simulé)","isin":"EUROFUND","type":"Fonds en euros"},
-    {"name":"R-co Valor C EUR","isin":"FR0011253624","type":"Actions Monde"},
-    {"name":"Vivalor International","isin":"FR0014001LS1","type":"Actions Monde"},
-    {"name":"CARMIGNAC Investissement A EUR","isin":"FR0010148981","type":"Actions Monde"},
-    {"name":"FIDELITY Funds - World Fund","isin":"LU0069449576","type":"Actions Monde"},
-    {"name":"CLARTAN Valeurs C","isin":"LU1100076550","type":"Actions Europe"},
-    {"name":"CARMIGNAC Patrimoine","isin":"FR0010135103","type":"Diversifié patrimonial"},
-    {"name":"SYCOYIELD 2030 RC","isin":"FR001400MCQ6","type":"Obligataire échéance"},
-    {"name":"R-Co Target 2029 HY","isin":"FR001400AWH8","type":"Obligataire HY"},
-]
-UNI_OPTIONS = ["— Saisie libre —"] + [f"{r['name']} — {r['isin']}" for r in UNIVERSE_GENERALI]
-
-# -------- 10) Helpers pour UI & parsing --------
-def _auto_name_from_isin(isin: str) -> str:
-    if not isin:
-        return ""
-    if isin.upper() == "EUROFUND":
-        return "Fonds en euros (simulé)"
-    res = eod_search(isin)
-    for it in res:
-        if str(it.get("ISIN", "")).upper() == isin.upper():
-            nm = str(it.get("Name", "")).strip()
-            if nm:
-                return nm
-    return ""
-
-def _get_close_on(df: pd.DataFrame, dt: pd.Timestamp) -> Optional[float]:
+def _get_close_on(df: pd.DataFrame, d: pd.Timestamp) -> float:
+    """Prix d'achat au jour d'achat (ou 1er jour >= achat)."""
     if df.empty:
-        return None
-    if dt in df.index:
-        v = df.loc[dt, "Close"]
-        return float(v) if pd.notna(v) else None
-    after = df.loc[df.index >= dt]
+        return np.nan
+    if d in df.index:
+        return float(df.loc[d, "Close"])
+    after = df.loc[df.index >= d]
     if not after.empty:
-        return float(after["Close"].iloc[0])
-    return float(df["Close"].iloc[-1]) if not df.empty else None
+        return float(after.iloc[0]["Close"])
+    return float(df.iloc[-1]["Close"])
 
-def _month_end(d: pd.Timestamp) -> pd.Timestamp:
-    last_day = calendar.monthrange(d.year, d.month)[1]
-    return pd.Timestamp(year=d.year, month=d.month, day=last_day)
+@st.cache_data(show_spinner=False, ttl=3600)
+def get_price_series(isin_or_name: str, start: Optional[pd.Timestamp], euro_rate: float) -> Tuple[pd.DataFrame, str, str]:
+    """
+    Retourne (df Close, symbol_utilisé, debug) pour un ISIN/Nom.
+    EUROFUND => prix constant 1.0.
+    """
+    debug = {"cands": []}
+    val = str(isin_or_name).strip()
+    if not val:
+        return pd.DataFrame(), "", json.dumps(debug)
 
-def _month_schedule(start_dt: pd.Timestamp, end_dt: pd.Timestamp) -> List[pd.Timestamp]:
-    dates = []
-    cur = pd.Timestamp(year=start_dt.year, month=start_dt.month, day=start_dt.day)
-    cur = min(cur, _month_end(cur))
-    while cur <= end_dt:
-        dates.append(cur)
-        y = cur.year + (cur.month // 12)
-        m = 1 if cur.month == 12 else cur.month + 1
-        day = min(start_dt.day, calendar.monthrange(y, m)[1])
-        cur = pd.Timestamp(year=y, month=m, day=day)
-    return dates
+    if val.upper() == "EUROFUND":
+        idx = pd.bdate_range(start=pd.Timestamp("2000-01-03"), end=TODAY, freq="B")
+        df = pd.DataFrame({"Close": 1.0}, index=idx)
+        if start is not None:
+            df = df.loc[df.index >= start]
+        return df, "EUROFUND", json.dumps(debug)
 
-def _normalize_header(h: str) -> str:
-    h = h.strip().lower()
-    h = h.replace("€", "").replace("(", "").replace(")", "")
-    h = h.replace("  ", " ")
-    mapping = {
-        "nom": "name", "nom du fonds": "name", "fonds": "name", "name": "name",
-        "isin": "isin", "code isin": "isin", "isin code": "isin",
-        "montant": "amount", "montant investi": "amount", "amount": "amount", "investi": "amount",
-        "date": "buy_date", "date d'achat": "buy_date", "date achat": "buy_date", "buy date": "buy_date",
-        "prix": "buy_price", "prix d'achat": "buy_price", "buy price": "buy_price"
-    }
-    return mapping.get(h, h)
+    cands = _symbol_candidates(val)
+    debug["cands"] = cands
+    for sym in cands:
+        df = eodhd_prices_daily(sym)
+        if not df.empty:
+            if start is not None:
+                df = df.loc[df.index >= start]
+            return df, sym, json.dumps(debug)
+    return pd.DataFrame(), "", json.dumps(debug)
 
-def _detect_delimiter(s: str) -> Optional[str]:
-    if "\t" in s: return "\t"
-    counts = {";": s.count(";"), "|": s.count("|"), ",": s.count(",")}
-    delim = max(counts, key=counts.get)
-    if counts[delim] > 0: return delim
-    return None
+# ----------------------- Schedules & poids ------------------
+def _month_schedule(d0: pd.Timestamp, d1: pd.Timestamp) -> List[pd.Timestamp]:
+    """1er jour ouvré de chaque mois entre d0 et d1 inclus."""
+    if d0 > d1:
+        return []
+    out = []
+    cur = pd.Timestamp(d0.year, d0.month, 1)
+    stop = pd.Timestamp(d1.year, d1.month, 1)
+    while cur <= stop:
+        bdays = pd.bdate_range(start=cur, end=cur + pd.offsets.MonthEnd(0))
+        if len(bdays) > 0:
+            out.append(bdays[0])
+        cur = cur + pd.offsets.MonthBegin(1)
+    return out
 
-def parse_pasted_table(text: str) -> pd.DataFrame:
-    lines = [ln for ln in text.strip().splitlines() if ln.strip()]
-    if not lines: return pd.DataFrame()
-    delim = _detect_delimiter(text)
-    rows = []
-    for ln in lines:
-        parts = [p.strip() for p in (ln.split(delim) if delim else re.split(r"\s{2,}", ln.strip()))]
-        rows.append(parts)
-    header = rows[0]
-    normalized = [_normalize_header(h) for h in header]
-    known = set(normalized) & {"name", "isin", "amount", "buy_date", "buy_price"}
-    if not known:
-        cols = ["name", "isin", "amount"]
-        if len(header) >= 4: cols.append("buy_date")
-        if len(header) >= 5: cols.append("buy_price")
-        data = rows
-        df = pd.DataFrame(data, columns=cols[:len(data[0])])
+def _weights_for(lines: List[Dict[str, Any]],
+                 alloc_mode: str,
+                 custom_weights: Dict[int, float],
+                 single_target: Optional[int]) -> Dict[int, float]:
+    keys = [id(ln) for ln in lines]
+    if len(keys) == 0:
+        return {}
+    if alloc_mode == "equal":
+        w = 1.0 / len(keys)
+        return {k: w for k in keys}
+    if alloc_mode == "custom":
+        tot = sum(max(0.0, float(custom_weights.get(id(ln), 0.0))) for ln in lines)
+        if tot <= 0:
+            w = 1.0 / len(keys)
+            return {k: w for k in keys}
+        return {id(ln): max(0.0, float(custom_weights.get(id(ln), 0.0))) / tot for ln in lines}
+    if alloc_mode == "single":
+        target = single_target
+        return {id(ln): (1.0 if id(ln) == target else 0.0) for ln in lines}
+    # default
+    w = 1.0 / len(keys)
+    return {k: w for k in keys}
+
+# ----------------------- Métriques ligne (frais dynamiques) -
+def compute_line_metrics(line: Dict[str, Any], fee_pct: float, euro_rate: float) -> Tuple[float, float, float]:
+    """
+    (net_investi, prix_achat, quantite) en appliquant le % de frais fourni.
+    EUROFUND => prix 1.0.
+    """
+    amt_brut = float(line.get("amount_gross", 0.0))
+    net_amt  = amt_brut * (1.0 - fee_pct / 100.0)
+
+    buy_ts = pd.Timestamp(line.get("buy_date"))
+    px_manual = line.get("buy_px", None)
+
+    if str(line.get("sym_used", "")).upper() == "EUROFUND" or str(line.get("isin", "")).upper() == "EUROFUND":
+        px = 1.0
     else:
-        data = rows[1:]
-        df = pd.DataFrame(data, columns=normalized[:len(rows[0])])
-
-    for col in df.columns:
-        df[col] = df[col].astype(str).str.strip()
-        if col == "amount":
-            df[col] = df[col].str.replace(" ", "").str.replace("€", "").str.replace(",", ".")
-        if col == "buy_price":
-            df[col] = df[col].str.replace(" ", "").str.replace("€", "").str.replace(",", ".")
-    return df
-
-def _standardize_df(df_raw: pd.DataFrame) -> pd.DataFrame:
-    colmap = {c: _normalize_header(str(c)) for c in df_raw.columns}
-    df = df_raw.rename(columns=colmap)
-    keep = [c for c in ["name", "isin", "amount", "buy_price", "buy_date"] if c in df.columns]
-    df = df[keep].copy()
-    if "amount" in df:
-        df["amount"] = (
-            df["amount"].astype(str).str.replace(" ", "").str.replace("€", "").str.replace(",", ".")
-            .apply(lambda x: pd.to_numeric(x, errors="coerce"))
-        )
-    if "buy_price" in df:
-        df["buy_price"] = (
-            df["buy_price"].astype(str).str.replace(" ", "").str.replace("€", "").str.replace(",", ".")
-            .apply(lambda x: pd.to_numeric(x, errors="coerce"))
-        )
-    if "buy_date" in df:
-        df["buy_date"] = pd.to_datetime(df["buy_date"], errors="coerce", dayfirst=True).dt.date
-    if "isin" in df:
-        df["isin"] = df["isin"].astype(str).str.upper().str.strip()
-    if "name" in df:
-        df["name"] = df["name"].astype(str).str.strip()
-    df = df.dropna(how="all")
-    return df
-
-def build_import_template_df() -> pd.DataFrame:
-    return pd.DataFrame(
-        [
-            {"name": "R-co Valor C EUR", "isin": "FR0011253624", "amount": 10000, "buy_price": "", "buy_date": "2024-01-02"},
-            {"name": "Fonds en euros (simulé)", "isin": "EUROFUND", "amount": 10000, "buy_price": "", "buy_date": "2024-01-02"},
-        ],
-        columns=["name", "isin", "amount", "buy_price", "buy_date"]
-    )
-
-def export_template_csv_bytes() -> bytes:
-    return build_import_template_df().to_csv(index=False).encode("utf-8")
-
-# -------- 11) VL synth UI (simplifiée) --------
-with st.sidebar:
-    st.header("🧮 VL synthétique (si VL absente)")
-    synth_key = st.text_input("ISIN ou Nom (clé)")
-    c1, c2 = st.columns(2)
-    with c1:
-        base_date = st.date_input("Date de départ", value=date(2018, 1, 1))
-        start_px = st.number_input("VL de départ", min_value=0.0, value=100.0, step=0.01, format="%.2f")
-    with c2:
-        last_px = st.number_input("VL actuelle", min_value=0.0, value=120.0, step=0.01, format="%.2f")
-
-    if st.button("✅ Enregistrer la VL synthétique"):
-        key_in = (synth_key or "").strip()
-        if not key_in:
-            st.warning("Saisis une clé (ISIN ou Nom).")
-        elif start_px <= 0 or last_px <= 0:
-            st.warning("VL de départ et VL actuelle doivent être > 0.")
-        else:
-            set_synth_params(
-                key=key_in,
-                base_date=pd.Timestamp(base_date),
-                start_px=float(start_px),
-                last_px=float(last_px),
-            )
-            st.success(f"Paramètres enregistrés pour « {key_in.upper()} ».")
-
-# -------- 12) Fonds en euros (taux) --------
-with st.sidebar:
-    st.header("💶 Fonds en euros — Paramètre global")
-    EURO_RATE = st.number_input(
-        "Taux annuel du fonds en euros (%)",
-        min_value=0.0, max_value=10.0, value=2.0, step=0.1,
-        help="Intérêts capitalisés le 31/12 (série rebasée à 1 au départ)."
-    )
-    st.session_state["EURO_RATE_PREVIEW"] = EURO_RATE
-
-# -------- 13) Frais d’entrée (%) --------
-with st.sidebar:
-    st.header("💸 Frais d’entrée (%)")
-    FEE_A = st.number_input("Frais d’entrée — Portefeuille 1 (Client)", min_value=0.0, max_value=10.0, value=0.0, step=0.1)
-    FEE_B = st.number_input("Frais d’entrée — Portefeuille 2 (Vous)", min_value=0.0, max_value=10.0, value=0.0, step=0.1)
-    st.caption("Ex.: 10 000 € investis avec 4 % de frais => 9 600 € réellement investis. Les frais s’appliquent aussi aux versements.")
-
-# -------- 14) Saisie/édition d’une ligne --------
-def _add_line_ui(port_key: str, title: str, euro_rate: float):
-    st.subheader(title)
-    with st.form(key=f"{port_key}_form", clear_on_submit=False):
-        c1, c2 = st.columns([2, 1])
-        with c1:
-            sel = st.selectbox("Choisir un fonds (ou saisie libre) :", ["— Saisie libre —"] + [f"{r['name']} — {r['isin']}" for r in UNIVERSE_GENERALI], key=f"{port_key}_select")
-        with c2:
-            amount = st.text_input("Montant investi (brut) €", value="", key=f"{port_key}_amount")
-
-        c3, c4 = st.columns(2)
-        with c3:
-            dt = st.date_input("Date d’achat", value=date(2024, 1, 2), key=f"{port_key}_date")
-        with c4:
-            px_opt = st.text_input("Prix d’achat (optionnel, sinon VL)", value="", key=f"{port_key}_px")
-
-        if sel != "— Saisie libre —":
-            name, isin = sel.split(" — ")
-            name = name.strip()
-            isin = isin.strip().upper()
-        else:
-            name = st.text_input("Nom du fonds (facultatif si ISIN saisi)", key=f"{port_key}_name").strip()
-            isin = st.text_input("ISIN (recommandé ou EUROFUND)", key=f"{port_key}_isin").strip().upper()
-
-        submitted = st.form_submit_button("➕ Ajouter", type="primary")
-
-    if submitted:
-        try:
-            amt_gross = float(str(amount).replace(" ", "").replace(",", "."))
-            assert amt_gross > 0
-        except Exception:
-            st.warning("Entre un **montant brut (€)** valide (>0).")
-            st.stop()
-
-        if not isin and not name:
-            st.warning("Indique au minimum l’**ISIN** ou le **nom** du fonds.")
-            st.stop()
-
-        dfp, sym_used, note = get_price_series(isin or name, pd.Timestamp(dt), euro_rate)
-        if dfp.empty:
-            st.error("Impossible de récupérer des VL (EODHD ou synth). Si pas de VL, saisis une VL synthétique dans la barre latérale.")
-            st.stop()
-
-        px = None
-        if px_opt:
+        dfp, _, _ = get_price_series(line.get("isin") or line.get("name"), buy_ts, euro_rate)
+        if px_manual not in (None, "", 0, "0"):
             try:
-                px = float(str(px_opt).replace(",", "."))
-            except:
-                px = None
-        if px is None:
-            px = _get_close_on(dfp, pd.Timestamp(dt))
-        if not px or px <= 0:
-            st.error("Prix d’achat non déterminable.")
-            st.stop()
+                px = float(px_manual)
+            except Exception:
+                px = _get_close_on(dfp, buy_ts)
+        else:
+            px = _get_close_on(dfp, buy_ts)
 
-        if not name and isin:
-            name = _auto_name_from_isin(isin) or "—"
+    qty = (net_amt / px) if px and px > 0 else 0.0
+    return float(net_amt), float(px), float(qty)
 
-        fee_pct = FEE_A if port_key == "A_lines" else FEE_B
-        net_amt = amt_gross * (1.0 - fee_pct/100.0)
-        qty = float(net_amt) / float(px)
+# ----------------------- Simulation vectorisée --------------
+def simulate_portfolio(
+    lines: List[Dict[str, Any]],
+    monthly_amt_gross: float,
+    one_amt_gross: float, one_date: date,
+    alloc_mode: str,
+    custom_weights: Dict[int, float],
+    single_target: Optional[int],
+    euro_rate: float,
+    fee_pct: float
+) -> Tuple[pd.DataFrame, float, float, float, Optional[float], pd.Timestamp, pd.Timestamp]:
 
-        st.session_state[port_key].append({
-            "name": name or "—",
-            "isin": isin or "",
-            "amount_gross": float(amt_gross),
-            "amount_net": float(net_amt),
-            "qty_calc": float(qty),
-            "buy_date": pd.Timestamp(dt),
-            "buy_px": float(px),
-            "sym_used": sym_used,
-            "note": note,
-        })
-        st.success(f"Ligne ajoutée ({name or isin})")
+    if not lines:
+        return pd.DataFrame(), 0.0, 0.0, 0.0, None, TODAY, TODAY
 
+    # 1) Prix de chaque ligne + dates d'achat effectives
+    price_map: Dict[int, pd.Series] = {}
+    eff_buy_date: Dict[int, pd.Timestamp] = {}
+    buy_price_used: Dict[int, float] = {}
+
+    for ln in lines:
+        key_id = id(ln)
+        df, sym, _ = get_price_series(ln.get("isin") or ln.get("name"), None, euro_rate)
+        if df.empty:
+            continue
+        ln["sym_used"] = sym
+
+        d_buy = pd.Timestamp(ln["buy_date"])
+        if d_buy in df.index:
+            px_buy = float(df.loc[d_buy, "Close"]); eff_dt = d_buy
+        else:
+            after = df.loc[df.index >= d_buy]
+            if after.empty:
+                px_buy = float(df.iloc[-1]["Close"]); eff_dt = df.index[-1]
+            else:
+                px_buy = float(after.iloc[0]["Close"]); eff_dt = after.index[0]
+
+        px_manual = ln.get("buy_px", None)
+        px_for_qty = float(px_manual) if (px_manual not in (None, "", 0, "0")) else px_buy
+
+        price_map[key_id] = df["Close"].astype(float)
+        eff_buy_date[key_id] = eff_dt
+        buy_price_used[key_id] = px_for_qty
+
+    if not price_map:
+        return pd.DataFrame(), 0.0, 0.0, 0.0, None, TODAY, TODAY
+
+    start_min = min(eff_buy_date.values())
+    start_full = max(eff_buy_date.values())
+
+    # 2) Calendrier business-day commun + ffill
+    bidx = pd.bdate_range(start=start_min, end=TODAY, freq="B")
+    prices = pd.DataFrame(index=bidx)
+    for key_id, s in price_map.items():
+        prices[key_id] = s.reindex(bidx).ffill()
+
+    # 3) Achats initiaux (quantités) – frais dynamiques
+    qty_events = pd.DataFrame(0.0, index=bidx, columns=prices.columns)
+    total_brut = 0.0
+    total_net = 0.0
+    cash_flows: List[Tuple[pd.Timestamp, float]] = []
+
+    for ln in lines:
+        key_id = id(ln)
+        if key_id not in prices.columns:
+            continue
+        brut = float(ln.get("amount_gross", 0.0))
+        net  = brut * (1.0 - fee_pct/100.0)
+        px   = float(buy_price_used[key_id])
+        dt   = eff_buy_date[key_id]
+        if brut > 0 and px > 0:
+            q = net / px
+            tgt = dt if dt in qty_events.index else qty_events.index[qty_events.index >= dt][0]
+            qty_events.loc[tgt, key_id] += q
+            total_brut += brut
+            total_net  += net
+            cash_flows.append((tgt, -brut))
+
+    # 4) Poids d'allocation
+    weights = _weights_for(lines, alloc_mode, custom_weights, single_target)
+
+    # 5) Versement ponctuel
+    if one_amt_gross > 0:
+        dt = pd.Timestamp(one_date)
+        if dt not in qty_events.index:
+            after = qty_events.index[qty_events.index >= dt]
+            if len(after) > 0:
+                dt = after[0]
+            else:
+                dt = None
+        if dt is not None:
+            net_amt = one_amt_gross * (1.0 - fee_pct/100.0)
+            for ln in lines:
+                key_id = id(ln)
+                w = weights.get(key_id, 0.0)
+                if w <= 0 or key_id not in prices.columns:
+                    continue
+                px = float(prices.loc[dt, key_id])
+                if px > 0:
+                    qty_events.loc[dt, key_id] += (net_amt * w) / px
+            total_brut += float(one_amt_gross)
+            total_net  += float(net_amt)
+            cash_flows.append((dt, -float(one_amt_gross)))
+
+    # 6) Mensualités
+    if monthly_amt_gross > 0:
+        sched = _month_schedule(start_min, TODAY)
+        for dt in sched:
+            if dt not in qty_events.index:
+                after = qty_events.index[qty_events.index >= dt]
+                if len(after) == 0:
+                    continue
+                dt = after[0]
+            net_m = monthly_amt_gross * (1.0 - fee_pct/100.0)
+            for ln in lines:
+                key_id = id(ln)
+                w = weights.get(key_id, 0.0)
+                if w <= 0 or key_id not in prices.columns:
+                    continue
+                px = float(prices.loc[dt, key_id])
+                if px > 0:
+                    qty_events.loc[dt, key_id] += (net_m * w) / px
+            total_brut += float(monthly_amt_gross)
+            total_net  += float(net_m)
+            cash_flows.append((dt, -float(monthly_amt_gross)))
+
+    # 7) Quantités cumulées + valeur
+    qty_cum = qty_events.cumsum()
+    values = (qty_cum * prices).sum(axis=1)
+    df_val = pd.DataFrame({"Valeur": values})
+
+    final_val = float(df_val["Valeur"].iloc[-1]) if not df_val.empty else 0.0
+    cash_flows.append((TODAY, final_val))
+    irr = xirr(cash_flows)
+
+    return df_val, total_brut, total_net, final_val, (irr * 100.0 if irr is not None else None), start_min, start_full
+
+# ----------------------- UI: Ligne (carte) ------------------
 def _line_card(line: Dict[str, Any], idx: int, port_key: str):
     state_key = f"edit_mode_{port_key}_{idx}"
     if state_key not in st.session_state:
         st.session_state[state_key] = False
 
-    # Frais dynamiques selon le portefeuille (A = client, B = vous)
-    fee_pct = FEE_A if port_key == "A_lines" else FEE_B
+    fee_pct = st.session_state.get("FEE_A", 0.0) if port_key == "A_lines" else st.session_state.get("FEE_B", 0.0)
+    euro_rate = st.session_state.get("EURO_RATE_PREVIEW", 2.0)
 
-    # Montant brut & net (RECALCULÉ dynamiquement)
-    amt_brut = float(line.get("amount_gross", 0.0))
-    buy_px   = float(line.get("buy_px", 0.0)) or np.nan
-    net_amt  = amt_brut * (1.0 - fee_pct / 100.0)
-    qty_disp = (net_amt / buy_px) if (buy_px and buy_px > 0) else np.nan
+    net_amt, buy_px, qty_disp = compute_line_metrics(line, fee_pct, euro_rate)
 
     with st.container(border=True):
-        header = st.columns([3, 2, 2, 2, 1])
-        with header[0]:
+        cols = st.columns([3, 2, 2, 2, 1])
+        with cols[0]:
             st.markdown(f"**{line.get('name','—')}**")
-            st.caption(f"ISIN : `{line.get('isin','—')}` • Symbole : ")
+            st.caption(f"ISIN : `{line.get('isin','—')}` • Symbole :")
             st.code(line.get('sym_used','—'))
-        with header[1]:
-            st.markdown(f"Investi (brut)\n\n**{to_eur(amt_brut)}**")
+        with cols[1]:
+            st.markdown(f"Investi (brut)\n\n**{to_eur(line.get('amount_gross', 0.0))}**")
             st.caption(f"Net après frais {fee_pct:.1f}% : **{to_eur(net_amt)}**")
             st.caption(f"le {fmt_date(line.get('buy_date'))}")
-        with header[2]:
+        with cols[2]:
             st.markdown(f"Prix achat\n\n**{to_eur(buy_px)}**")
-            st.caption(f"Quantité (calc) : {qty_disp:.6f}" if not np.isnan(qty_disp) else "Quantité (calc) : —")
+            st.caption(f"Quantité : {qty_disp:.6f}")
             if line.get("note"):
                 st.caption(line["note"])
-        with header[3]:
+        with cols[3]:
             try:
-                df_last, _, _ = get_price_series(line.get("isin") or line.get("name"),
-                                                 None, st.session_state.get("EURO_RATE_PREVIEW", 2.0))
-                last = float(df_last["Close"].iloc[-1]) if not df_last.empty else np.nan
+                dfl, _, _ = get_price_series(line.get("isin") or line.get("name"), None, euro_rate)
+                last = float(dfl["Close"].iloc[-1]) if not dfl.empty else np.nan
                 st.markdown(f"Dernier : **{to_eur(last)}**")
             except Exception:
-                pass
-        with header[4]:
+                st.markdown("Dernier : —")
+        with cols[4]:
             if not st.session_state[state_key]:
                 if st.button("✏️", key=f"edit_{port_key}_{idx}", help="Modifier"):
                     st.session_state[state_key] = True
@@ -558,481 +465,243 @@ def _line_card(line: Dict[str, Any], idx: int, port_key: str):
                         st.stop()
 
                     buy_ts = pd.Timestamp(new_date)
-                    dfp, _, _ = get_price_series(line.get("isin") or line.get("name"),
-                                                 buy_ts, st.session_state.get("EURO_RATE_PREVIEW", 2.0))
-                    if dfp.empty:
-                        st.error("Impossible de recalculer la VL au jour choisi.")
-                        st.stop()
-
-                    if new_px.strip():
-                        try:
-                            px = float(str(new_px).replace(",", "."))
-                        except Exception:
-                            px = _get_close_on(dfp, buy_ts)
-                    else:
-                        px = _get_close_on(dfp, buy_ts)
-
-                    if not px or px <= 0:
-                        st.error("Prix d’achat non déterminable.")
-                        st.stop()
-
-                    # On n’enregistre plus de 'amount_net' ni de 'qty_calc' figés
                     line["amount_gross"] = float(amt_gross)
                     line["buy_date"] = buy_ts
-                    line["buy_px"] = float(px)
-
+                    if new_px.strip():
+                        try:
+                            line["buy_px"] = float(str(new_px).replace(",", "."))
+                        except Exception:
+                            line["buy_px"] = ""
+                    else:
+                        line["buy_px"] = ""
                     st.session_state[state_key] = False
                     st.success("Ligne mise à jour.")
                     st.experimental_rerun()
 
-# -------- 15) Coller un tableau --------
-def lines_from_dataframe(df_std: pd.DataFrame, euro_rate: float, default_dt: Optional[pd.Timestamp], fee_pct: float) -> List[Dict[str, Any]]:
-    lines: List[Dict[str, Any]] = []
-    for _, row in df_std.iterrows():
-        isin = str(row.get("isin", "") or "").strip().upper()
-        name = str(row.get("name", "") or "").strip()
-        amount = row.get("amount", None)
-        buy_price = row.get("buy_price", None)
-        buy_date = row.get("buy_date", None)
+# ----------------------- UI: Table positions ----------------
+def positions_table(title: str, port_key: str):
+    fee_pct = st.session_state.get("FEE_A", 0.0) if port_key == "A_lines" else st.session_state.get("FEE_B", 0.0)
+    euro_rate = st.session_state.get("EURO_RATE_PREVIEW", 2.0)
+    lines = st.session_state.get(port_key, [])
 
-        if (not isin and not name) or (amount is None or pd.isna(amount) or float(amount) <= 0):
-            continue
-
-        if not buy_date or pd.isna(buy_date):
-            buy_ts = pd.Timestamp(default_dt) if default_dt is not None else TODAY
-        else:
-            buy_ts = pd.Timestamp(buy_date)
-
-        dfp, sym_used, note = get_price_series(isin or name, buy_ts, euro_rate)
-        if dfp.empty:
-            continue
-
-        if (buy_price is not None) and not pd.isna(buy_price) and float(buy_price) > 0:
-            px = float(buy_price)
-        else:
-            px = _get_close_on(dfp, buy_ts)
-        if not px or px <= 0:
-            continue
-
-        if not name and isin:
-            name = _auto_name_from_isin(isin) or (isin if isin else "—")
-
-        amt_gross = float(amount)
-        net_amt = amt_gross * (1.0 - fee_pct/100.0)
-        qty = float(net_amt) / float(px)
-
-        lines.append({
-            "name": name or "—",
-            "isin": isin or "",
-            "amount_gross": float(amt_gross),
-            "amount_net": float(net_amt),
-            "qty_calc": float(qty),
-            "buy_date": buy_ts,
-            "buy_px": float(px),
-            "sym_used": sym_used,
-            "note": note,
+    rows = []
+    for ln in lines:
+        net_amt, buy_px, qty = compute_line_metrics(ln, fee_pct, euro_rate)
+        rows.append({
+            "Nom": ln.get("name", ""),
+            "ISIN": ln.get("isin", ""),
+            "Symbole": ln.get("sym_used", ""),
+            "Montant brut €": float(ln.get("amount_gross", 0.0)),
+            "Net investi €": net_amt,
+            "Quantité": qty,
+            "Prix achat €": buy_px,
+            "Date d'achat": fmt_date(ln.get("buy_date")),
         })
-    return lines
 
-def _expander_paste_block(who_label: str, paste_key_prefix: str, lines_key: str, fee_pct: float):
-    with st.expander(f"📋 Coller un tableau (Nom | ISIN | Montant | [Date] | [Prix]) — {who_label}"):
-        default_dt = st.date_input("Date d’achat par défaut (si absente)", value=date(2024, 1, 2), key=f"default_dt_{paste_key_prefix}")
-        text = st.text_area("Colle ici depuis Excel/Sheets", height=180, key=f"paste_{paste_key_prefix}")
-        if st.button(f"🔎 Prévisualiser ({who_label})"):
-            if not text.strip():
-                st.warning("Rien à parser.")
-            else:
-                dfp = parse_pasted_table(text)
-                if dfp.empty:
-                    st.warning("Impossible de détecter un tableau.")
-                else:
-                    st.write("Aperçu :", dfp)
-                    st.session_state[f"paste_preview_{paste_key_prefix}"] = dfp
-                    st.session_state[f"paste_default_dt_{paste_key_prefix}"] = pd.Timestamp(default_dt)
-
-        if st.button(f"➕ Ajouter ces lignes ({who_label})"):
-            dfp = st.session_state.get(f"paste_preview_{paste_key_prefix}", pd.DataFrame())
-            default_dt_saved = st.session_state.get(f"paste_default_dt_{paste_key_prefix}", None)
-            if default_dt_saved is None:
-                default_dt_saved = pd.Timestamp(default_dt)
-            if dfp.empty:
-                st.warning("Fais d’abord la prévisualisation.")
-            else:
-                dfp = dfp.replace("", np.nan)
-                for col in ["amount", "buy_price"]:
-                    if col in dfp.columns:
-                        dfp[col] = pd.to_numeric(dfp[col], errors="coerce")
-                new_lines = lines_from_dataframe(dfp, st.session_state["EURO_RATE_PREVIEW"], default_dt=default_dt_saved, fee_pct=fee_pct)
-                if not new_lines:
-                    st.warning("Aucune ligne valide à ajouter. Si un fonds n’a pas de VL, crée une **VL synthétique** (barre latérale).")
-                else:
-                    st.session_state[lines_key].extend(new_lines)
-                    st.success(f"{len(new_lines)} ligne(s) ajoutée(s).")
-                    st.experimental_rerun()
-
-# -------- 16) Sidebar paramètres de versement --------
-def _weights_for(lines: List[Dict[str, Any]], mode: str, custom: Dict[int, float], single_id: Optional[int]) -> Dict[int, float]:
-    if not lines:
-        return {}
-    if mode == "Tout sur un seul fonds" and single_id is not None:
-        return {id(ln): (1.0 if id(ln) == single_id else 0.0) for ln in lines}
-    if mode == "Répartition personnalisée" and custom:
-        s = sum(max(0.0, v) for v in custom.values())
-        if s <= 0:
-            return {id(ln): 1.0 / len(lines) for ln in lines}
-        return {k: max(0.0, v) / s for k, v in custom.items()}
-    total = sum(float(ln.get("amount_net", 0.0)) for ln in lines)  # pro-rata sur le net investi initial
-    if total > 0:
-        return {id(ln): float(ln.get("amount_net", 0.0)) / total for ln in lines}
-    return {id(ln): 1.0 / len(lines) for ln in lines}
-
-def _alloc_sidebar(side_label: str, lines_key: str, prefix: str):
-    st.subheader(side_label)
-    m = st.number_input(f"Versement mensuel (brut) — {prefix}", min_value=0.0, value=0.0, step=100.0, key=f"m_{prefix}")
-    one_amt = st.number_input(f"Versement ponctuel (brut) — {prefix}", min_value=0.0, value=0.0, step=100.0, key=f"one_{prefix}_amt")
-    one_date = st.date_input(f"Date versement ponctuel — {prefix}", value=date.today(), key=f"one_{prefix}_date")
-    mode = st.selectbox(f"Affectation des versements — {prefix}",
-                        ["Pro-rata (net init.)", "Répartition personnalisée", "Tout sur un seul fonds"],
-                        key=f"mode_{prefix}")
-    custom = {}
-    single = None
-    lines = st.session_state[lines_key]
-    if mode == "Répartition personnalisée":
-        if lines:
-            st.caption("Répartir sur les lignes ci-dessous (total ≈ 100 %).")
-            default = round(100.0 / len(lines), 2)
-            tot = 0.0
-            for i, ln in enumerate(lines):
-                w = st.slider(f"{ln['name']} ({ln['isin']})", 0.0, 100.0, default, 1.0, key=f"{prefix}_w{i}")
-                custom[id(ln)] = w / 100.0
-                tot += w
-            if abs(tot - 100.0) > 1.0:
-                st.warning("La somme des poids s’éloigne de 100 % — elle sera renormalisée automatiquement.")
-        else:
-            st.info("Ajoute au moins une ligne pour définir des poids personnalisés.")
-    elif mode == "Tout sur un seul fonds":
-        if lines:
-            options = [f"{ln['name']} — {ln['isin']}" for ln in lines]
-            pick = st.selectbox("Choisir la ligne cible", options, key=f"{prefix}_single_pick")
-            idx = options.index(pick)
-            single = id(lines[idx])
-        else:
-            st.info("Ajoute au moins une ligne pour choisir une cible unique.")
-    return m, one_amt, one_date, mode, custom, single
-
-with st.sidebar:
-    st.header("⚙️ Paramètres de versement")
-    mA, oneA_amt, oneA_date, modeA, customA, singleA = _alloc_sidebar("Portefeuille 1 — Client", "A_lines", "A")
-    st.divider()
-    mB, oneB_amt, oneB_date, modeB, customB, singleB = _alloc_sidebar("Portefeuille 2 — Vous", "B_lines", "B")
-
-# -------- 17) Onglets Portefeuilles --------
-st.title("🟣 Comparer deux portefeuilles (Client vs Vous)")
-tabA, tabB = st.tabs(["📁 Portefeuille 1 — Client", "🟣 Portefeuille 2 — Vous"])
-
-with tabA:
-    _add_line_ui("A_lines", "Portefeuille 1 — Client", st.session_state.get("EURO_RATE_PREVIEW", 2.0))
-    _expander_paste_block("Client", "A", "A_lines", FEE_A)
-    for i, ln in enumerate(st.session_state["A_lines"]):
-        _line_card(ln, i, "A_lines")
-
-with tabB:
-    _add_line_ui("B_lines", "Portefeuille 2 — Vous", st.session_state.get("EURO_RATE_PREVIEW", 2.0))
-    _expander_paste_block("Vous", "B", "B_lines", FEE_B)
-    for i, ln in enumerate(st.session_state["B_lines"]):
-        _line_card(ln, i, "B_lines")
-
-# -------- 18) Simulation & XIRR --------
-def xnpv(rate: float, cash_flows: List[Tuple[pd.Timestamp, float]]) -> float:
-    t0 = cash_flows[0][0]
-    return sum(cf / ((1 + rate) ** ((t - t0).days / 365.2425)) for t, cf in cash_flows)
-
-def xirr(cash_flows: List[Tuple[pd.Timestamp, float]]) -> Optional[float]:
-    if not cash_flows or len(cash_flows) < 2:
-        return None
-    lo, hi = -0.9999, 10.0
-    for _ in range(100):
-        mid = (lo + hi) / 2
-        val = xnpv(mid, cash_flows)
-        if abs(val) < 1e-6:
-            return mid
-        if xnpv(lo, cash_flows) * val < 0:
-            hi = mid
-        else:
-            lo = mid
-    return None
-
-def simulate_portfolio(
-    lines: List[Dict[str, Any]],
-    monthly_amt_gross: float,
-    one_amt_gross: float, one_date: date,
-    alloc_mode: str,
-    custom_weights: Dict[int, float],
-    single_target: Optional[int],
-    euro_rate: float,
-    fee_pct: float
-) -> Tuple[pd.DataFrame, float, float, float, Optional[float], pd.Timestamp, pd.Timestamp]:
-    if not lines:
-        return pd.DataFrame(), 0.0, 0.0, 0.0, None, TODAY, TODAY
-
-    # 1) Prix pour chaque ligne
-    price_map: Dict[int, pd.Series] = {}
-    eff_buy_date: Dict[int, pd.Timestamp] = {}
-    buy_price_used: Dict[int, float] = {}
-
-    for ln in lines:
-        key_id = id(ln)
-        series_df, _, _ = get_price_series(ln.get("isin") or ln.get("name"), None, euro_rate)
-        s = series_df["Close"] if not series_df.empty else pd.Series(dtype=float)
-        if s.empty:
-            continue
-
-        d_buy = pd.Timestamp(ln["buy_date"])
-        if d_buy in s.index:
-            px_buy = float(s.loc[d_buy]); eff_dt = d_buy
-        else:
-            after = s.loc[s.index >= d_buy]
-            if after.empty:
-                px_buy = float(s.iloc[-1]); eff_dt = s.index[-1]
-            else:
-                px_buy = float(after.iloc[0]); eff_dt = after.index[0]
-
-        px_manual = ln.get("buy_px", None)
-        px_for_qty = float(px_manual) if (px_manual and px_manual > 0) else px_buy
-
-        price_map[key_id] = s.astype(float)
-        eff_buy_date[key_id] = eff_dt
-        buy_price_used[key_id] = px_for_qty
-
-    if not price_map:
-        return pd.DataFrame(), 0.0, 0.0, 0.0, None, TODAY, TODAY
-
-    start_min = min(eff_buy_date.values())
-    start_full = max(eff_buy_date.values())
-
-    # 2) Calendrier business-day + ffill
-    bidx = pd.bdate_range(start=start_min, end=TODAY, freq="B")
-    prices = pd.DataFrame(index=bidx)
-    for key_id, s in price_map.items():
-        prices[key_id] = s.reindex(bidx).ffill()
-
-    # 3) Événements d’achats (quantités) – TOUT recalculé avec frais ACTUELS
-    qty_events = pd.DataFrame(0.0, index=bidx, columns=prices.columns)
-    total_brut = 0.0
-    total_net = 0.0
-    cash_flows: List[Tuple[pd.Timestamp, float]] = []
-
-    for ln in lines:
-        key_id = id(ln)
-        if key_id not in prices.columns:
-            continue
-        brut = float(ln.get("amount_gross", 0.0))
-        net  = brut * (1.0 - fee_pct/100.0)          # << frais dynamiques
-        px   = float(buy_price_used[key_id])
-        dt   = eff_buy_date[key_id]
-
-        if brut > 0 and px > 0:
-            q = net / px
-            if dt in qty_events.index:
-                qty_events.loc[dt, key_id] += q
-            else:
-                after = qty_events.index[qty_events.index >= dt]
-                if len(after) > 0:
-                    qty_events.loc[after[0], key_id] += q
-            total_brut += brut
-            total_net  += net
-            cash_flows.append((dt, -brut))
-
-    # 4) Poids pour les versements
-    weights = _weights_for(lines, alloc_mode, custom_weights, single_target)
-
-    # 5) Versement ponctuel
-    if one_amt_gross > 0:
-        dt = pd.Timestamp(one_date)
-        if dt in qty_events.index:
-            alloc_dt = dt
-        else:
-            after = qty_events.index[qty_events.index >= dt]
-            alloc_dt = after[0] if len(after) > 0 else None
-
-        if alloc_dt is not None:
-            net_amt = one_amt_gross * (1.0 - fee_pct/100.0)
-            for ln in lines:
-                key_id = id(ln)
-                w = weights.get(key_id, 0.0)
-                if w <= 0 or key_id not in prices.columns:
-                    continue
-                px = float(prices.loc[alloc_dt, key_id])
-                if px > 0:
-                    qty_events.loc[alloc_dt, key_id] += (net_amt * w) / px
-            total_brut += float(one_amt_gross)
-            total_net  += float(net_amt)
-            cash_flows.append((alloc_dt, -float(one_amt_gross)))
-
-    # 6) Mensualités
-    if monthly_amt_gross > 0:
-        sched = _month_schedule(start_min, TODAY)
-        for dt in sched:
-            if dt not in qty_events.index:
-                after = qty_events.index[qty_events.index >= dt]
-                if len(after) == 0:
-                    continue
-                dt = after[0]
-            net_m = monthly_amt_gross * (1.0 - fee_pct/100.0)
-            for ln in lines:
-                key_id = id(ln)
-                w = weights.get(key_id, 0.0)
-                if w <= 0 or key_id not in prices.columns:
-                    continue
-                px = float(prices.loc[dt, key_id])
-                if px > 0:
-                    qty_events.loc[dt, key_id] += (net_m * w) / px
-            total_brut += float(monthly_amt_gross)
-            total_net  += float(net_m)
-            cash_flows.append((dt, -float(monthly_amt_gross)))
-
-    # 7) Quantités cumulées et valorisation
-    qty_cum = qty_events.cumsum()
-    values = (qty_cum * prices).sum(axis=1)
-    df_val = pd.DataFrame({"Valeur": values})
-
-    final_val = float(df_val["Valeur"].iloc[-1]) if not df_val.empty else 0.0
-    cash_flows.append((TODAY, final_val))
-    irr = xirr(cash_flows)
-
-    return df_val, total_brut, total_net, final_val, (irr * 100.0 if irr is not None else None), start_min, start_full
-
-
-# -------- 19) Run & affichage --------
-rebase_100 = st.checkbox("Normaliser les courbes à 100 au départ", value=False)
-st.divider()
-run = st.button("🚀 Lancer la comparaison", type="primary")
-
-if run:
-    dfA, investA_brut, investA_net, valA, xirrA, A_first, A_full = simulate_portfolio(
-        st.session_state["A_lines"],
-        st.session_state.get("m_A", 0.0),
-        st.session_state.get("one_A_amt", 0.0),
-        st.session_state.get("one_A_date", date.today()),
-        st.session_state.get("mode_A", "Pro-rata (net init.)"),
-        {k: v for k, v in st.session_state.items() if str(k).startswith("A_") and isinstance(v, float)},
-        st.session_state.get("A_single_pick", None),
-        st.session_state.get("EURO_RATE_PREVIEW", 2.0),
-        FEE_A
-    )
-    dfB, investB_brut, investB_net, valB, xirrB, B_first, B_full = simulate_portfolio(
-        st.session_state["B_lines"],
-        st.session_state.get("m_B", 0.0),
-        st.session_state.get("one_B_amt", 0.0),
-        st.session_state.get("one_B_date", date.today()),
-        st.session_state.get("mode_B", "Pro-rata (net init.)"),
-        {k: v for k, v in st.session_state.items() if str(k).startswith("B_") and isinstance(v, float)},
-        st.session_state.get("B_single_pick", None),
-        st.session_state.get("EURO_RATE_PREVIEW", 2.0),
-        FEE_B
-    )
-
-    A_start, B_start = A_first, B_first
-    dfA_plot = dfA.loc[dfA.index >= A_start].copy() if not dfA.empty else dfA
-    dfB_plot = dfB.loc[dfB.index >= B_start].copy() if not dfB.empty else dfB
-
-    if rebase_100:
-        if not dfA_plot.empty: dfA_plot["Valeur"] = 100 * dfA_plot["Valeur"] / dfA_plot["Valeur"].iloc[0]
-        if not dfB_plot.empty: dfB_plot["Valeur"] = 100 * dfB_plot["Valeur"] / dfB_plot["Valeur"].iloc[0]
-
-    st.subheader("📈 Évolution de la valeur des portefeuilles")
-    if not dfA_plot.empty or not dfB_plot.empty:
-        df_plot = pd.DataFrame(index=sorted(set(dfA_plot.index).union(dfB_plot.index)))
-        if not dfA_plot.empty: df_plot["Client"] = dfA_plot["Valeur"]
-        if not dfB_plot.empty: df_plot["Vous"] = dfB_plot["Valeur"]
-
-        y_label = "Indice (base 100)" if rebase_100 else "Valeur (€)"
-        starts = []
-        if not dfA_plot.empty: starts.append(float(dfA_plot["Valeur"].iloc[0]))
-        if not dfB_plot.empty: starts.append(float(dfB_plot["Valeur"].iloc[0]))
-        base_min = min(starts) if starts else (min(df_plot.min()) if not df_plot.empty else 0.0)
-        y_max = max(df_plot.max()) if not df_plot.empty else 1.0
-        y_margin = (y_max - base_min) * 0.05
-        y_min_adj = max(0.0, base_min - y_margin)
-
-        fig = px.line(df_plot, x=df_plot.index, y=df_plot.columns,
-                      labels={"value": y_label, "index": "Date"},
-                      title="Valeur quotidienne (versements pris en compte, frais d’entrée déduits)")
-        fig.update_yaxes(range=[y_min_adj, y_max + y_margin])
-        st.plotly_chart(fig, use_container_width=True)
+    df = pd.DataFrame(rows)
+    st.markdown(f"### {title}")
+    if df.empty:
+        st.info("Aucune ligne.")
     else:
-        st.info("Ajoute des lignes pour au moins un portefeuille.")
-
-    st.subheader("📊 Synthèse chiffrée")
-    c1, c2, c3, c4, c5, c6 = st.columns(6)
-    c1.metric("Investi BRUT (Client)", to_eur(investA_brut))
-    c2.metric("Net investi (Client)", to_eur(investA_net))
-    c3.metric("XIRR (Client)", f"{xirrA:.2f}%" if xirrA is not None else "—")
-    c4.metric("Investi BRUT (Vous)", to_eur(investB_brut))
-    c5.metric("Net investi (Vous)", to_eur(investB_net))
-    c6.metric("XIRR (Vous)", f"{xirrB:.2f}%" if xirrB is not None else "—")
-
-    st.subheader("✅ Et si c’était avec nous ?")
-    if (valA is not None) and (valB is not None):
-        delta_val = (valB or 0.0) - (valA or 0.0)
-        msg = f"**Vous auriez gagné {to_eur(delta_val)} de plus.**"
-        if (xirrA is not None) and (xirrB is not None):
-            delta_xirr = (xirrB - xirrA)
-            msg += f" **Soit +{delta_xirr:.2f}% de performance annualisée.**"
-        st.success(msg)
-        st.markdown(f"- **Gain de valeur** vs portefeuille client : **{to_eur(delta_val)}**")
-        if xirrA is not None and xirrB is not None:
-            st.markdown(f"- **Surperformance annualisée (Δ XIRR)** : **{(xirrB - xirrA):+.2f}%**")
-    else:
-        st.info("Ajoute des lignes et relance pour voir le delta.")
-
-    # Détail positions
-    def _detail_table(lines: List[Dict[str, Any]], title: str):
-        st.markdown(f"#### {title}")
-        if not lines:
-            st.info("Aucune ligne.")
-            return
-        rows = []
-        for ln in lines:
-            df_, _, _ = get_price_series(ln.get("isin") or ln.get("name"),
-                                         None, st.session_state.get("EURO_RATE_PREVIEW", 2.0))
-            last = float(df_["Close"].iloc[-1]) if not df_.empty else np.nan
-            rows.append({
-                "Nom": ln.get("name", "—"),
-                "ISIN": ln.get("isin", "—"),
-                "Symbole": ln.get("sym_used", "—"),
-                "Montant brut €": float(ln.get("amount_gross", 0.0)),
-                "Net investi €": float(ln.get("amount_net", 0.0)),
-                "Quantité": float(ln.get("qty_calc", 0.0)),
-                "Prix achat": float(ln.get("buy_px", np.nan)),
-                "Dernier cours": last,
-                "Date d’achat": fmt_date(ln.get("buy_date")),
-            })
-        dfv = pd.DataFrame(rows)
         st.dataframe(
-            dfv.style.format({
+            df.style.format({
                 "Montant brut €": to_eur,
                 "Net investi €": to_eur,
-                "Quantité": "{:.6f}",
-                "Prix achat": to_eur,
-                "Dernier cours": to_eur
+                "Prix achat €": to_eur,
+                "Quantité": "{:,.6f}".format
             }),
-            use_container_width=True, hide_index=True
+            hide_index=True,
+            use_container_width=True
         )
 
-    d1, d2 = st.columns(2)
-    with d1: _detail_table(st.session_state["A_lines"], "Portefeuille 1 — Client (positions)")
-    with d2: _detail_table(st.session_state["B_lines"], "Portefeuille 2 — Vous (positions)")
-else:
-    st.info("Ajoute des lignes (formulaire ou **Coller un tableau**), règle les frais & versements, puis clique **Lancer la comparaison**.")
+# ----------------------- UI: Sidebar Saisie -----------------
+def _add_line_form(port_key: str, label: str):
+    st.subheader(label)
+    with st.form(key=f"form_add_{port_key}", clear_on_submit=False):
+        c1, c2 = st.columns([3, 2])
+        with c1:
+            name = st.text_input("Nom du fonds (ou 'EUROFUND')", value="")
+            isin = st.text_input("ISIN (peut être 'EUROFUND')", value="")
+        with c2:
+            amount = st.text_input("Montant investi (brut) €", value="")
+            buy_date = st.date_input("Date d’achat", value=pd.Timestamp("2024-01-02").date())
+        px = st.text_input("Prix d’achat (optionnel)", value="")
+        note = st.text_input("Note (optionnel)", value="")
+        add_btn = st.form_submit_button("➕ Ajouter cette ligne")
 
-# -------- 20) Debug --------
-with st.expander("🔧 Debug EODHD / Synth (optionnel)"):
-    test_q = st.text_input("Tester une recherche (ISIN, nom ou EUROFUND)")
-    if test_q:
-        st.write("Résultat /search :", eod_search(test_q))
-        df_dbg, sym_dbg, note_dbg = get_price_series(test_q, None, st.session_state.get("EURO_RATE_PREVIEW", 2.0))
-        st.write("Symbole testé :", sym_dbg)
-        if note_dbg: st.caption(note_dbg)
-        if not df_dbg.empty: st.dataframe(df_dbg.tail(5))
-        else: st.warning("Aucune VL trouvée (EODHD ou synth).")
+    if add_btn:
+        try:
+            amt = float(str(amount).replace(" ", "").replace(",", "."))
+            assert amt > 0
+        except Exception:
+            st.warning("Montant invalide.")
+            return
+        ln = {
+            "name": name.strip() or isin.strip() or "—",
+            "isin": isin.strip() or name.strip(),
+            "amount_gross": float(amt),
+            "buy_date": pd.Timestamp(buy_date),
+            "buy_px": float(str(px).replace(",", ".")) if px.strip() else "",
+            "note": note.strip(),
+            "sym_used": ""  # renseigné lors des téléchargements de prix
+        }
+        st.session_state[port_key].append(ln)
+        st.success("Ligne ajoutée.")
+
+def _paste_table_block(port_key: str, label: str):
+    st.subheader(f"{label} — Coller un tableau")
+    st.caption("Format attendu (une ligne par position) : **Nom;ISIN;Montant** (séparateur `;`).")
+    txt = st.text_area("Coller ici :", value="", height=120, key=f"paste_{port_key}")
+    if st.button("👀 Prévisualiser", key=f"prev_{port_key}"):
+        rows = []
+        for raw in txt.strip().splitlines():
+            parts = [p.strip() for p in raw.split(";")]
+            if len(parts) < 3:
+                continue
+            nm, isinn, amt = parts[0], parts[1], parts[2]
+            try:
+                a = float(str(amt).replace(" ", "").replace(",", "."))
+            except Exception:
+                a = 0.0
+            rows.append({"name": nm, "isin": isinn, "amount_gross": a})
+        st.session_state[f"preview_{port_key}"] = rows
+
+    prev = st.session_state.get(f"preview_{port_key}", [])
+    if prev:
+        st.success(f"{len(prev)} ligne(s) détectée(s).")
+        dfp = pd.DataFrame(prev)
+        st.dataframe(dfp, hide_index=True, use_container_width=True)
+        if st.button("➕ Ajouter ces lignes", key=f"addprev_{port_key}"):
+            for r in prev:
+                st.session_state[port_key].append({
+                    "name": r["name"],
+                    "isin": r["isin"],
+                    "amount_gross": float(r["amount_gross"]),
+                    "buy_date": pd.Timestamp("2024-01-02"),
+                    "buy_px": "",
+                    "note": "",
+                    "sym_used": ""
+                })
+            st.session_state[f"preview_{port_key}"] = []
+            st.success("Lignes ajoutées.")
+
+# ----------------------- App --------------------------------
+st.set_page_config(page_title=APP_TITLE, layout="wide")
+st.title(APP_TITLE)
+
+# Etat
+for key in ["A_lines", "B_lines"]:
+    if key not in st.session_state:
+        st.session_state[key] = []
+
+# --------- Sidebar: paramètres globaux ----------
+with st.sidebar:
+    st.header("🟦 Fonds en euros — Paramètre global")
+    EURO_RATE = st.number_input("Taux annuel du fonds en euros (%)", 0.0, 10.0, 2.0, 0.10, key="EURO_RATE_PREVIEW")
+    st.caption("Astuce : utilisez le symbole **EUROFUND** pour ajouter le fonds en euros.")
+
+    st.header("💶 Frais d’entrée (%)")
+    FEE_A = st.number_input("Frais d’entrée — Portefeuille 1 (Client)", 0.0, 10.0, 3.0, 0.10, key="FEE_A")
+    FEE_B = st.number_input("Frais d’entrée — Portefeuille 2 (Vous)",   0.0, 10.0, 2.0, 0.10, key="FEE_B")
+    st.caption("Ex.: 10 000 € investis avec 4 % de frais ⇒ 9 600 € réellement investis. Les frais s’appliquent aussi aux versements.")
+
+    st.header("📅 Paramètres de versement")
+    with st.expander("Portefeuille 1 — Client"):
+        M_A = st.number_input("Mensuel brut (€)", 0.0, 1_000_000.0, 0.0, 100.0, key="M_A")
+        ONE_A = st.number_input("Ponctuel brut (€)", 0.0, 1_000_000.0, 0.0, 100.0, key="ONE_A")
+        ONE_A_DATE = st.date_input("Date du ponctuel", value=pd.Timestamp("2024-07-01").date(), key="ONE_A_DATE")
+    with st.expander("Portefeuille 2 — Vous"):
+        M_B = st.number_input("Mensuel brut (€)", 0.0, 1_000_000.0, 0.0, 100.0, key="M_B")
+        ONE_B = st.number_input("Ponctuel brut (€)", 0.0, 1_000_000.0, 0.0, 100.0, key="ONE_B")
+        ONE_B_DATE = st.date_input("Date du ponctuel", value=pd.Timestamp("2024-07-01").date(), key="ONE_B_DATE")
+
+    st.header("🧮 Règle d’affectation des versements")
+    ALLOC_MODE = st.selectbox("Mode", ["equal", "custom", "single"], index=0, help="Répartition des versements entre les lignes.")
+    st.caption("• equal = parts égales • custom = poids personnalisés • single = tout sur une ligne")
+
+    st.divider()
+    _add_line_form("A_lines", "Portefeuille 1 — Client : ajouter une ligne")
+    _paste_table_block("A_lines", "Portefeuille 1 — Client")
+
+    st.divider()
+    _add_line_form("B_lines", "Portefeuille 2 — Vous : ajouter une ligne")
+    _paste_table_block("B_lines", "Portefeuille 2 — Vous")
+
+# Poids perso / single target (par id)
+custom_weights_A = {id(ln): 1.0 for ln in st.session_state["A_lines"]}
+custom_weights_B = {id(ln): 1.0 for ln in st.session_state["B_lines"]}
+single_target_A = id(st.session_state["A_lines"][0]) if st.session_state["A_lines"] else None
+single_target_B = id(st.session_state["B_lines"][0]) if st.session_state["B_lines"] else None
+
+# ---------------- Simulation -----------------
+dfA, brutA, netA, valA, xirrA, startA, fullA = simulate_portfolio(
+    st.session_state["A_lines"], st.session_state["M_A"], st.session_state["ONE_A"], st.session_state["ONE_A_DATE"],
+    st.session_state["ALLOC_MODE"], custom_weights_A, single_target_A,
+    st.session_state["EURO_RATE_PREVIEW"], st.session_state["FEE_A"]
+)
+dfB, brutB, netB, valB, xirrB, startB, fullB = simulate_portfolio(
+    st.session_state["B_lines"], st.session_state["M_B"], st.session_state["ONE_B"], st.session_state["ONE_B_DATE"],
+    st.session_state["ALLOC_MODE"], custom_weights_B, single_target_B,
+    st.session_state["EURO_RATE_PREVIEW"], st.session_state["FEE_B"]
+)
+
+# Alignement graphique sur période commune
+start_plot = min([x for x in [startA, startB] if pd.notnull(x)])
+idx = pd.bdate_range(start=start_plot, end=TODAY, freq="B")
+chart_df = pd.DataFrame(index=idx)
+if not dfA.empty:
+    chart_df["Client"] = dfA.reindex(idx)["Valeur"].ffill()
+if not dfB.empty:
+    chart_df["Vous"] = dfB.reindex(idx)["Valeur"].ffill()
+chart_df = chart_df.reset_index().rename(columns={"index": "Date"})
+chart_df = chart_df.melt("Date", var_name="variable", value_name="Valeur (€)")
+
+st.subheader("📈 Évolution de la valeur des portefeuilles")
+if chart_df.dropna().empty:
+    st.info("Ajoutez des lignes et/ou vérifiez vos paramètres pour afficher le graphique.")
+else:
+    base = alt.Chart(chart_df).mark_line().encode(
+        x=alt.X("Date:T", title="Date"),
+        y=alt.Y("Valeur (€):Q", title="Valeur (€)"),
+        color="variable:N"
+    ).properties(height=360, use_container_width=True)
+    st.altair_chart(base, use_container_width=True)
+
+# ---------------- Synthèse -------------------
+st.subheader("📊 Synthèse chiffrée")
+c1, c2, c3, c4, c5, c6 = st.columns(6)
+with c1: st.metric("Investi BRUT (Client)", to_eur(brutA))
+with c2: st.metric("Net investi (Client)", to_eur(netA))
+with c3: st.metric("XIRR (Client)", f"{xirrA:.2f}%" if xirrA is not None else "—")
+with c4: st.metric("Investi BRUT (Vous)", to_eur(brutB))
+with c5: st.metric("Net investi (Vous)", to_eur(netB))
+with c6: st.metric("XIRR (Vous)", f"{xirrB:.2f}%" if xirrB is not None else "—")
+
+st.markdown("### ✅ Et si c’était avec nous ?")
+gain_vs_client = (valB - valA) if (valA and valB) else 0.0
+delta_xirr = (xirrB - xirrA) if (xirrA is not None and xirrB is not None) else None
+st.success(
+    f"Vous auriez gagné **{to_eur(gain_vs_client)}** de plus."
+    + (f" Soit **{delta_xirr:+.2f}%** de performance annualisée supplémentaire." if delta_xirr is not None else "")
+)
+st.markdown("- **Gain de valeur** vs portefeuille client : " + to_eur(gain_vs_client))
+if delta_xirr is not None:
+    st.markdown(f"- **Surperformance annualisée (Δ XIRR)** : {delta_xirr:+.2f}%")
+
+# ---------------- Positions -------------------
+positions_table("Portefeuille 1 — Client (positions)", "A_lines")
+positions_table("Portefeuille 2 — Vous (positions)", "B_lines")
+
+# ---------------- Aide rapide -----------------
+with st.expander("🧩 Aide rapide"):
+    st.markdown(
+        """
+- **Ajouter une ligne** côté gauche (ou collez un tableau `Nom;ISIN;Montant`).
+- **Fonds en euros** : utilisez le symbole **EUROFUND** (taux paramétrable).
+- **Frais d’entrée** : sliders indépendants pour Client et Vous.  
+  Les frais s’appliquent **à chaque achat** (initial, mensuel, ponctuel).
+- **Prix d’achat** : si non fourni, on prend la VL du jour d’achat (ou le 1er jour ouvré suivant).
+- **Versements** : paramétrez des montants bruts et la règle d’affectation.
+- **XIRR** : calculé à partir des flux bruts et de la valeur finale.
+        """
+    )

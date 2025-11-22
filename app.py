@@ -846,7 +846,9 @@ dfB, brutB, netB, valB, xirrB, startB_min, fullB = simulate_portfolio(
     st.session_state.get("FEE_B", 0.0),
 )
 
-# Graphique (on commence quand les deux portefeuilles sont entièrement investis)
+# ------------------------------------------------------------
+# Graphique (évolution des portefeuilles)
+# ------------------------------------------------------------
 full_dates = [d for d in [fullA, fullB] if isinstance(d, pd.Timestamp)]
 start_plot = max(full_dates) if full_dates else TODAY
 
@@ -870,60 +872,97 @@ else:
     ).properties(height=360, width="container")
     st.altair_chart(base, use_container_width=True)
 
-# Synthèse chiffrée
+# ------------------------------------------------------------
+# Synthèse chiffrée : cartes Client / Valority
+# ------------------------------------------------------------
 st.subheader("Synthèse chiffrée")
 
-c1, c2, c3, c4, c5, c6 = st.columns(6)
-with c1:
-    st.metric("Investi BRUT (Client)", to_eur(brutA))
-with c2:
-    st.metric("Net investi (Client)", to_eur(netA))
-with c3:
-    st.metric("Valeur actuelle (Client)", to_eur(valA))
-with c4:
-    st.metric("Investi BRUT (Valority)", to_eur(brutB))
-with c5:
-    st.metric("Net investi (Valority)", to_eur(netB))
-with c6:
-    st.metric("Valeur actuelle (Valority)", to_eur(valB))
+period_dates = [d for d in [startA_min, startB_min] if isinstance(d, pd.Timestamp)]
+if period_dates:
+    start_global = min(period_dates)
+    st.caption(f"Période analysée : du **{fmt_date(start_global)}** au **{fmt_date(TODAY)}**")
 
+# Rendements totaux
 perf_tot_client = (valA / netA - 1.0) * 100.0 if netA > 0 else None
 perf_tot_valority = (valB / netB - 1.0) * 100.0 if netB > 0 else None
 
-c7, c8, c9, c10 = st.columns(4)
-with c7:
-    st.metric(
-        "Rendement total (Client)",
-        f"{perf_tot_client:.2f}%" if perf_tot_client is not None else "—",
-    )
-with c8:
-    st.metric(
-        "Rendement annualisé (Client, XIRR)",
-        f"{xirrA:.2f}%" if xirrA is not None else "—",
-    )
-with c9:
-    st.metric(
-        "Rendement total (Valority)",
-        f"{perf_tot_valority:.2f}%" if perf_tot_valority is not None else "—",
-    )
-with c10:
-    st.metric(
-        "Rendement annualisé (Valority, XIRR)",
-        f"{xirrB:.2f}%" if xirrB is not None else "—",
-    )
+col_client, col_valority = st.columns(2)
 
-st.markdown("### Et si c’était avec nous ?")
+with col_client:
+    with st.container(border=True):
+        st.markdown("#### 🧍 Situation actuelle — Client")
+        st.metric("Valeur actuelle", to_eur(valA))
+        st.markdown(
+            f"""
+- Montants réellement investis (après frais) : **{to_eur(netA)}**
+- Montants versés (brut) : {to_eur(brutA)}
+- Rendement total depuis le début : **{(perf_tot_client or 0):.2f}%**""" if perf_tot_client is not None else
+            f"""
+- Montants réellement investis (après frais) : **{to_eur(netA)}**
+- Montants versés (brut) : {to_eur(brutA)}
+- Rendement total depuis le début : **—**"""
+        )
+        st.markdown(
+            f"- Rendement annualisé (XIRR) : **{xirrA:.2f}%**"
+            if xirrA is not None
+            else "- Rendement annualisé (XIRR) : **—**"
+        )
+
+with col_valority:
+    with st.container(border=True):
+        st.markdown("#### 🏢 Simulation — Allocation Valority")
+        st.metric("Valeur actuelle simulée", to_eur(valB))
+        st.markdown(
+            f"""
+- Montants réellement investis (après frais) : **{to_eur(netB)}**
+- Montants versés (brut) : {to_eur(brutB)}
+- Rendement total depuis le début : **{(perf_tot_valority or 0):.2f}%**""" if perf_tot_valority is not None else
+            f"""
+- Montants réellement investis (après frais) : **{to_eur(netB)}**
+- Montants versés (brut) : {to_eur(brutB)}
+- Rendement total depuis le début : **—**"""
+        )
+        st.markdown(
+            f"- Rendement annualisé (XIRR) : **{xirrB:.2f}%**"
+            if xirrB is not None
+            else "- Rendement annualisé (XIRR) : **—**"
+        )
+
+# ------------------------------------------------------------
+# Comparaison directe : "Et si c’était avec nous ?"
+# ------------------------------------------------------------
+st.subheader("📌 Comparaison : Client vs Valority")
+
 gain_vs_client = (valB - valA) if (valA and valB) else 0.0
 delta_xirr = (xirrB - xirrA) if (xirrA is not None and xirrB is not None) else None
-st.success(
-    f"Vous auriez gagné {to_eur(gain_vs_client)} de plus."
-    + (f" Soit {delta_xirr:+.2f}% de performance annualisée supplémentaire." if delta_xirr is not None else "")
+perf_diff_tot = (
+    (perf_tot_valority - perf_tot_client) if (perf_tot_client is not None and perf_tot_valority is not None) else None
 )
-st.markdown("- Gain de valeur vs portefeuille client : " + to_eur(gain_vs_client))
-if delta_xirr is not None:
-    st.markdown(f"- Surperformance annualisée (Δ XIRR) : {delta_xirr:+.2f}%")
 
+with st.container(border=True):
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        st.metric("Gain en valeur", to_eur(gain_vs_client))
+    with c2:
+        st.metric(
+            "Surperformance totale",
+            f"{perf_diff_tot:+.2f}%" if perf_diff_tot is not None else "—",
+        )
+    with c3:
+        st.metric(
+            "Surperformance annualisée (Δ XIRR)",
+            f"{delta_xirr:+.2f}%" if delta_xirr is not None else "—",
+        )
+
+    st.markdown(
+        f"""
+Aujourd’hui, avec votre allocation actuelle, votre portefeuille vaut **{to_eur(valA)}**.  
+Avec l’allocation Valority, il serait autour de **{to_eur(valB)}**, soit environ **{to_eur(gain_vs_client)}** de plus."""
+    )
+
+# ------------------------------------------------------------
 # Tables positions
+# ------------------------------------------------------------
 positions_table("Portefeuille 1 — Client", "A_lines")
 positions_table("Portefeuille 2 — Valority", "B_lines")
 

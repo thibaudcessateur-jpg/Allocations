@@ -9,6 +9,7 @@
 # - Moteur de valorisation vectorisé (prix x quantités)
 # - Rendu graphique + XIRR + synthèse & "Et si c'était avec nous ?"
 # - Récupération VL via EODHD (recherche robuste)
+# - Sélection de modèles de portefeuilles (Client / Vous)
 # ------------------------------------------------------------
 
 from __future__ import annotations
@@ -27,6 +28,99 @@ import altair as alt
 # ----------------------- Constantes -------------------------
 TODAY = pd.Timestamp.today().normalize()
 APP_TITLE = "Comparateur de portefeuilles"
+
+# ----------------------- Modèles de portefeuilles ----------
+
+# Montants à 0 € volontairement (à personnaliser au cas par cas).
+# L’intérêt : les supports sont déjà renseignés (nom + ISIN), tu n’as plus qu’à mettre
+# les montants et/ou les dates d’achat que tu veux utiliser pour la simulation.
+
+PORTFOLIO_PRESETS: Dict[str, List[Dict[str, Any]]] = {
+    "— Aucun modèle —": [],
+    "UC cœur recommandées (à personnaliser)": [
+        {
+            "name": "Fonds en euros (EUROFUND)",
+            "isin": "EUROFUND",
+            "amount_gross": 0.0,
+            "buy_date": "2024-01-02",
+            "buy_px": "",
+            "note": "Support sécurisé fonds en euros",
+        },
+        {
+            "name": "R-co Valor C EUR",
+            "isin": "FR0011253624",  # R-co Valor C EUR :contentReference[oaicite:0]{index=0}
+            "amount_gross": 0.0,
+            "buy_date": "2024-01-02",
+            "buy_px": "",
+            "note": "Fonds flexible international cœur",
+        },
+        {
+            "name": "Vivalor International A",
+            "isin": "FR0013515921",  # Vivalor International A :contentReference[oaicite:1]{index=1}
+            "amount_gross": 0.0,
+            "buy_date": "2024-01-02",
+            "buy_px": "",
+            "note": "Allocation diversifiée internationale",
+        },
+        {
+            "name": "Carmignac Investissement A EUR Acc",
+            "isin": "FR0010148981",  # Carmignac Investissement A EUR Acc :contentReference[oaicite:2]{index=2}
+            "amount_gross": 0.0,
+            "buy_date": "2024-01-02",
+            "buy_px": "",
+            "note": "Actions internationales croissance",
+        },
+        {
+            "name": "Fidelity Funds - World Fund A EUR",
+            "isin": "LU0069449576",  # Fidelity Funds - World Fund A-EUR :contentReference[oaicite:3]{index=3}
+            "amount_gross": 0.0,
+            "buy_date": "2024-01-02",
+            "buy_px": "",
+            "note": "Actions monde grandes capitalisations",
+        },
+        {
+            "name": "Clartan Valeurs C",
+            "isin": "LU1100076550",  # Clartan Valeurs C :contentReference[oaicite:4]{index=4}
+            "amount_gross": 0.0,
+            "buy_date": "2024-01-02",
+            "buy_px": "",
+            "note": "Allocation flexible internationale",
+        },
+        {
+            "name": "Carmignac Patrimoine A EUR Acc",
+            "isin": "FR0010135103",  # Carmignac Patrimoine A EUR Acc :contentReference[oaicite:5]{index=5}
+            "amount_gross": 0.0,
+            "buy_date": "2024-01-02",
+            "buy_px": "",
+            "note": "Diversifié patrimonial équilibré",
+        },
+    ],
+}
+
+
+def load_preset_into_session(port_key: str, preset_name: str):
+    """
+    Charge un modèle de portefeuille dans st.session_state[port_key].
+    port_key = "A_lines" ou "B_lines".
+    """
+    preset_lines = PORTFOLIO_PRESETS.get(preset_name, [])
+    prepared: List[Dict[str, Any]] = []
+    for ln in preset_lines:
+        buy_date_raw = ln.get("buy_date", TODAY)
+        buy_ts = pd.Timestamp(buy_date_raw)
+        prepared.append(
+            {
+                "name": str(ln.get("name", "")).strip() or str(ln.get("isin", "")).strip() or "—",
+                "isin": str(ln.get("isin", "")).strip() or str(ln.get("name", "")).strip(),
+                "amount_gross": float(ln.get("amount_gross", 0.0)),
+                "buy_date": buy_ts,
+                "buy_px": float(str(ln.get("buy_px")).replace(",", ".")) if str(ln.get("buy_px", "")).strip() else "",
+                "note": str(ln.get("note", "")).strip(),
+                "sym_used": "",
+            }
+        )
+    st.session_state[port_key] = prepared
+
 
 # ----------------------- Utils format -----------------------
 def to_eur(x: Any) -> str:
@@ -62,6 +156,7 @@ def xirr(cash_flows: List[Tuple[pd.Timestamp, float]], guess: float = 0.1) -> Op
             h = 1e-6
             f1 = _npv(r + h, cfs)
             d = (f1 - f) / h
+            d = float(d)
             if abs(d) < 1e-12:
                 break
             r2 = r - f / d
@@ -171,31 +266,28 @@ def _get_close_on(df: pd.DataFrame, d: pd.Timestamp) -> float:
 def get_price_series(isin_or_name: str, start: Optional[pd.Timestamp], euro_rate: float) -> Tuple[pd.DataFrame, str, str]:
     """
     Retourne (df Close, symbol_utilisé, debug) pour un ISIN/Nom.
-    EUROFUND => série synthétique avec taux annuel euro_rate (%).
+    EUROFUND => série synthétique croissant au taux annuel euro_rate (%).
     """
     debug = {"cands": []}
     val = str(isin_or_name).strip()
     if not val:
         return pd.DataFrame(), "", json.dumps(debug)
 
-    # --- Cas fonds en euros synthétique ---
+    # ----- Cas fonds en euros synthétique -----
     if val.upper() == "EUROFUND":
         idx = pd.bdate_range(start=pd.Timestamp("2000-01-03"), end=TODAY, freq="B")
         if euro_rate is None:
             euro_rate = 0.0
         r = float(euro_rate) / 100.0
-
-        # Croissance lissée en fonction du temps écoulé (en années)
-        days = (idx - idx[0]).days.values.astype(float)
+        days = (idx - idx[0]).days.astype(float)
         years = days / 365.25
         close = (1.0 + r) ** years
-
         df = pd.DataFrame({"Close": close}, index=idx)
         if start is not None:
             df = df.loc[df.index >= start]
         return df, "EUROFUND", json.dumps(debug)
 
-    # --- Cas général : ETF / fonds via EODHD ---
+    # ----- Cas général : OPCVM / ETF via EODHD -----
     cands = _symbol_candidates(val)
     debug["cands"] = cands
     for sym in cands:
@@ -251,7 +343,7 @@ def _weights_for(
 def compute_line_metrics(line: Dict[str, Any], fee_pct: float, euro_rate: float) -> Tuple[float, float, float]:
     """
     (net_investi, prix_achat, quantite) en appliquant le % de frais fourni.
-    EUROFUND => utilise la série synthétique avec le taux euro_rate.
+    EUROFUND passe aussi par la série synthétique (taux euro_rate).
     """
     amt_brut = float(line.get("amount_gross", 0.0))
     net_amt = amt_brut * (1.0 - fee_pct / 100.0)
@@ -259,7 +351,6 @@ def compute_line_metrics(line: Dict[str, Any], fee_pct: float, euro_rate: float)
     buy_ts = pd.Timestamp(line.get("buy_date"))
     px_manual = line.get("buy_px", None)
 
-    # Toujours passer par get_price_series (EUROFUND inclus)
     dfp, _, _ = get_price_series(line.get("isin") or line.get("name"), buy_ts, euro_rate)
 
     if px_manual not in (None, "", 0, "0"):
@@ -617,9 +708,34 @@ st.session_state.setdefault("ONE_B", 0.0)
 st.session_state.setdefault("ONE_A_DATE", pd.Timestamp("2024-07-01").date())
 st.session_state.setdefault("ONE_B_DATE", pd.Timestamp("2024-07-01").date())
 st.session_state.setdefault("ALLOC_MODE", "equal")
+st.session_state.setdefault("PRESET_A", "— Aucun modèle —")
+st.session_state.setdefault("PRESET_B", "— Aucun modèle —")
 
 # --------- Sidebar: paramètres globaux ----------
 with st.sidebar:
+    st.header("📂 Modèles de portefeuilles")
+    col_p1, col_p2 = st.columns(2)
+    with col_p1:
+        preset_a = st.selectbox(
+            "Portefeuille 1 (Client)",
+            list(PORTFOLIO_PRESETS.keys()),
+            key="PRESET_A",
+        )
+        if st.button("Charger Ptf. 1", key="BTN_LOAD_A"):
+            load_preset_into_session("A_lines", preset_a)
+            st.success("Portefeuille 1 chargé.")
+    with col_p2:
+        preset_b = st.selectbox(
+            "Portefeuille 2 (Vous)",
+            list(PORTFOLIO_PRESETS.keys()),
+            key="PRESET_B",
+        )
+        if st.button("Charger Ptf. 2", key="BTN_LOAD_B"):
+            load_preset_into_session("B_lines", preset_b)
+            st.success("Portefeuille 2 chargé.")
+
+    st.divider()
+
     st.header("🟦 Fonds en euros — Paramètre global")
     EURO_RATE = st.number_input(
         "Taux annuel du fonds en euros (%)",
@@ -762,7 +878,8 @@ positions_table("Portefeuille 2 — Vous (positions)", "B_lines")
 with st.expander("🧩 Aide rapide"):
     st.markdown(
         """
-- **Ajouter une ligne** côté gauche (ou collez un tableau `Nom;ISIN;Montant`).
+- **Modèles** : utilisez le bloc *Modèles de portefeuilles* pour charger vos allocations types (Client / Vous).
+- **Ajouter une ligne** : formulaires dans la barre latérale ou collez un tableau `Nom;ISIN;Montant`.
 - **Fonds en euros** : utilisez le symbole **EUROFUND** (taux paramétrable).
 - **Frais d’entrée** : sliders indépendants pour Client et Vous.  
   Les frais s’appliquent **à chaque achat** (initial, mensuel, ponctuel).

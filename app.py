@@ -179,7 +179,6 @@ def get_price_series(isin_or_name: str, start: Optional[pd.Timestamp], euro_rate
     # Fonds en euros synthétique
     if val.upper() == "EUROFUND":
         idx = pd.bdate_range(start=pd.Timestamp("2000-01-03"), end=pd.Timestamp.today().normalize(), freq="B")
-        r = 0.0
         try:
             r = max(0.0, float(euro_rate) / 100.0)
         except Exception:
@@ -251,7 +250,6 @@ def compute_line_metrics(line: Dict[str, Any], fee_pct: float, euro_rate: float)
     buy_ts = pd.Timestamp(line.get("buy_date"))
     px_manual = line.get("buy_px", None)
 
-    # Plus de cas spécial "EUROFUND" : on utilise la vraie série de prix
     dfp, _, _ = get_price_series(line.get("isin") or line.get("name"), buy_ts, euro_rate)
     if px_manual not in (None, "", 0, "0"):
         try:
@@ -398,7 +396,7 @@ def simulate_portfolio(
     return df_val, total_brut, total_net, final_val, (irr * 100.0 if irr is not None else None), start_min, start_full
 
 # ---------------------------------------------------------------------
-# Affichage des lignes
+# Affichage des lignes (cartes éditables)
 # ---------------------------------------------------------------------
 def _line_card(line: Dict[str, Any], idx: int, port_key: str):
     state_key = f"edit_mode_{port_key}_{idx}"
@@ -473,7 +471,9 @@ def _line_card(line: Dict[str, Any], idx: int, port_key: str):
                     st.success("Ligne mise à jour.")
                     st.experimental_rerun()
 
-
+# ---------------------------------------------------------------------
+# Table positions : départ vs aujourd'hui + perf
+# ---------------------------------------------------------------------
 def positions_table(title: str, port_key: str):
     fee_pct = st.session_state.get("FEE_A", 0.0) if port_key == "A_lines" else st.session_state.get("FEE_B", 0.0)
     euro_rate = st.session_state.get("EURO_RATE_PREVIEW", 2.0)
@@ -481,14 +481,34 @@ def positions_table(title: str, port_key: str):
     rows = []
     for ln in lines:
         net_amt, buy_px, qty = compute_line_metrics(ln, fee_pct, euro_rate)
+        # Prix / date actuels
+        dfl, _, _ = get_price_series(ln.get("isin") or ln.get("name"), None, euro_rate)
+        if not dfl.empty and qty > 0:
+            last_date = dfl.index[-1]
+            last_px = float(dfl["Close"].iloc[-1])
+            current_val = qty * last_px
+            perf_abs = current_val - net_amt
+            perf_pct = (current_val / net_amt - 1.0) * 100.0 if net_amt > 0 else np.nan
+        else:
+            last_date = pd.NaT
+            last_px = np.nan
+            current_val = np.nan
+            perf_abs = np.nan
+            perf_pct = np.nan
+
         rows.append({
             "Nom": ln.get("name", ""),
             "ISIN": ln.get("isin", ""),
             "Symbole": ln.get("sym_used", ""),
             "Montant brut €": float(ln.get("amount_gross", 0.0)),
-            "Net investi €": net_amt,
+            "Net investi €": net_amt,          # Position de départ (net)
             "Quantité": qty,
-            "Prix achat €": buy_px,
+            "VL achat €": buy_px,             # VL de départ
+            "VL actuelle €": last_px,         # VL aujourd'hui
+            "Valeur actuelle €": current_val, # Position aujourd'hui
+            "Perf €": perf_abs,
+            "Perf %": perf_pct,
+            "Date VL actuelle": fmt_date(last_date),
             "Date d'achat": fmt_date(ln.get("buy_date")),
         })
     df = pd.DataFrame(rows)
@@ -500,16 +520,19 @@ def positions_table(title: str, port_key: str):
             df.style.format({
                 "Montant brut €": to_eur,
                 "Net investi €": to_eur,
-                "Prix achat €": to_eur,
-                "Quantité": "{:,.6f}".format
+                "VL achat €": to_eur,
+                "VL actuelle €": to_eur,
+                "Valeur actuelle €": to_eur,
+                "Perf €": to_eur,
+                "Perf %": "{:,.2f}%".format,
+                "Quantité": "{:,.6f}".format,
             }),
             hide_index=True,
             use_container_width=True
         )
 
 # ---------------------------------------------------------------------
-# Saisie : UN SEUL bloc par portefeuille
-#  - choix "Fonds recommandés" OU "Saisie libre"
+# Saisie : UN SEUL bloc par portefeuille (fonds recommandés ou libre)
 # ---------------------------------------------------------------------
 def _add_line_form(port_key: str, label: str):
     st.subheader(label)
@@ -595,6 +618,13 @@ def _add_line_form(port_key: str, label: str):
         }
         st.session_state[port_key].append(ln)
         st.success("Ligne ajoutée.")
+
+    # Juste en dessous : afficher les lignes existantes avec édition / suppression
+    lines = st.session_state.get(port_key, [])
+    if lines:
+        st.markdown("#### Lignes actuelles")
+        for idx, ln in enumerate(lines):
+            _line_card(ln, idx, port_key)
 
 # ---------------------------------------------------------------------
 # Layout principal
@@ -731,30 +761,47 @@ else:
 # Synthèse & "Et si c'était avec nous ?"
 # ---------------------------------------------------------------------
 st.subheader("Synthèse chiffrée")
+
+# Rendements simples (valeur actuelle / net investi - 1)
+rendA_pct = (valA / netA - 1.0) * 100.0 if netA > 0 else None
+rendB_pct = (valB / netB - 1.0) * 100.0 if netB > 0 else None
+
 c1, c2, c3, c4, c5, c6 = st.columns(6)
 with c1:
     st.metric("Investi BRUT (Client)", to_eur(brutA))
 with c2:
     st.metric("Net investi (Client)", to_eur(netA))
 with c3:
-    st.metric("XIRR (Client)", f"{xirrA:.2f}%" if xirrA is not None else "—")
+    st.metric("Valeur actuelle (Client)", to_eur(valA))
 with c4:
     st.metric("Investi BRUT (Valority)", to_eur(brutB))
 with c5:
     st.metric("Net investi (Valority)", to_eur(netB))
 with c6:
-    st.metric("XIRR (Valority)", f"{xirrB:.2f}%" if xirrB is not None else "—")
+    st.metric("Valeur actuelle (Valority)", to_eur(valB))
+
+c7, c8 = st.columns(2)
+with c7:
+    st.metric(
+        "Rendement total (Client)",
+        f"{rendA_pct:.2f}%" if rendA_pct is not None else "—"
+    )
+with c8:
+    st.metric(
+        "Rendement total (Valority)",
+        f"{rendB_pct:.2f}%" if rendB_pct is not None else "—"
+    )
 
 st.markdown("### Et si c’était avec Valority ?")
 gain_vs_client = (valB - valA) if (valA and valB) else 0.0
-delta_xirr = (xirrB - xirrA) if (xirrA is not None and xirrB is not None) else None
+delta_rend = (rendB_pct - rendA_pct) if (rendA_pct is not None and rendB_pct is not None) else None
 st.success(
-    f"Vous auriez gagné {to_eur(gain_vs_client)} de plus."
-    + (f" Soit {delta_xirr:+.2f}% de performance annualisée supplémentaire." if delta_xirr is not None else "")
+    f"Vous auriez aujourd’hui {to_eur(gain_vs_client)} de plus."
+    + (f" Soit {delta_rend:+.2f} points de rendement total en plus." if delta_rend is not None else "")
 )
 st.markdown("- Gain de valeur vs portefeuille client : " + to_eur(gain_vs_client))
-if delta_xirr is not None:
-    st.markdown(f"- Surperformance annualisée (Δ XIRR) : {delta_xirr:+.2f}%")
+if delta_rend is not None:
+    st.markdown(f"- Différence de rendement total : {delta_rend:+.2f} points")
 
 # Tables de positions
 positions_table("Portefeuille 1 — Client (positions)", "A_lines")
@@ -764,8 +811,9 @@ with st.expander("Aide rapide"):
     st.markdown(
         '''
 - Dans chaque onglet, ajoutez des lignes en choisissant un **fonds recommandé** (Core / Défensif, y compris EUROFUND) ou via **saisie libre** (Nom + ISIN).
+- Juste sous le formulaire, vous voyez les lignes existantes, modifiables (montant, date, prix) et supprimables.
 - Le taux du fonds en euros, les frais d’entrée et les versements se règlent dans la barre latérale.
-- Les versements suivent la règle d’affectation choisie (equal / custom / single).
-- Le XIRR est calculé à partir des flux bruts investis et de la valeur finale simulée.
+- Les tables de positions distinguent **la position de départ** (net investi, VL d’achat) et **la position aujourd’hui** (VL actuelle, valeur actuelle, performance en € et en %).
+- Le rendement total affiché dans la synthèse correspond à : valeur actuelle / net investi – 1.
 '''
     )

@@ -260,7 +260,6 @@ def compute_line_metrics(
 
     dfp, _, _ = get_price_series(line.get("isin") or line.get("name"), buy_ts, euro_rate)
     if str(line.get("sym_used", "")).upper() == "EUROFUND" or str(line.get("isin", "")).upper() == "EUROFUND":
-        # la série EUROFUND est déjà capitalisée, mais le prix au jour d'achat est celui de la VL ce jour-là
         px = _get_close_on(dfp, buy_ts)
     else:
         if px_manual not in (None, "", 0, "0"):
@@ -324,7 +323,7 @@ def simulate_portfolio(
         return pd.DataFrame(), 0.0, 0.0, 0.0, None, TODAY, TODAY
 
     start_min = min(eff_buy_date.values())
-    start_full = max(eff_buy_date.values())  # date où toutes les lignes sont en place
+    start_full = max(eff_buy_date.values())
 
     bidx = pd.bdate_range(start=start_min, end=TODAY, freq="B")
     prices = pd.DataFrame(index=bidx)
@@ -501,7 +500,7 @@ def positions_table(title: str, port_key: str):
 
     for ln in lines:
         net_amt, buy_px, qty = compute_line_metrics(ln, fee_pct, euro_rate)
-        # VL actuelle
+
         dfl, _, _ = get_price_series(ln.get("isin") or ln.get("name"), None, euro_rate)
         if not dfl.empty:
             last_date = dfl.index[-1]
@@ -510,7 +509,7 @@ def positions_table(title: str, port_key: str):
             last_date = None
             last_px = np.nan
 
-        val_now = qty * last_px if last_px == last_px else 0.0  # NaN check
+        val_now = qty * last_px if last_px == last_px else 0.0
         perf_abs = val_now - net_amt
         perf_pct = (val_now / net_amt - 1.0) * 100.0 if net_amt > 0 else np.nan
 
@@ -576,65 +575,96 @@ def positions_table(title: str, port_key: str):
 
 
 # ------------------------------------------------------------
-# Saisie libre avec option fonds recommandés
+# Blocs de saisie : soit fonds recommandés, soit saisie libre
 # ------------------------------------------------------------
-def _add_line_form(port_key: str, label: str):
+def _add_from_reco_block(port_key: str, label: str):
     st.subheader(label)
+    cat = st.selectbox(
+        "Catégorie",
+        ["Core (référence)", "Défensif"],
+        key=f"reco_cat_{port_key}",
+    )
+    if "Core" in cat:
+        fonds_list = RECO_FUNDS_CORE
+    else:
+        fonds_list = RECO_FUNDS_DEF
+    options = [f"{nm} ({isin})" for nm, isin in fonds_list]
+    choice = st.selectbox("Fonds recommandé", options, key=f"reco_choice_{port_key}")
+    idx = options.index(choice) if choice in options else 0
+    name, isin = fonds_list[idx]
 
-    col_select, col_rest = st.columns([2, 3])
-
-    with col_select:
-        reco_choice = st.selectbox(
-            "Fonds recommandé (optionnel)",
-            ["Aucun"] + [f"{nm} ({isin})" for nm, isin in RECO_FUNDS_CORE + RECO_FUNDS_DEF],
-            key=f"reco_select_{port_key}",
+    c1, c2 = st.columns([2, 2])
+    with c1:
+        amount = st.text_input("Montant investi (brut) €", value="", key=f"reco_amt_{port_key}")
+    with c2:
+        buy_date = st.date_input(
+            "Date d’achat",
+            value=pd.Timestamp("2024-01-02").date(),
+            key=f"reco_date_{port_key}",
         )
+    px = st.text_input("Prix d’achat (optionnel)", value="", key=f"reco_px_{port_key}")
 
-    with col_rest:
-        with st.form(key=f"form_add_{port_key}", clear_on_submit=False):
-            c1, c2 = st.columns([3, 2])
-            with c1:
-                name = st.text_input("Nom du fonds (libre)", value="")
-                isin = st.text_input("ISIN ou code (peut être 'EUROFUND')", value="")
-            with c2:
-                amount = st.text_input("Montant investi (brut) €", value="")
-                buy_date = st.date_input("Date d’achat", value=pd.Timestamp("2024-01-02").date())
-            px = st.text_input("Prix d’achat (optionnel)", value="")
-            note = st.text_input("Note (optionnel)", value="")
-            add_btn = st.form_submit_button("➕ Ajouter cette ligne")
+    if st.button("➕ Ajouter ce fonds recommandé", key=f"reco_add_{port_key}"):
+        try:
+            amt = float(str(amount).replace(" ", "").replace(",", "."))
+            assert amt > 0
+        except Exception:
+            st.warning("Montant invalide.")
+            return
+        ln = {
+            "name": name,
+            "isin": isin,
+            "amount_gross": float(amt),
+            "buy_date": pd.Timestamp(buy_date),
+            "buy_px": float(str(px).replace(",", ".")) if px.strip() else "",
+            "note": "",
+            "sym_used": "",
+        }
+        st.session_state[port_key].append(ln)
+        st.success("Fonds recommandé ajouté.")
+
+
+def _add_line_form_free(port_key: str, label: str):
+    st.subheader(label)
+    with st.form(key=f"form_add_free_{port_key}", clear_on_submit=False):
+        c1, c2 = st.columns([3, 2])
+        with c1:
+            name = st.text_input("Nom du fonds (libre)", value="")
+            isin = st.text_input("ISIN ou code (peut être 'EUROFUND')", value="")
+        with c2:
+            amount = st.text_input("Montant investi (brut) €", value="")
+            buy_date = st.date_input(
+                "Date d’achat",
+                value=pd.Timestamp("2024-01-02").date(),
+            )
+        px = st.text_input("Prix d’achat (optionnel)", value="")
+        note = st.text_input("Note (optionnel)", value="")
+        add_btn = st.form_submit_button("➕ Ajouter cette ligne")
 
     if not add_btn:
         return
 
-    # Si un fonds recommandé est choisi, on override nom/ISIN
-    if reco_choice != "Aucun":
-        all_funds = RECO_FUNDS_CORE + RECO_FUNDS_DEF
-        idx = [f"{nm} ({isin})" for nm, isin in all_funds].index(reco_choice)
-        name_reco, isin_reco = all_funds[idx]
-        name_final = name_reco
-        isin_final = isin_reco
-    else:
-        isin_final = isin.strip()
-        name_final = name.strip()
+    isin_final = isin.strip()
+    name_final = name.strip()
 
-        # Si pas de nom mais un ISIN/code : on essaie de récupérer le nom via EODHD
-        if not name_final and isin_final:
-            res = eodhd_search(isin_final)
-            match = None
-            for it in res:
-                if it.get("ISIN") == isin_final:
-                    match = it
-                    break
-            if match is None and res:
-                match = res[0]
-            if match:
-                name_final = match.get("Name", isin_final)
+    # Si pas de nom mais un ISIN/code : on essaie de récupérer le nom via EODHD
+    if not name_final and isin_final:
+        res = eodhd_search(isin_final)
+        match = None
+        for it in res:
+            if it.get("ISIN") == isin_final:
+                match = it
+                break
+        if match is None and res:
+            match = res[0]
+        if match:
+            name_final = match.get("Name", isin_final)
 
-        if not name_final and isin_final.upper() == "EUROFUND":
-            name_final = "Fonds en euros (EUROFUND)"
+    if not name_final and isin_final.upper() == "EUROFUND":
+        name_final = "Fonds en euros (EUROFUND)"
 
-        if not name_final:
-            name_final = isin_final or "—"
+    if not name_final:
+        name_final = isin_final or "—"
 
     try:
         amt = float(str(amount).replace(" ", "").replace(",", "."))
@@ -676,9 +706,7 @@ st.session_state.setdefault("ONE_A_DATE", pd.Timestamp("2024-07-01").date())
 st.session_state.setdefault("ONE_B_DATE", pd.Timestamp("2024-07-01").date())
 st.session_state.setdefault("ALLOC_MODE", "equal")
 
-# ------------------------------------------------------------
 # Sidebar : fonds euros, frais, versements, règle d'affectation
-# ------------------------------------------------------------
 with st.sidebar:
     st.header("Fonds en euros — Paramètre global")
     EURO_RATE = st.number_input(
@@ -765,26 +793,30 @@ with st.sidebar:
         help="Répartition des versements entre les lignes.",
     )
 
-# ------------------------------------------------------------
-# Colonne centrale/droite : composition + résultats
-# ------------------------------------------------------------
+# Onglets principaux : Client / Valority
 tabs = st.tabs(["Portefeuille Client", "Portefeuille Valority"])
 
 with tabs[0]:
-    _add_line_form("A_lines", "Portefeuille 1 — Client : saisie libre ou fonds recommandés")
+    subtabs = st.tabs(["Fonds recommandés", "Saisie libre"])
+    with subtabs[0]:
+        _add_from_reco_block("A_lines", "Ajouter un fonds recommandé (Client)")
+    with subtabs[1]:
+        _add_line_form_free("A_lines", "Portefeuille 1 — Client : saisie libre")
     st.markdown("#### Lignes actuelles — Portefeuille Client")
     for i, ln in enumerate(st.session_state.get("A_lines", [])):
         _line_card(ln, i, "A_lines")
 
 with tabs[1]:
-    _add_line_form("B_lines", "Portefeuille 2 — Valority : saisie libre ou fonds recommandés")
+    subtabs = st.tabs(["Fonds recommandés", "Saisie libre"])
+    with subtabs[0]:
+        _add_from_reco_block("B_lines", "Ajouter un fonds recommandé (Valority)")
+    with subtabs[1]:
+        _add_line_form_free("B_lines", "Portefeuille 2 — Valority : saisie libre")
     st.markdown("#### Lignes actuelles — Portefeuille Valority")
     for i, ln in enumerate(st.session_state.get("B_lines", [])):
         _line_card(ln, i, "B_lines")
 
-# ------------------------------------------------------------
 # Simulation des deux portefeuilles
-# ------------------------------------------------------------
 custom_weights_A = {id(ln): 1.0 for ln in st.session_state.get("A_lines", [])}
 custom_weights_B = {id(ln): 1.0 for ln in st.session_state.get("B_lines", [])}
 single_target_A = id(st.session_state["A_lines"][0]) if st.session_state["A_lines"] else None
@@ -814,9 +846,7 @@ dfB, brutB, netB, valB, xirrB, startB_min, fullB = simulate_portfolio(
     st.session_state.get("FEE_B", 0.0),
 )
 
-# ------------------------------------------------------------
-# Graphique : on commence quand les deux portefeuilles sont 100 % investis
-# ------------------------------------------------------------
+# Graphique (on commence quand les deux portefeuilles sont entièrement investis)
 full_dates = [d for d in [fullA, fullB] if isinstance(d, pd.Timestamp)]
 start_plot = max(full_dates) if full_dates else TODAY
 
@@ -840,9 +870,7 @@ else:
     ).properties(height=360, width="container")
     st.altair_chart(base, use_container_width=True)
 
-# ------------------------------------------------------------
-# Synthèse : montants + rendement total & annualisé
-# ------------------------------------------------------------
+# Synthèse chiffrée
 st.subheader("Synthèse chiffrée")
 
 c1, c2, c3, c4, c5, c6 = st.columns(6)
@@ -859,7 +887,6 @@ with c5:
 with c6:
     st.metric("Valeur actuelle (Valority)", to_eur(valB))
 
-# Rendements simples + annualisés
 perf_tot_client = (valA / netA - 1.0) * 100.0 if netA > 0 else None
 perf_tot_valority = (valB / netB - 1.0) * 100.0 if netB > 0 else None
 
@@ -896,20 +923,18 @@ st.markdown("- Gain de valeur vs portefeuille client : " + to_eur(gain_vs_client
 if delta_xirr is not None:
     st.markdown(f"- Surperformance annualisée (Δ XIRR) : {delta_xirr:+.2f}%")
 
-# ------------------------------------------------------------
 # Tables positions
-# ------------------------------------------------------------
 positions_table("Portefeuille 1 — Client", "A_lines")
 positions_table("Portefeuille 2 — Valority", "B_lines")
 
 with st.expander("Aide rapide"):
     st.markdown(
         """
-- Ajoutez les lignes dans chaque portefeuille (client / Valority) depuis les onglets ci-dessus.
-- Vous pouvez choisir un **fonds recommandé** ou saisir un **ISIN / code** (ex : EASYN).
+- Dans chaque portefeuille, vous pouvez **soit** ajouter des *fonds recommandés* (onglet dédié),
+  **soit** utiliser la *saisie libre* avec ISIN / code.
 - Pour le **fonds en euros**, utilisez le symbole **EUROFUND** (taux paramétrable dans la barre de gauche).
-- Les frais d’entrée s’appliquent sur chaque investissement (initial, mensuel, ponctuel).
+- Les frais d’entrée s’appliquent à chaque investissement.
 - Le **rendement total** est la performance globale depuis l’origine (valeur actuelle / net investi).
-- Le **rendement annualisé** repose sur le calcul XIRR (prise en compte des dates et montants des flux).
+- Le **rendement annualisé** utilise le XIRR (prise en compte des dates et montants).
         """
     )

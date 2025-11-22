@@ -172,6 +172,7 @@ def get_price_series(isin_or_name: str, start: Optional[pd.Timestamp], euro_rate
     if not val:
         return pd.DataFrame(), "", json.dumps(debug)
 
+    # Fonds en euros synthétique
     if val.upper() == "EUROFUND":
         idx = pd.bdate_range(start=pd.Timestamp("2000-01-03"), end=pd.Timestamp.today().normalize(), freq="B")
         df = pd.DataFrame({"Close": 1.0}, index=idx)
@@ -274,13 +275,13 @@ def simulate_portfolio(
     eff_buy_date: Dict[int, pd.Timestamp] = {}
     buy_price_used: Dict[int, float] = {}
 
+    # Prix et dates effectives d'achat
     for ln in lines:
         key_id = id(ln)
         df, sym, _ = get_price_series(ln.get("isin") or ln.get("name"), None, euro_rate)
         if df.empty:
             continue
         ln["sym_used"] = sym
-
         d_buy = pd.Timestamp(ln["buy_date"])
         if d_buy in df.index:
             px_buy = float(df.loc[d_buy, "Close"])
@@ -293,10 +294,8 @@ def simulate_portfolio(
             else:
                 px_buy = float(after.iloc[0]["Close"])
                 eff_dt = after.index[0]
-
         px_manual = ln.get("buy_px", None)
         px_for_qty = float(px_manual) if (px_manual not in (None, "", 0, "0")) else px_buy
-
         price_map[key_id] = df["Close"].astype(float)
         eff_buy_date[key_id] = eff_dt
         buy_price_used[key_id] = px_for_qty
@@ -316,7 +315,7 @@ def simulate_portfolio(
     total_net = 0.0
     cash_flows: List[Tuple[pd.Timestamp, float]] = []
 
-    # achats initiaux
+    # Achats initiaux
     for ln in lines:
         key_id = id(ln)
         if key_id not in prices.columns:
@@ -333,7 +332,7 @@ def simulate_portfolio(
             total_net += net
             cash_flows.append((tgt, -brut))
 
-    # versement ponctuel
+    # Versement ponctuel
     weights = _weights_for(lines, alloc_mode, custom_weights, single_target)
     if one_amt_gross > 0:
         dt = pd.Timestamp(one_date)
@@ -357,7 +356,7 @@ def simulate_portfolio(
             total_net += float(net_amt)
             cash_flows.append((dt, -float(one_amt_gross)))
 
-    # mensuels
+    # Mensuels
     if monthly_amt_gross > 0:
         sched = _month_schedule(start_min, TODAY)
         for dt in sched:
@@ -500,32 +499,88 @@ def positions_table(title: str, port_key: str):
         )
 
 # ---------------------------------------------------------------------
-# Saisie : libre, collage tableau, fonds recommandés, fonds externes
+# Saisie : UN SEUL bloc par portefeuille
+#  - choix "Fonds recommandés" OU "Saisie libre"
 # ---------------------------------------------------------------------
 def _add_line_form(port_key: str, label: str):
     st.subheader(label)
-    with st.form(key=f"form_add_{port_key}", clear_on_submit=False):
+
+    # Choix de la source du fonds
+    source = st.radio(
+        "Type de fonds",
+        ["Fonds recommandés", "Saisie libre"],
+        horizontal=True,
+        key=f"src_{port_key}",
+    )
+
+    name = ""
+    isin = ""
+
+    if source == "Fonds recommandés":
+        cat = st.selectbox(
+            "Catégorie",
+            ["Core (référence)", "Défensif"],
+            key=f"cat_{port_key}"
+        )
+        if "Core" in cat:
+            fonds_list = RECO_FUNDS_CORE
+        else:
+            fonds_list = RECO_FUNDS_DEF
+        options = [f"{nm} ({code})" for nm, code in fonds_list]
+        choice = st.selectbox("Fonds recommandé", options, key=f"reco_choice_{port_key}")
+        idx = options.index(choice) if choice in options else 0
+        name, isin = fonds_list[idx]
+    else:
         c1, c2 = st.columns([3, 2])
         with c1:
-            name = st.text_input("Nom du fonds (ou 'EUROFUND')", value="", key=f"name_{port_key}")
-            isin = st.text_input("ISIN (peut être 'EUROFUND')", value="", key=f"isin_{port_key}")
+            name = st.text_input(
+                "Nom du fonds (ou 'EUROFUND')",
+                value="",
+                key=f"name_{port_key}"
+            )
         with c2:
-            amount = st.text_input("Montant investi (brut) €", value="", key=f"amt_{port_key}")
-            buy_date = st.date_input("Date d’achat", value=pd.Timestamp("2024-01-02").date(), key=f"date_{port_key}")
-        px = st.text_input("Prix d’achat (optionnel)", value="", key=f"px_{port_key}")
-        note = st.text_input("Note (optionnel)", value="", key=f"note_{port_key}")
-        add_btn = st.form_submit_button("➕ Ajouter cette ligne")
+            isin = st.text_input(
+                "ISIN (peut être 'EUROFUND')",
+                value="",
+                key=f"isin_{port_key}"
+            )
+
+    c3, c4 = st.columns([2, 2])
+    with c3:
+        amount = st.text_input(
+            "Montant investi (brut) €",
+            value="",
+            key=f"amt_{port_key}"
+        )
+    with c4:
+        buy_date = st.date_input(
+            "Date d’achat",
+            value=pd.Timestamp("2024-01-02").date(),
+            key=f"date_{port_key}"
+        )
+
+    px = st.text_input("Prix d’achat (optionnel)", value="", key=f"px_{port_key}")
+    note = st.text_input("Note (optionnel)", value="", key=f"note_{port_key}")
+
+    add_btn = st.button("➕ Ajouter cette ligne", key=f"add_{port_key}")
 
     if add_btn:
+        # Vérif montant
         try:
             amt = float(str(amount).replace(" ", "").replace(",", "."))
             assert amt > 0
         except Exception:
             st.warning("Montant invalide.")
             return
+
+        # Si fonds recommandé, on a déjà name/isin définis
+        # Si saisie libre, on prend ce qui est saisi (au minimum un ISIN ou un nom)
+        final_name = (name or isin or "—").strip()
+        final_isin = (isin or name).strip()
+
         ln = {
-            "name": name.strip() or isin.strip() or "—",
-            "isin": isin.strip() or name.strip(),
+            "name": final_name,
+            "isin": final_isin,
             "amount_gross": float(amt),
             "buy_date": pd.Timestamp(buy_date),
             "buy_px": float(str(px).replace(",", ".")) if px.strip() else "",
@@ -534,7 +589,6 @@ def _add_line_form(port_key: str, label: str):
         }
         st.session_state[port_key].append(ln)
         st.success("Ligne ajoutée.")
-
 
 def _paste_table_block(port_key: str, label: str):
     st.subheader(f"{label} — Coller un tableau")
@@ -573,101 +627,6 @@ def _paste_table_block(port_key: str, label: str):
             st.session_state[f"preview_{port_key}"] = []
             st.success("Lignes ajoutées.")
 
-
-def _add_from_reco_block(port_key: str, label: str):
-    st.subheader(label)
-    cat = st.selectbox(
-        "Catégorie",
-        ["Core (référence)", "Défensif"],
-        key=f"reco_cat_{port_key}"
-    )
-    if "Core" in cat:
-        fonds_list = RECO_FUNDS_CORE
-    else:
-        fonds_list = RECO_FUNDS_DEF
-    options = [f"{nm} ({isin})" for nm, isin in fonds_list]
-    choice = st.selectbox("Fonds recommandé", options, key=f"reco_choice_{port_key}")
-    idx = options.index(choice) if choice in options else 0
-    name, isin = fonds_list[idx]
-
-    c1, c2 = st.columns([2, 2])
-    with c1:
-        amount = st.text_input("Montant investi (brut) €", value="", key=f"reco_amt_{port_key}")
-    with c2:
-        buy_date = st.date_input("Date d’achat", value=pd.Timestamp("2024-01-02").date(), key=f"reco_date_{port_key}")
-    px = st.text_input("Prix d’achat (optionnel)", value="", key=f"reco_px_{port_key}")
-
-    if st.button("➕ Ajouter ce fonds recommandé", key=f"reco_add_{port_key}"):
-        try:
-            amt = float(str(amount).replace(" ", "").replace(",", "."))
-            assert amt > 0
-        except Exception:
-            st.warning("Montant invalide.")
-            return
-        ln = {
-            "name": name,
-            "isin": isin,
-            "amount_gross": float(amt),
-            "buy_date": pd.Timestamp(buy_date),
-            "buy_px": float(str(px).replace(",", ".")) if px.strip() else "",
-            "note": "",
-            "sym_used": ""
-        }
-        st.session_state[port_key].append(ln)
-        st.success("Fonds recommandé ajouté.")
-
-
-def _add_external_isin_block(port_key: str, label: str):
-    st.subheader(label)
-    isin = st.text_input("ISIN du fonds externe", key=f"ext_isin_{port_key}")
-    if st.button("🔎 Chercher le fonds", key=f"ext_search_{port_key}"):
-        res = eodhd_search(isin)
-        match = None
-        for it in res:
-            if it.get("ISIN") == isin:
-                match = it
-                break
-        if match is None and res:
-            match = res[0]
-        if match:
-            st.session_state[f"ext_found_{port_key}"] = {
-                "name": match.get("Name", isin),
-                "isin": isin
-            }
-        else:
-            st.warning("Aucun fonds trouvé pour cet ISIN.")
-            st.session_state[f"ext_found_{port_key}"] = None
-
-    data = st.session_state.get(f"ext_found_{port_key}")
-    if data:
-        st.markdown(f"Fonds trouvé : **{data['name']}** (`{data['isin']}`)")
-        with st.form(key=f"form_ext_{port_key}", clear_on_submit=False):
-            c1, c2 = st.columns([2, 2])
-            with c1:
-                amount = st.text_input("Montant investi (brut) €", value="", key=f"ext_amt_{port_key}")
-            with c2:
-                buy_date = st.date_input("Date d’achat", value=pd.Timestamp("2024-01-02").date(), key=f"ext_date_{port_key}")
-            px = st.text_input("Prix d’achat (optionnel)", value="", key=f"ext_px_{port_key}")
-            ok = st.form_submit_button("➕ Ajouter ce fonds externe")
-        if ok:
-            try:
-                amt = float(str(amount).replace(" ", "").replace(",", "."))
-                assert amt > 0
-            except Exception:
-                st.warning("Montant invalide.")
-                return
-            ln = {
-                "name": data["name"],
-                "isin": data["isin"],
-                "amount_gross": float(amt),
-                "buy_date": pd.Timestamp(buy_date),
-                "buy_px": float(str(px).replace(",", ".")) if px.strip() else "",
-                "note": "",
-                "sym_used": ""
-            }
-            st.session_state[port_key].append(ln)
-            st.success("Fonds externe ajouté.")
-
 # ---------------------------------------------------------------------
 # Layout principal
 # ---------------------------------------------------------------------
@@ -688,7 +647,7 @@ st.session_state.setdefault("ONE_A_DATE", pd.Timestamp("2024-07-01").date())
 st.session_state.setdefault("ONE_B_DATE", pd.Timestamp("2024-07-01").date())
 st.session_state.setdefault("ALLOC_MODE", "equal")
 
-# Sidebar : fonds €, frais, versements, règle d'affectation (inchangé)
+# Sidebar : fonds €, frais, versements, règle d'affectation
 with st.sidebar:
     st.header("Fonds en euros — Paramètre global")
     EURO_RATE = st.number_input(
@@ -705,7 +664,7 @@ with st.sidebar:
         0.10, key="FEE_A"
     )
     FEE_B = st.number_input(
-        "Frais d’entrée — Portefeuille 2 (Vous / Valority)",
+        "Frais d’entrée — Portefeuille 2 (Valority)",
         0.0, 10.0, st.session_state.get("FEE_B", 2.0),
         0.10, key="FEE_B"
     )
@@ -731,23 +690,17 @@ with st.sidebar:
     )
 
 # ---------------------------------------------------------------------
-# Zone centrale : d'abord composition (onglets), puis comparateur
+# Zone centrale : onglets de composition, puis comparateur
 # ---------------------------------------------------------------------
-
-# Onglets de composition des portefeuilles
 st.markdown("## Composition des portefeuilles")
 tab_client, tab_valority = st.tabs(["Portefeuille Client", "Portefeuille Valority"])
 
 with tab_client:
-    _add_from_reco_block("A_lines", "Ajouter un fonds recommandé (Client)")
-    _add_external_isin_block("A_lines", "Ajouter un fonds externe (Client)")
-    _add_line_form("A_lines", "Portefeuille 1 — Client : saisie libre")
+    _add_line_form("A_lines", "Portefeuille 1 — Client : saisie libre / fonds recommandés")
     _paste_table_block("A_lines", "Portefeuille 1 — Client")
 
 with tab_valority:
-    _add_from_reco_block("B_lines", "Ajouter un fonds recommandé (Valority)")
-    _add_external_isin_block("B_lines", "Ajouter un fonds externe (Valority)")
-    _add_line_form("B_lines", "Portefeuille 2 — Valority : saisie libre")
+    _add_line_form("B_lines", "Portefeuille 2 — Valority : saisie libre / fonds recommandés")
     _paste_table_block("B_lines", "Portefeuille 2 — Valority")
 
 # ---------------------------------------------------------------------
@@ -843,9 +796,9 @@ positions_table("Portefeuille 2 — Valority (positions)", "B_lines")
 with st.expander("Aide rapide"):
     st.markdown(
         '''
-- Définissez la composition dans les onglets **Portefeuille Client** et **Portefeuille Valority** (fonds recommandés, ISIN externe ou saisie libre).
-- Fonds en euros : utilisez le symbole **EUROFUND** (taux paramétrable dans la barre latérale).
-- Frais d’entrée et versements se paramètrent dans la barre latérale.
-- Le XIRR est calculé à partir des flux bruts (investissements) et de la valeur finale simulée.
+- Dans chaque onglet, ajoutez des lignes en **choisissant un fonds recommandé** (Core / Défensif, y compris EUROFUND) ou via **saisie libre** (Nom + ISIN).
+- Le taux du fonds en euros, les frais d’entrée et les versements se règlent dans la barre latérale.
+- Les versements suivent la règle d’affectation choisie (equal / custom / single).
+- Le XIRR est calculé à partir des flux bruts investis et de la valeur finale simulée.
 '''
     )

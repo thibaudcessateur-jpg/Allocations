@@ -26,8 +26,8 @@ RECO_FUNDS_CORE = [
 RECO_FUNDS_DEF = [
     ("Fonds en euros (EUROFUND)", "EUROFUND"),
     ("SYCOYIELD 2030 RC", "FR001400MCQ6"),
-    ("R-Co Target 2029 HY", "FR0014002XJ3"),   # à corriger si besoin
-    ("Euro Bond 1-3 Years", "LU0321462953"),   # exemple générique
+    ("R-Co Target 2029 HY", "FR0014002XJ3"),
+    ("Euro Bond 1-3 Years", "LU0321462953"),
 ]
 
 # ---------------------------------------------------------------------
@@ -167,6 +167,10 @@ def _get_close_on(df: pd.DataFrame, d: pd.Timestamp) -> float:
 
 @st.cache_data(show_spinner=False, ttl=3600)
 def get_price_series(isin_or_name: str, start: Optional[pd.Timestamp], euro_rate: float) -> Tuple[pd.DataFrame, str, str]:
+    """
+    EUROFUND : VL qui croît dans le temps au taux euro_rate (%/an),
+    via (1 + r) ** (delta_days / 365.25).
+    """
     debug = {"cands": []}
     val = str(isin_or_name).strip()
     if not val:
@@ -175,7 +179,14 @@ def get_price_series(isin_or_name: str, start: Optional[pd.Timestamp], euro_rate
     # Fonds en euros synthétique
     if val.upper() == "EUROFUND":
         idx = pd.bdate_range(start=pd.Timestamp("2000-01-03"), end=pd.Timestamp.today().normalize(), freq="B")
-        df = pd.DataFrame({"Close": 1.0}, index=idx)
+        r = 0.0
+        try:
+            r = max(0.0, float(euro_rate) / 100.0)
+        except Exception:
+            r = 0.0
+        days = (idx - idx[0]).days.astype(float)
+        close = (1.0 + r) ** (days / 365.25)
+        df = pd.DataFrame({"Close": close}, index=idx)
         if start is not None:
             df = df.loc[df.index >= start]
         return df, "EUROFUND", json.dumps(debug)
@@ -240,17 +251,15 @@ def compute_line_metrics(line: Dict[str, Any], fee_pct: float, euro_rate: float)
     buy_ts = pd.Timestamp(line.get("buy_date"))
     px_manual = line.get("buy_px", None)
 
-    if str(line.get("sym_used", "")).upper() == "EUROFUND" or str(line.get("isin", "")).upper() == "EUROFUND":
-        px = 1.0
-    else:
-        dfp, _, _ = get_price_series(line.get("isin") or line.get("name"), buy_ts, euro_rate)
-        if px_manual not in (None, "", 0, "0"):
-            try:
-                px = float(px_manual)
-            except Exception:
-                px = _get_close_on(dfp, buy_ts)
-        else:
+    # Plus de cas spécial "EUROFUND" : on utilise la vraie série de prix
+    dfp, _, _ = get_price_series(line.get("isin") or line.get("name"), buy_ts, euro_rate)
+    if px_manual not in (None, "", 0, "0"):
+        try:
+            px = float(px_manual)
+        except Exception:
             px = _get_close_on(dfp, buy_ts)
+    else:
+        px = _get_close_on(dfp, buy_ts)
 
     qty = (net_amt / px) if px and px > 0 else 0.0
     return float(net_amt), float(px), float(qty)
@@ -565,7 +574,6 @@ def _add_line_form(port_key: str, label: str):
     add_btn = st.button("➕ Ajouter cette ligne", key=f"add_{port_key}")
 
     if add_btn:
-        # Vérif montant
         try:
             amt = float(str(amount).replace(" ", "").replace(",", "."))
             assert amt > 0
@@ -573,8 +581,6 @@ def _add_line_form(port_key: str, label: str):
             st.warning("Montant invalide.")
             return
 
-        # Si fonds recommandé, on a déjà name/isin définis
-        # Si saisie libre, on prend ce qui est saisi (au minimum un ISIN ou un nom)
         final_name = (name or isin or "—").strip()
         final_isin = (isin or name).strip()
 
@@ -589,43 +595,6 @@ def _add_line_form(port_key: str, label: str):
         }
         st.session_state[port_key].append(ln)
         st.success("Ligne ajoutée.")
-
-def _paste_table_block(port_key: str, label: str):
-    st.subheader(f"{label} — Coller un tableau")
-    st.caption("Format attendu : Nom;ISIN;Montant (séparateur ';').")
-    txt = st.text_area("Coller ici :", value="", height=120, key=f"paste_{port_key}")
-    if st.button("👀 Prévisualiser", key=f"prev_{port_key}"):
-        rows = []
-        for raw in txt.strip().splitlines():
-            parts = [p.strip() for p in raw.split(";")]
-            if len(parts) < 3:
-                continue
-            nm, isinn, amt = parts[0], parts[1], parts[2]
-            try:
-                a = float(str(amt).replace(" ", "").replace(",", "."))
-            except Exception:
-                a = 0.0
-            rows.append({"name": nm, "isin": isinn, "amount_gross": a})
-        st.session_state[f"preview_{port_key}"] = rows
-
-    prev = st.session_state.get(f"preview_{port_key}", [])
-    if prev:
-        st.success(f"{len(prev)} ligne(s) détectée(s).")
-        dfp = pd.DataFrame(prev)
-        st.dataframe(dfp, hide_index=True, use_container_width=True)
-        if st.button("➕ Ajouter ces lignes", key=f"addprev_{port_key}"):
-            for r in prev:
-                st.session_state[port_key].append({
-                    "name": r["name"],
-                    "isin": r["isin"],
-                    "amount_gross": float(r["amount_gross"]),
-                    "buy_date": pd.Timestamp("2024-01-02"),
-                    "buy_px": "",
-                    "note": "",
-                    "sym_used": ""
-                })
-            st.session_state[f"preview_{port_key}"] = []
-            st.success("Lignes ajoutées.")
 
 # ---------------------------------------------------------------------
 # Layout principal
@@ -697,11 +666,9 @@ tab_client, tab_valority = st.tabs(["Portefeuille Client", "Portefeuille Valorit
 
 with tab_client:
     _add_line_form("A_lines", "Portefeuille 1 — Client : saisie libre / fonds recommandés")
-    _paste_table_block("A_lines", "Portefeuille 1 — Client")
 
 with tab_valority:
     _add_line_form("B_lines", "Portefeuille 2 — Valority : saisie libre / fonds recommandés")
-    _paste_table_block("B_lines", "Portefeuille 2 — Valority")
 
 # ---------------------------------------------------------------------
 # Simulation des deux portefeuilles
@@ -796,7 +763,7 @@ positions_table("Portefeuille 2 — Valority (positions)", "B_lines")
 with st.expander("Aide rapide"):
     st.markdown(
         '''
-- Dans chaque onglet, ajoutez des lignes en **choisissant un fonds recommandé** (Core / Défensif, y compris EUROFUND) ou via **saisie libre** (Nom + ISIN).
+- Dans chaque onglet, ajoutez des lignes en choisissant un **fonds recommandé** (Core / Défensif, y compris EUROFUND) ou via **saisie libre** (Nom + ISIN).
 - Le taux du fonds en euros, les frais d’entrée et les versements se règlent dans la barre latérale.
 - Les versements suivent la règle d’affectation choisie (equal / custom / single).
 - Le XIRR est calculé à partir des flux bruts investis et de la valeur finale simulée.

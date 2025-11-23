@@ -201,6 +201,9 @@ def get_price_series(
             df = df.loc[df.index >= start]
         return df, "EUROFUND", json.dumps(debug)
 
+        # (note : ce return interrompt la suite pour EUROFUND,
+        # donc le reste ne s'applique qu'aux autres fonds)
+
     cands = _symbol_candidates(val)
     debug["cands"] = cands
     for sym in cands:
@@ -1106,14 +1109,7 @@ if chart_df.dropna().empty:
     st.info("Ajoutez des lignes et/ou vérifiez vos paramètres pour afficher le graphique.")
 else:
     base = alt.Chart(chart_df).mark_line().encode(
-        x=alt.X(
-            "Date:T",
-            title="Date",
-            axis=alt.Axis(
-                format="%d/%m/%Y",  # affichage jour/mois/année
-                tickCount="year",   # un tick par année pour éviter "April / October"
-            ),
-        ),
+        x=alt.X("Date:T", title="Date"),
         y=alt.Y("Valeur (€):Q", title="Valeur (€)"),
         color="variable:N",
     ).properties(height=360, width="container")

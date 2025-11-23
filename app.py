@@ -206,6 +206,29 @@ def get_price_series(
 
 
 # ------------------------------------------------------------
+# Alternatives si date < 1ère VL  # >>> NEW
+# ------------------------------------------------------------
+def suggest_alternative_funds(buy_date: pd.Timestamp, euro_rate: float) -> List[Tuple[str, str, pd.Timestamp]]:
+    """
+    Propose des fonds recommandés (core + défensifs) dont la première VL
+    est antérieure ou égale à la date d'achat donnée.
+    Retourne (nom, isin, date_inception).
+    """
+    alternatives: List[Tuple[str, str, pd.Timestamp]] = []
+    universe = RECO_FUNDS_CORE + RECO_FUNDS_DEF
+
+    for name, isin in universe:
+        df, _, _ = get_price_series(isin, None, euro_rate)
+        if df.empty:
+            continue
+        inception = df.index.min()
+        if inception <= buy_date:
+            alternatives.append((name, isin, inception))
+
+    return alternatives
+
+
+# ------------------------------------------------------------
 # Calendrier versements & poids
 # ------------------------------------------------------------
 def _month_schedule(d0: pd.Timestamp, d1: pd.Timestamp) -> List[pd.Timestamp]:
@@ -275,7 +298,7 @@ def compute_line_metrics(
 
 
 # ------------------------------------------------------------
-# Simulation d'un portefeuille
+# Simulation d'un portefeuille (avec contrôle 1ère VL)  # >>> MODIFIÉ
 # ------------------------------------------------------------
 def simulate_portfolio(
     lines: List[Dict[str, Any]],
@@ -287,6 +310,7 @@ def simulate_portfolio(
     single_target: Optional[int],
     euro_rate: float,
     fee_pct: float,
+    portfolio_label: str = "",  # >>> NEW (pour les messages)
 ) -> Tuple[pd.DataFrame, float, float, float, Optional[float], pd.Timestamp, pd.Timestamp]:
     if not lines:
         return pd.DataFrame(), 0.0, 0.0, 0.0, None, TODAY, TODAY
@@ -295,13 +319,49 @@ def simulate_portfolio(
     eff_buy_date: Dict[int, pd.Timestamp] = {}
     buy_price_used: Dict[int, float] = {}
 
+    invalid_found = False  # >>> NEW
+    date_warnings = st.session_state.setdefault("DATE_WARNINGS", [])  # >>> NEW
+
     for ln in lines:
         key_id = id(ln)
-        df, sym, _ = get_price_series(ln.get("isin") or ln.get("name"), None, euro_rate)
-        if df.empty:
+        # On récupère toute l'historique pour contrôler la date de 1ère VL
+        df_full, sym, _ = get_price_series(ln.get("isin") or ln.get("name"), None, euro_rate)
+        if df_full.empty:
             continue
-        ln["sym_used"] = sym
+
+        inception = df_full.index.min()
         d_buy = pd.Timestamp(ln["buy_date"])
+
+        # Si la date d'achat est antérieure à la 1ère VL → on ne simule pas ce fonds
+        if d_buy < inception:
+            invalid_found = True
+            ln["invalid_date"] = True
+            ln["inception_date"] = inception
+
+            alts = suggest_alternative_funds(d_buy, euro_rate)
+            if alts:
+                alt_lines = [
+                    f"- {name} ({isin}), historique depuis le {fmt_date(incep)}"
+                    for name, isin, incep in alts
+                ]
+                alt_msg = "\n".join(alt_lines)
+            else:
+                alt_msg = "Aucun fonds recommandé ne dispose d'un historique suffisant pour cette date."
+
+            date_warnings.append(
+                f"[{portfolio_label}] {ln.get('name','(sans nom)')} "
+                f"({ln.get('isin','—')}) :\n"
+                f"- Date d'achat saisie : {fmt_date(d_buy)}\n"
+                f"- 1ère VL disponible : {fmt_date(inception)}\n\n"
+                f"Impossible de simuler ce fonds sur toute la période demandée.\n"
+                f"Propositions d'alternatives pour l'analyse historique :\n{alt_msg}"
+            )
+            continue
+
+        # Si OK, on continue comme avant
+        ln["sym_used"] = sym
+        df = df_full
+
         if d_buy in df.index:
             px_buy = float(df.loc[d_buy, "Close"])
             eff_dt = d_buy
@@ -319,6 +379,9 @@ def simulate_portfolio(
         eff_buy_date[key_id] = eff_dt
         buy_price_used[key_id] = px_for_qty
 
+    # Si toutes les lignes valides ont sauté (ou aucune) → on retourne vide
+    if invalid_found and not price_map:
+        return pd.DataFrame(), 0.0, 0.0, 0.0, None, TODAY, TODAY
     if not price_map:
         return pd.DataFrame(), 0.0, 0.0, 0.0, None, TODAY, TODAY
 
@@ -428,6 +491,11 @@ def _line_card(line: Dict[str, Any], idx: int, port_key: str):
             st.markdown(f"**{line.get('name','—')}**")
             st.caption(f"ISIN / Code : `{line.get('isin','—')}`")
             st.caption(f"Symbole EODHD : `{line.get('sym_used','—')}`")
+            # >>> NEW : petit rappel visuel si date invalide
+            if line.get("invalid_date"):
+                st.markdown(
+                    f"⚠️ Date d'achat antérieure à la 1ère VL ({fmt_date(line.get('inception_date'))}).",
+                )
         with cols[1]:
             st.markdown(f"Investi (brut)\n\n**{to_eur(line.get('amount_gross', 0.0))}**")
             st.caption(f"Net après frais {fee_pct:.1f}% : **{to_eur(net_amt)}**")
@@ -482,6 +550,9 @@ def _line_card(line: Dict[str, Any], idx: int, port_key: str):
                             line["buy_px"] = ""
                     else:
                         line["buy_px"] = ""
+                    # >>> NEW : on enlève le flag d'invalidité si on corrige la date
+                    line.pop("invalid_date", None)
+                    line.pop("inception_date", None)
                     st.session_state[state_key] = False
                     st.success("Ligne mise à jour.")
                     st.experimental_rerun()
@@ -705,6 +776,7 @@ st.session_state.setdefault("ONE_B", 0.0)
 st.session_state.setdefault("ONE_A_DATE", pd.Timestamp("2024-07-01").date())
 st.session_state.setdefault("ONE_B_DATE", pd.Timestamp("2024-07-01").date())
 st.session_state.setdefault("ALLOC_MODE", "equal")
+st.session_state.setdefault("DATE_WARNINGS", [])  # >>> NEW
 
 # Sidebar : fonds euros, frais, versements, règle d'affectation
 with st.sidebar:
@@ -822,6 +894,9 @@ custom_weights_B = {id(ln): 1.0 for ln in st.session_state.get("B_lines", [])}
 single_target_A = id(st.session_state["A_lines"][0]) if st.session_state["A_lines"] else None
 single_target_B = id(st.session_state["B_lines"][0]) if st.session_state["B_lines"] else None
 
+# Reset warnings avant chaque run  # >>> NEW
+st.session_state["DATE_WARNINGS"] = []
+
 dfA, brutA, netA, valA, xirrA, startA_min, fullA = simulate_portfolio(
     st.session_state.get("A_lines", []),
     st.session_state.get("M_A", 0.0),
@@ -832,6 +907,7 @@ dfA, brutA, netA, valA, xirrA, startA_min, fullA = simulate_portfolio(
     single_target_A,
     st.session_state.get("EURO_RATE_PREVIEW", 2.0),
     st.session_state.get("FEE_A", 0.0),
+    portfolio_label="Client",  # >>> NEW
 )
 
 dfB, brutB, netB, valB, xirrB, startB_min, fullB = simulate_portfolio(
@@ -844,11 +920,21 @@ dfB, brutB, netB, valB, xirrB, startB_min, fullB = simulate_portfolio(
     single_target_B,
     st.session_state.get("EURO_RATE_PREVIEW", 2.0),
     st.session_state.get("FEE_B", 0.0),
+    portfolio_label="Valority",  # >>> NEW
 )
+
+# ------------------------------------------------------------
+# Avertissements sur les dates / 1ère VL  # >>> NEW
+# ------------------------------------------------------------
+if st.session_state.get("DATE_WARNINGS"):
+    with st.expander("⚠️ Problèmes d'historique / dates de VL"):
+        for msg in st.session_state["DATE_WARNINGS"]:
+            st.warning(msg)
 
 # ------------------------------------------------------------
 # Graphique (évolution des portefeuilles)
 # ------------------------------------------------------------
+st.subheader("Évolution de la valeur des portefeuilles")
 full_dates = [d for d in [fullA, fullB] if isinstance(d, pd.Timestamp)]
 start_plot = max(full_dates) if full_dates else TODAY
 
@@ -861,7 +947,6 @@ if not dfB.empty:
 chart_df = chart_df.reset_index().rename(columns={"index": "Date"})
 chart_df = chart_df.melt("Date", var_name="variable", value_name="Valeur (€)")
 
-st.subheader("Évolution de la valeur des portefeuilles")
 if chart_df.dropna().empty:
     st.info("Ajoutez des lignes et/ou vérifiez vos paramètres pour afficher le graphique.")
 else:

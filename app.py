@@ -32,6 +32,13 @@ RECO_FUNDS_DEF = [
     ("Euro Bond 1-3 Years", "LU0321462953"),
 ]
 
+# Libellés FR -> codes internes pour l'affectation des versements
+ALLOC_LABELS = {
+    "Répartition égale": "equal",
+    "Personnalisé": "custom",
+    "Tout sur une ligne": "single",
+}
+
 
 # ------------------------------------------------------------
 # Utils format
@@ -194,6 +201,9 @@ def get_price_series(
             df = df.loc[df.index >= start]
         return df, "EUROFUND", json.dumps(debug)
 
+        # (note : ce return interrompt la suite pour EUROFUND,
+        # donc le reste ne s'applique qu'aux autres fonds)
+
     cands = _symbol_candidates(val)
     debug["cands"] = cands
     for sym in cands:
@@ -206,7 +216,7 @@ def get_price_series(
 
 
 # ------------------------------------------------------------
-# Alternatives si date < 1ère VL  # >>> NEW
+# Alternatives si date < 1ère VL
 # ------------------------------------------------------------
 def suggest_alternative_funds(buy_date: pd.Timestamp, euro_rate: float) -> List[Tuple[str, str, pd.Timestamp]]:
     """
@@ -298,7 +308,8 @@ def compute_line_metrics(
 
 
 # ------------------------------------------------------------
-# Simulation d'un portefeuille (avec contrôle 1ère VL)  # >>> MODIFIÉ
+# Simulation d'un portefeuille (avec contrôle 1ère VL)
+# + distinction poids mensuels / ponctuels
 # ------------------------------------------------------------
 def simulate_portfolio(
     lines: List[Dict[str, Any]],
@@ -306,11 +317,12 @@ def simulate_portfolio(
     one_amt_gross: float,
     one_date: date,
     alloc_mode: str,
-    custom_weights: Dict[int, float],
+    custom_weights_monthly: Optional[Dict[int, float]],
+    custom_weights_oneoff: Optional[Dict[int, float]],
     single_target: Optional[int],
     euro_rate: float,
     fee_pct: float,
-    portfolio_label: str = "",  # >>> NEW (pour les messages)
+    portfolio_label: str = "",
 ) -> Tuple[pd.DataFrame, float, float, float, Optional[float], pd.Timestamp, pd.Timestamp]:
     if not lines:
         return pd.DataFrame(), 0.0, 0.0, 0.0, None, TODAY, TODAY
@@ -319,12 +331,11 @@ def simulate_portfolio(
     eff_buy_date: Dict[int, pd.Timestamp] = {}
     buy_price_used: Dict[int, float] = {}
 
-    invalid_found = False  # >>> NEW
-    date_warnings = st.session_state.setdefault("DATE_WARNINGS", [])  # >>> NEW
+    invalid_found = False
+    date_warnings = st.session_state.setdefault("DATE_WARNINGS", [])
 
     for ln in lines:
         key_id = id(ln)
-        # On récupère toute l'historique pour contrôler la date de 1ère VL
         df_full, sym, _ = get_price_series(ln.get("isin") or ln.get("name"), None, euro_rate)
         if df_full.empty:
             continue
@@ -332,7 +343,6 @@ def simulate_portfolio(
         inception = df_full.index.min()
         d_buy = pd.Timestamp(ln["buy_date"])
 
-        # Si la date d'achat est antérieure à la 1ère VL → on ne simule pas ce fonds
         if d_buy < inception:
             invalid_found = True
             ln["invalid_date"] = True
@@ -358,7 +368,6 @@ def simulate_portfolio(
             )
             continue
 
-        # Si OK, on continue comme avant
         ln["sym_used"] = sym
         df = df_full
 
@@ -379,7 +388,6 @@ def simulate_portfolio(
         eff_buy_date[key_id] = eff_dt
         buy_price_used[key_id] = px_for_qty
 
-    # Si toutes les lignes valides ont sauté (ou aucune) → on retourne vide
     if invalid_found and not price_map:
         return pd.DataFrame(), 0.0, 0.0, 0.0, None, TODAY, TODAY
     if not price_map:
@@ -415,7 +423,19 @@ def simulate_portfolio(
             total_net += net
             cash_flows.append((tgt, -brut))
 
-    weights = _weights_for(lines, alloc_mode, custom_weights, single_target)
+    # Poids pour versements mensuels / ponctuels
+    weights_monthly = _weights_for(
+        lines,
+        alloc_mode,
+        custom_weights_monthly or {},
+        single_target,
+    )
+    weights_oneoff = _weights_for(
+        lines,
+        alloc_mode,
+        custom_weights_oneoff or {},
+        single_target,
+    )
 
     # Versement ponctuel
     if one_amt_gross > 0:
@@ -430,7 +450,7 @@ def simulate_portfolio(
             net_amt = one_amt_gross * (1.0 - fee_pct / 100.0)
             for ln in lines:
                 key_id = id(ln)
-                w = weights.get(key_id, 0.0)
+                w = weights_oneoff.get(key_id, 0.0)
                 if w <= 0 or key_id not in prices.columns:
                     continue
                 px = float(prices.loc[dt, key_id])
@@ -452,7 +472,7 @@ def simulate_portfolio(
             net_m = monthly_amt_gross * (1.0 - fee_pct / 100.0)
             for ln in lines:
                 key_id = id(ln)
-                w = weights.get(key_id, 0.0)
+                w = weights_monthly.get(key_id, 0.0)
                 if w <= 0 or key_id not in prices.columns:
                     continue
                 px = float(prices.loc[dt, key_id])
@@ -491,7 +511,6 @@ def _line_card(line: Dict[str, Any], idx: int, port_key: str):
             st.markdown(f"**{line.get('name','—')}**")
             st.caption(f"ISIN / Code : `{line.get('isin','—')}`")
             st.caption(f"Symbole EODHD : `{line.get('sym_used','—')}`")
-            # >>> NEW : petit rappel visuel si date invalide
             if line.get("invalid_date"):
                 st.markdown(
                     f"⚠️ Date d'achat antérieure à la 1ère VL ({fmt_date(line.get('inception_date'))}).",
@@ -550,7 +569,6 @@ def _line_card(line: Dict[str, Any], idx: int, port_key: str):
                             line["buy_px"] = ""
                     else:
                         line["buy_px"] = ""
-                    # >>> NEW : on enlève le flag d'invalidité si on corrige la date
                     line.pop("invalid_date", None)
                     line.pop("inception_date", None)
                     st.session_state[state_key] = False
@@ -718,7 +736,6 @@ def _add_line_form_free(port_key: str, label: str):
     isin_final = isin.strip()
     name_final = name.strip()
 
-    # Si pas de nom mais un ISIN/code : on essaie de récupérer le nom via EODHD
     if not name_final and isin_final:
         res = eodhd_search(isin_final)
         match = None
@@ -776,7 +793,7 @@ st.session_state.setdefault("ONE_B", 0.0)
 st.session_state.setdefault("ONE_A_DATE", pd.Timestamp("2024-07-01").date())
 st.session_state.setdefault("ONE_B_DATE", pd.Timestamp("2024-07-01").date())
 st.session_state.setdefault("ALLOC_MODE", "equal")
-st.session_state.setdefault("DATE_WARNINGS", [])  # >>> NEW
+st.session_state.setdefault("DATE_WARNINGS", [])
 
 # Sidebar : fonds euros, frais, versements, règle d'affectation
 with st.sidebar:
@@ -856,14 +873,126 @@ with st.sidebar:
             key="ONE_B_DATE",
         )
 
+    # Règle d'affectation en français + stockage en code interne
     st.header("Règle d’affectation des versements")
-    st.selectbox(
+    current_code = st.session_state.get("ALLOC_MODE", "equal")
+    inv_labels = {v: k for k, v in ALLOC_LABELS.items()}
+    current_label = inv_labels.get(current_code, "Répartition égale")
+
+    mode_label = st.selectbox(
         "Mode",
-        ["equal", "custom", "single"],
-        index=["equal", "custom", "single"].index(st.session_state.get("ALLOC_MODE", "equal")),
-        key="ALLOC_MODE",
+        list(ALLOC_LABELS.keys()),
+        index=list(ALLOC_LABELS.keys()).index(current_label),
         help="Répartition des versements entre les lignes.",
     )
+    st.session_state["ALLOC_MODE"] = ALLOC_LABELS[mode_label]
+    alloc_mode_code = st.session_state["ALLOC_MODE"]
+
+    # Si mode personnalisé : détail des versements par ligne + sécurité (Option A)
+    if alloc_mode_code == "custom":
+        st.caption("Paramétrage détaillé des versements personnalisés.")
+
+        # Portefeuille 1 - Client
+        with st.expander("Affectation des versements — Portefeuille 1 (Client)", expanded=False):
+            linesA = st.session_state.get("A_lines", [])
+            if not linesA:
+                st.info("Ajoutez au moins une ligne dans le Portefeuille Client.")
+            else:
+                custom_m_A: Dict[int, float] = {}
+                custom_o_A: Dict[int, float] = {}
+                for i, ln in enumerate(linesA):
+                    label_ligne = ln.get("name") or ln.get("isin") or f"Ligne {i+1}"
+                    m_key = f"CUST_M_A_{i}"
+                    o_key = f"CUST_O_A_{i}"
+
+                    m_val = st.number_input(
+                        f"Mensuel affecté à « {label_ligne} » (€)",
+                        0.0,
+                        1_000_000.0,
+                        value=float(st.session_state.get(m_key, 0.0)),
+                        step=50.0,
+                        key=m_key,
+                    )
+                    o_val = st.number_input(
+                        f"Ponctuel affecté à « {label_ligne} » (€)",
+                        0.0,
+                        1_000_000.0,
+                        value=float(st.session_state.get(o_key, 0.0)),
+                        step=50.0,
+                        key=o_key,
+                    )
+                    custom_m_A[id(ln)] = float(m_val)
+                    custom_o_A[id(ln)] = float(o_val)
+
+                st.session_state["CUSTOM_M_A"] = custom_m_A
+                st.session_state["CUSTOM_O_A"] = custom_o_A
+
+                total_mA = sum(custom_m_A.values())
+                total_oA = sum(custom_o_A.values())
+                M_A_global = st.session_state.get("M_A", 0.0)
+                ONE_A_global = st.session_state.get("ONE_A", 0.0)
+
+                if M_A_global > 0 and abs(total_mA - M_A_global) > 1e-6:
+                    st.warning(
+                        f"Le total des versements mensuels personnalisés est de {to_eur(total_mA)}, "
+                        f"alors que le montant mensuel brut saisi pour le portefeuille Client est de {to_eur(M_A_global)}."
+                    )
+                if ONE_A_global > 0 and abs(total_oA - ONE_A_global) > 1e-6:
+                    st.warning(
+                        f"Le total des versements ponctuels personnalisés est de {to_eur(total_oA)}, "
+                        f"alors que le montant ponctuel brut saisi pour le portefeuille Client est de {to_eur(ONE_A_global)}."
+                    )
+
+        # Portefeuille 2 - Valority
+        with st.expander("Affectation des versements — Portefeuille 2 (Valority)", expanded=False):
+            linesB = st.session_state.get("B_lines", [])
+            if not linesB:
+                st.info("Ajoutez au moins une ligne dans le Portefeuille Valority.")
+            else:
+                custom_m_B: Dict[int, float] = {}
+                custom_o_B: Dict[int, float] = {}
+                for i, ln in enumerate(linesB):
+                    label_ligne = ln.get("name") or ln.get("isin") or f"Ligne {i+1}"
+                    m_key = f"CUST_M_B_{i}"
+                    o_key = f"CUST_O_B_{i}"
+
+                    m_val = st.number_input(
+                        f"Mensuel affecté à « {label_ligne} » (€)",
+                        0.0,
+                        1_000_000.0,
+                        value=float(st.session_state.get(m_key, 0.0)),
+                        step=50.0,
+                        key=m_key,
+                    )
+                    o_val = st.number_input(
+                        f"Ponctuel affecté à « {label_ligne} » (€)",
+                        0.0,
+                        1_000_000.0,
+                        value=float(st.session_state.get(o_key, 0.0)),
+                        step=50.0,
+                        key=o_key,
+                    )
+                    custom_m_B[id(ln)] = float(m_val)
+                    custom_o_B[id(ln)] = float(o_val)
+
+                st.session_state["CUSTOM_M_B"] = custom_m_B
+                st.session_state["CUSTOM_O_B"] = custom_o_B
+
+                total_mB = sum(custom_m_B.values())
+                total_oB = sum(custom_o_B.values())
+                M_B_global = st.session_state.get("M_B", 0.0)
+                ONE_B_global = st.session_state.get("ONE_B", 0.0)
+
+                if M_B_global > 0 and abs(total_mB - M_B_global) > 1e-6:
+                    st.warning(
+                        f"Le total des versements mensuels personnalisés est de {to_eur(total_mB)}, "
+                        f"alors que le montant mensuel brut saisi pour le portefeuille Valority est de {to_eur(M_B_global)}."
+                    )
+                if ONE_B_global > 0 and abs(total_oB - ONE_B_global) > 1e-6:
+                    st.warning(
+                        f"Le total des versements ponctuels personnalisés est de {to_eur(total_oB)}, "
+                        f"alors que le montant ponctuel brut saisi pour le portefeuille Valority est de {to_eur(ONE_B_global)}."
+                    )
 
 # Onglets principaux : Client / Valority
 tabs = st.tabs(["Portefeuille Client", "Portefeuille Valority"])
@@ -889,12 +1018,39 @@ with tabs[1]:
         _line_card(ln, i, "B_lines")
 
 # Simulation des deux portefeuilles
-custom_weights_A = {id(ln): 1.0 for ln in st.session_state.get("A_lines", [])}
-custom_weights_B = {id(ln): 1.0 for ln in st.session_state.get("B_lines", [])}
 single_target_A = id(st.session_state["A_lines"][0]) if st.session_state["A_lines"] else None
 single_target_B = id(st.session_state["B_lines"][0]) if st.session_state["B_lines"] else None
 
-# Reset warnings avant chaque run  # >>> NEW
+# Préparation des poids personnalisés (mensuels / ponctuels)
+alloc_mode_code = st.session_state.get("ALLOC_MODE", "equal")
+
+custom_month_weights_A: Optional[Dict[int, float]] = None
+custom_oneoff_weights_A: Optional[Dict[int, float]] = None
+custom_month_weights_B: Optional[Dict[int, float]] = None
+custom_oneoff_weights_B: Optional[Dict[int, float]] = None
+
+if alloc_mode_code == "custom":
+    # Portefeuille A
+    cmA = st.session_state.get("CUSTOM_M_A", {}) or {}
+    coA = st.session_state.get("CUSTOM_O_A", {}) or {}
+    tot_mA = sum(v for v in cmA.values() if v > 0)
+    tot_oA = sum(v for v in coA.values() if v > 0)
+    if tot_mA > 0:
+        custom_month_weights_A = {k: v / tot_mA for k, v in cmA.items() if v > 0}
+    if tot_oA > 0:
+        custom_oneoff_weights_A = {k: v / tot_oA for k, v in coA.items() if v > 0}
+
+    # Portefeuille B
+    cmB = st.session_state.get("CUSTOM_M_B", {}) or {}
+    coB = st.session_state.get("CUSTOM_O_B", {}) or {}
+    tot_mB = sum(v for v in cmB.values() if v > 0)
+    tot_oB = sum(v for v in coB.values() if v > 0)
+    if tot_mB > 0:
+        custom_month_weights_B = {k: v / tot_mB for k, v in cmB.items() if v > 0}
+    if tot_oB > 0:
+        custom_oneoff_weights_B = {k: v / tot_oB for k, v in coB.items() if v > 0}
+
+# Reset warnings avant chaque run
 st.session_state["DATE_WARNINGS"] = []
 
 dfA, brutA, netA, valA, xirrA, startA_min, fullA = simulate_portfolio(
@@ -902,12 +1058,13 @@ dfA, brutA, netA, valA, xirrA, startA_min, fullA = simulate_portfolio(
     st.session_state.get("M_A", 0.0),
     st.session_state.get("ONE_A", 0.0),
     st.session_state.get("ONE_A_DATE", pd.Timestamp("2024-07-01").date()),
-    st.session_state.get("ALLOC_MODE", "equal"),
-    custom_weights_A,
+    alloc_mode_code,
+    custom_month_weights_A,
+    custom_oneoff_weights_A,
     single_target_A,
     st.session_state.get("EURO_RATE_PREVIEW", 2.0),
     st.session_state.get("FEE_A", 0.0),
-    portfolio_label="Client",  # >>> NEW
+    portfolio_label="Client",
 )
 
 dfB, brutB, netB, valB, xirrB, startB_min, fullB = simulate_portfolio(
@@ -915,16 +1072,17 @@ dfB, brutB, netB, valB, xirrB, startB_min, fullB = simulate_portfolio(
     st.session_state.get("M_B", 0.0),
     st.session_state.get("ONE_B", 0.0),
     st.session_state.get("ONE_B_DATE", pd.Timestamp("2024-07-01").date()),
-    st.session_state.get("ALLOC_MODE", "equal"),
-    custom_weights_B,
+    alloc_mode_code,
+    custom_month_weights_B,
+    custom_oneoff_weights_B,
     single_target_B,
     st.session_state.get("EURO_RATE_PREVIEW", 2.0),
     st.session_state.get("FEE_B", 0.0),
-    portfolio_label="Valority",  # >>> NEW
+    portfolio_label="Valority",
 )
 
 # ------------------------------------------------------------
-# Avertissements sur les dates / 1ère VL  # >>> NEW
+# Avertissements sur les dates / 1ère VL
 # ------------------------------------------------------------
 if st.session_state.get("DATE_WARNINGS"):
     with st.expander("⚠️ Problèmes d'historique / dates de VL"):
@@ -967,7 +1125,6 @@ if period_dates:
     start_global = min(period_dates)
     st.caption(f"Période analysée : du **{fmt_date(start_global)}** au **{fmt_date(TODAY)}**")
 
-# Rendements totaux
 perf_tot_client = (valA / netA - 1.0) * 100.0 if netA > 0 else None
 perf_tot_valority = (valB / netB - 1.0) * 100.0 if netB > 0 else None
 
@@ -981,8 +1138,9 @@ with col_client:
             f"""
 - Montants réellement investis (après frais) : **{to_eur(netA)}**
 - Montants versés (brut) : {to_eur(brutA)}
-- Rendement total depuis le début : **{(perf_tot_client or 0):.2f}%**""" if perf_tot_client is not None else
-            f"""
+- Rendement total depuis le début : **{(perf_tot_client or 0):.2f}%**"""
+            if perf_tot_client is not None
+            else f"""
 - Montants réellement investis (après frais) : **{to_eur(netA)}**
 - Montants versés (brut) : {to_eur(brutA)}
 - Rendement total depuis le début : **—**"""
@@ -1001,8 +1159,9 @@ with col_valority:
             f"""
 - Montants réellement investis (après frais) : **{to_eur(netB)}**
 - Montants versés (brut) : {to_eur(brutB)}
-- Rendement total depuis le début : **{(perf_tot_valority or 0):.2f}%**""" if perf_tot_valority is not None else
-            f"""
+- Rendement total depuis le début : **{(perf_tot_valority or 0):.2f}%**"""
+            if perf_tot_valority is not None
+            else f"""
 - Montants réellement investis (après frais) : **{to_eur(netB)}**
 - Montants versés (brut) : {to_eur(brutB)}
 - Rendement total depuis le début : **—**"""
@@ -1060,5 +1219,7 @@ with st.expander("Aide rapide"):
 - Les frais d’entrée s’appliquent à chaque investissement.
 - Le **rendement total** est la performance globale depuis l’origine (valeur actuelle / net investi).
 - Le **rendement annualisé** utilise le XIRR (prise en compte des dates et montants).
+- En mode **Personnalisé**, vous pouvez affecter précisément les versements mensuels et ponctuels à chaque ligne,
+  avec un contrôle automatique de cohérence par rapport aux montants bruts saisis.
         """
     )

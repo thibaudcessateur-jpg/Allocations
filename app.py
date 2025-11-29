@@ -141,6 +141,7 @@ def eodhd_prices_daily(symbol: str) -> pd.DataFrame:
         return df[["Close"]].sort_index()
     except Exception:
         return pd.DataFrame()
+
 # ------------------------------------------------------------
 # EODHD Fundamentals : récupération + normalisation des breakdowns
 # ------------------------------------------------------------
@@ -149,8 +150,7 @@ def eodhd_prices_daily(symbol: str) -> pd.DataFrame:
 def eodhd_fundamentals(symbol: str) -> Dict[str, Any]:
     """
     Récupère le JSON complet des fondamentaux EODHD pour un symbole
-    (fonds/ETF/action). On laisse la réponse complète pour avoir tous
-    les sous-blocs (ETF_Data, Mutual_Fund_Data, etc.).
+    (fonds/ETF/action).
     """
     try:
         js = eodhd_get(f"/fundamentals/{symbol}", params=None)
@@ -161,33 +161,30 @@ def eodhd_fundamentals(symbol: str) -> Dict[str, Any]:
         return {}
 
 
-def _fund_breakdowns_node(js: Dict[str, Any]) -> Dict[str, Any]:
+def _deep_find_first(node: Any, key_candidates: List[str]) -> Any:
     """
-    Tente de trouver le noeud 'Breakdowns' dans les différentes
-    sections possibles (ETF_Data, Mutual_Fund_Data, Fund, etc.).
-    Les noms exacts peuvent légèrement varier suivant les types
-    d'instruments, il faudra éventuellement ajuster si ton JSON
-    réel est différent.
+    Parcours récursif du JSON pour trouver la première valeur dont la clé
+    est dans key_candidates. Retourne la valeur trouvée ou None.
     """
-    if not isinstance(js, dict):
-        return {}
-
-    for root in ("ETF_Data", "Mutual_Fund_Data", "Fundamental", "Fund"):
-        node = js.get(root)
-        if isinstance(node, dict):
-            bd = node.get("Breakdowns") or node.get("breakdowns")
-            if isinstance(bd, dict):
-                return bd
-
-    # Certains fonds peuvent avoir Breakdowns directement à la racine
-    bd = js.get("Breakdowns") or js.get("breakdowns")
-    return bd if isinstance(bd, dict) else {}
+    if isinstance(node, dict):
+        for k, v in node.items():
+            if k in key_candidates:
+                return v
+            res = _deep_find_first(v, key_candidates)
+            if res is not None:
+                return res
+    elif isinstance(node, list):
+        for it in node:
+            res = _deep_find_first(it, key_candidates)
+            if res is not None:
+                return res
+    return None
 
 
 def _normalize_breakdown(raw: Any) -> Dict[str, float]:
     """
     Transforme un breakdown quelle que soit sa forme en dict {label: float%}.
-    Gère à la fois les dicts imbriqués et les listes d'objets.
+    Gère à la fois les dicts et les listes d'objets.
     """
     out: Dict[str, float] = {}
 
@@ -198,7 +195,7 @@ def _normalize_breakdown(raw: Any) -> Dict[str, float]:
             val = None
             if isinstance(v, dict):
                 # Noms possibles des champs de pourcentage
-                for key_pct in ("Fund_%", "fund_percent", "Assets_%", "Weight", "Percent"):
+                for key_pct in ("Fund_%", "Assets_%", "Net_Assets_%", "Equity_%", "Weight", "Percent"):
                     if key_pct in v:
                         val = v[key_pct]
                         break
@@ -217,7 +214,7 @@ def _normalize_breakdown(raw: Any) -> Dict[str, float]:
                 continue
             label = item.get("Name") or item.get("Region") or item.get("Sector") or item.get("Code")
             val = None
-            for key_pct in ("Fund_%", "Assets_%", "Weight", "Percent"):
+            for key_pct in ("Fund_%", "Assets_%", "Net_Assets_%", "Equity_%", "Weight", "Percent"):
                 if key_pct in item:
                     val = item[key_pct]
                     break
@@ -228,7 +225,7 @@ def _normalize_breakdown(raw: Any) -> Dict[str, float]:
             except Exception:
                 continue
 
-    # On enlève les éventuels 0 ou valeurs négatives très petites
+    # On enlève les zéros / négatifs
     out = {k: v for k, v in out.items() if v is not None and v > 0}
     return out
 
@@ -241,9 +238,7 @@ def get_fund_breakdowns(symbol: str) -> Dict[str, Dict[str, float] | List[Dict[s
       - 'regions': {région: %}
       - 'sectors': {secteur: %}
       - 'top10': liste de dicts {name, weight}
-    Les clés exactes dans le JSON EODHD peuvent varier légèrement :
-    si tu constates que certains graphiques restent vides, va voir
-    la structure JSON de ton fond et adapte les noms ci-dessous.
+    On cherche les blocs en profondeur, quel que soit l'endroit où EODHD les a mis.
     """
     js = eodhd_fundamentals(symbol)
     if not js:
@@ -254,36 +249,11 @@ def get_fund_breakdowns(symbol: str) -> Dict[str, Dict[str, float] | List[Dict[s
             "top10": [],
         }
 
-    bd = _fund_breakdowns_node(js)
-    if not bd:
-        return {
-            "asset_allocation": {},
-            "regions": {},
-            "sectors": {},
-            "top10": [],
-        }
-
-    # Noms à adapter si besoin en fonction de ton JSON réel
-    raw_alloc = (
-        bd.get("Asset_Allocation")
-        or bd.get("AssetAllocation")
-        or bd.get("Allocation")
-    )
-    raw_regions = (
-        bd.get("World_Regions")
-        or bd.get("WorldRegions")
-        or bd.get("Regions")
-    )
-    raw_sectors = (
-        bd.get("Sector_Weights")
-        or bd.get("SectorWeights")
-        or bd.get("Sectors")
-    )
-    raw_top10 = (
-        bd.get("Top_10_Holdings")
-        or bd.get("Top10Holdings")
-        or bd.get("Top_Holdings")
-    )
+    # On cherche les blocs dans tout le JSON, pas seulement dans ETF_Data/Mutual_Fund_Data
+    raw_alloc = _deep_find_first(js, ["Asset_Allocation", "AssetAllocation"])
+    raw_regions = _deep_find_first(js, ["World_Regions", "WorldRegions"])
+    raw_sectors = _deep_find_first(js, ["Sector_Weights", "SectorWeights", "Sector_Weightings"])
+    raw_top10 = _deep_find_first(js, ["Top_10_Holdings", "Top10Holdings", "Top_Holdings"])
 
     alloc = _normalize_breakdown(raw_alloc) if raw_alloc is not None else {}
     regions = _normalize_breakdown(raw_regions) if raw_regions is not None else {}
@@ -350,8 +320,6 @@ def aggregate_portfolio_breakdowns(
     """
     Calcule la répartition globale du portefeuille à partir des breakdowns EODHD
     et des montants investis nets (investi net des frais d'entrée).
-    On raisonne explicitement sur les MONTANTS INVESTIS (pas sur les valorisations
-    actuelles), ce qui est parfaitement déterministe à partir des données que tu saisis.
     """
     if not lines:
         return {
@@ -370,13 +338,12 @@ def aggregate_portfolio_breakdowns(
         if not isin_or_name:
             continue
 
-        # EUROFUND : pas de fundamentals EODHD, on le traitera à part
+        # EUROFUND : pas de fundamentals EODHD, on le traite à part
         if str(isin_or_name).upper() == "EUROFUND":
             symbol = "EUROFUND"
         else:
             sym_used = ln.get("sym_used", "")
             if not sym_used:
-                # On réutilise la logique existante pour trouver le symbole
                 df_tmp, sym, _dbg = get_price_series(isin_or_name, None, euro_rate)
                 symbol = sym
                 ln["sym_used"] = sym
@@ -418,7 +385,7 @@ def aggregate_portfolio_breakdowns(
         w_line = net_amt / total_net  # poids de la ligne dans le portefeuille
 
         if symbol == "EUROFUND":
-            # Convention : 100% "Fonds en euros" dans une catégorie dédiée
+            # Convention : 100% "Fonds en euros"
             _accumulate_weighted(alloc_tot, {"Fonds en euros": 100.0}, w_line)
             continue
 
@@ -429,7 +396,7 @@ def aggregate_portfolio_breakdowns(
         top10 = bks.get("top10", []) or []
 
         _accumulate_weighted(alloc_tot, alloc, w_line)
-        _accumulate_weighted(regs_tot := regions_tot, regs, w_line)
+        _accumulate_weighted(regions_tot, regs, w_line)
         _accumulate_weighted(sectors_tot, sect, w_line)
 
         for h in top10:
@@ -510,7 +477,6 @@ def _bar_chart_top_holdings(title: str, holdings: List[Dict[str, Any]]):
         .properties(height=260)
     )
     st.altair_chart(chart, use_container_width=True)
-
 
 def _symbol_candidates(isin_or_name: str) -> List[str]:
     val = str(isin_or_name).strip()

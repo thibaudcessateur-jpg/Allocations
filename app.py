@@ -229,7 +229,6 @@ def _normalize_breakdown(raw: Any) -> Dict[str, float]:
     out = {k: v for k, v in out.items() if v is not None and v > 0}
     return out
 
-
 @st.cache_data(show_spinner=False, ttl=3600)
 def get_fund_breakdowns(symbol: str) -> Dict[str, Dict[str, float] | List[Dict[str, Any]]]:
     """
@@ -238,10 +237,91 @@ def get_fund_breakdowns(symbol: str) -> Dict[str, Dict[str, float] | List[Dict[s
       - 'regions': {région: %}
       - 'sectors': {secteur: %}
       - 'top10': liste de dicts {name, weight}
-    On cherche les blocs en profondeur, quel que soit l'endroit où EODHD les a mis.
+
+    Logique renforcée :
+    - on essaie plusieurs symboles pour les fundamentals :
+        1) le symbole utilisé pour les prix (ex. FR0011253624.EUFUND)
+        2) l'ISIN nu (ex. FR0011253624)
+        3) les codes retournés par eodhd_search()
+    - si EODHD renvoie un champ 'error' / 'Error', on le signale dans l'UI.
     """
-    js = eodhd_fundamentals(symbol)
-    if not js:
+
+    def _try_symbol(sym: str) -> Optional[Dict[str, Any]]:
+        if not sym:
+            return None
+        js = eodhd_fundamentals(sym)
+        if not js:
+            return None
+
+        # Si EODHD renvoie explicitement une erreur, on la remonte
+        err_msg = js.get("error") or js.get("Error")
+        if err_msg:
+            st.caption(f"⚠️ EODHD Fundamentals indisponibles pour **{sym}** : {err_msg}")
+            return None
+
+        # Est-ce qu'on voit au moins une des clés "structurantes" dans le JSON ?
+        has_any_breakdown = _deep_find_first(
+            js,
+            [
+                "Asset_Allocation",
+                "AssetAllocation",
+                "World_Regions",
+                "WorldRegions",
+                "Sector_Weights",
+                "SectorWeights",
+                "Sector_Weightings",
+                "Top_10_Holdings",
+                "Top10Holdings",
+                "Top_Holdings",
+            ],
+        )
+        if not has_any_breakdown:
+            # Pas fatal : on retourne quand même le JSON, mais on saura
+            # que les breakdowns sont vides pour ce symbole.
+            return js
+
+        return js
+
+    # 1) liste des symboles à tester
+    candidates: List[str] = []
+    base = symbol.strip()
+    if base:
+        candidates.append(base)
+        if "." in base:
+            # ex. FR0011253624.EUFUND -> FR0011253624
+            root = base.split(".", 1)[0]
+            candidates.append(root)
+
+        # On ajoute les symboles issus de la recherche EODHD
+        try:
+            search_res = eodhd_search(base)
+            for it in search_res:
+                code = it.get("Code")
+                exch = it.get("Exchange")
+                if code and exch:
+                    candidates.append(f"{code}.{exch}")
+                elif code:
+                    candidates.append(code)
+        except Exception:
+            pass
+
+    # on dédoublonne
+    seen = set()
+    uniq_candidates: List[str] = []
+    for c in candidates:
+        if c and c not in seen:
+            seen.add(c)
+            uniq_candidates.append(c)
+
+    js_used: Optional[Dict[str, Any]] = None
+    for sym in uniq_candidates:
+        js_try = _try_symbol(sym)
+        if js_try is not None:
+            js_used = js_try
+            break
+
+    if not js_used:
+        # Aucun symbole n'a donné de fondamentaux exploitables
         return {
             "asset_allocation": {},
             "regions": {},
@@ -249,11 +329,11 @@ def get_fund_breakdowns(symbol: str) -> Dict[str, Dict[str, float] | List[Dict[s
             "top10": [],
         }
 
-    # On cherche les blocs dans tout le JSON, pas seulement dans ETF_Data/Mutual_Fund_Data
-    raw_alloc = _deep_find_first(js, ["Asset_Allocation", "AssetAllocation"])
-    raw_regions = _deep_find_first(js, ["World_Regions", "WorldRegions"])
-    raw_sectors = _deep_find_first(js, ["Sector_Weights", "SectorWeights", "Sector_Weightings"])
-    raw_top10 = _deep_find_first(js, ["Top_10_Holdings", "Top10Holdings", "Top_Holdings"])
+    # On cherche les blocs dans tout le JSON
+    raw_alloc = _deep_find_first(js_used, ["Asset_Allocation", "AssetAllocation"])
+    raw_regions = _deep_find_first(js_used, ["World_Regions", "WorldRegions"])
+    raw_sectors = _deep_find_first(js_used, ["Sector_Weights", "SectorWeights", "Sector_Weightings"])
+    raw_top10 = _deep_find_first(js_used, ["Top_10_Holdings", "Top10Holdings", "Top_Holdings"])
 
     alloc = _normalize_breakdown(raw_alloc) if raw_alloc is not None else {}
     regions = _normalize_breakdown(raw_regions) if raw_regions is not None else {}

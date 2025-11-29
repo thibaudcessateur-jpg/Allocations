@@ -141,6 +141,375 @@ def eodhd_prices_daily(symbol: str) -> pd.DataFrame:
         return df[["Close"]].sort_index()
     except Exception:
         return pd.DataFrame()
+# ------------------------------------------------------------
+# EODHD Fundamentals : récupération + normalisation des breakdowns
+# ------------------------------------------------------------
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def eodhd_fundamentals(symbol: str) -> Dict[str, Any]:
+    """
+    Récupère le JSON complet des fondamentaux EODHD pour un symbole
+    (fonds/ETF/action). On laisse la réponse complète pour avoir tous
+    les sous-blocs (ETF_Data, Mutual_Fund_Data, etc.).
+    """
+    try:
+        js = eodhd_get(f"/fundamentals/{symbol}", params=None)
+        if isinstance(js, dict):
+            return js
+        return {}
+    except Exception:
+        return {}
+
+
+def _fund_breakdowns_node(js: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Tente de trouver le noeud 'Breakdowns' dans les différentes
+    sections possibles (ETF_Data, Mutual_Fund_Data, Fund, etc.).
+    Les noms exacts peuvent légèrement varier suivant les types
+    d'instruments, il faudra éventuellement ajuster si ton JSON
+    réel est différent.
+    """
+    if not isinstance(js, dict):
+        return {}
+
+    for root in ("ETF_Data", "Mutual_Fund_Data", "Fundamental", "Fund"):
+        node = js.get(root)
+        if isinstance(node, dict):
+            bd = node.get("Breakdowns") or node.get("breakdowns")
+            if isinstance(bd, dict):
+                return bd
+
+    # Certains fonds peuvent avoir Breakdowns directement à la racine
+    bd = js.get("Breakdowns") or js.get("breakdowns")
+    return bd if isinstance(bd, dict) else {}
+
+
+def _normalize_breakdown(raw: Any) -> Dict[str, float]:
+    """
+    Transforme un breakdown quelle que soit sa forme en dict {label: float%}.
+    Gère à la fois les dicts imbriqués et les listes d'objets.
+    """
+    out: Dict[str, float] = {}
+
+    # Cas dict -> soit { "Stocks": {"Fund_%": 90}, ... } soit { "Stocks": 90, ... }
+    if isinstance(raw, dict):
+        for k, v in raw.items():
+            label = str(k)
+            val = None
+            if isinstance(v, dict):
+                # Noms possibles des champs de pourcentage
+                for key_pct in ("Fund_%", "fund_percent", "Assets_%", "Weight", "Percent"):
+                    if key_pct in v:
+                        val = v[key_pct]
+                        break
+            else:
+                val = v
+            try:
+                if val is not None:
+                    out[label] = float(val)
+            except Exception:
+                continue
+
+    # Cas liste -> chaque élément est normalement un dict
+    if isinstance(raw, list):
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            label = item.get("Name") or item.get("Region") or item.get("Sector") or item.get("Code")
+            val = None
+            for key_pct in ("Fund_%", "Assets_%", "Weight", "Percent"):
+                if key_pct in item:
+                    val = item[key_pct]
+                    break
+            if not label or val is None:
+                continue
+            try:
+                out[str(label)] = float(val)
+            except Exception:
+                continue
+
+    # On enlève les éventuels 0 ou valeurs négatives très petites
+    out = {k: v for k, v in out.items() if v is not None and v > 0}
+    return out
+
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def get_fund_breakdowns(symbol: str) -> Dict[str, Dict[str, float] | List[Dict[str, Any]]]:
+    """
+    Retourne un dict avec :
+      - 'asset_allocation': {classe: %}
+      - 'regions': {région: %}
+      - 'sectors': {secteur: %}
+      - 'top10': liste de dicts {name, weight}
+    Les clés exactes dans le JSON EODHD peuvent varier légèrement :
+    si tu constates que certains graphiques restent vides, va voir
+    la structure JSON de ton fond et adapte les noms ci-dessous.
+    """
+    js = eodhd_fundamentals(symbol)
+    if not js:
+        return {
+            "asset_allocation": {},
+            "regions": {},
+            "sectors": {},
+            "top10": [],
+        }
+
+    bd = _fund_breakdowns_node(js)
+    if not bd:
+        return {
+            "asset_allocation": {},
+            "regions": {},
+            "sectors": {},
+            "top10": [],
+        }
+
+    # Noms à adapter si besoin en fonction de ton JSON réel
+    raw_alloc = (
+        bd.get("Asset_Allocation")
+        or bd.get("AssetAllocation")
+        or bd.get("Allocation")
+    )
+    raw_regions = (
+        bd.get("World_Regions")
+        or bd.get("WorldRegions")
+        or bd.get("Regions")
+    )
+    raw_sectors = (
+        bd.get("Sector_Weights")
+        or bd.get("SectorWeights")
+        or bd.get("Sectors")
+    )
+    raw_top10 = (
+        bd.get("Top_10_Holdings")
+        or bd.get("Top10Holdings")
+        or bd.get("Top_Holdings")
+    )
+
+    alloc = _normalize_breakdown(raw_alloc) if raw_alloc is not None else {}
+    regions = _normalize_breakdown(raw_regions) if raw_regions is not None else {}
+    sectors = _normalize_breakdown(raw_sectors) if raw_sectors is not None else {}
+
+    top10_list: List[Dict[str, Any]] = []
+    if isinstance(raw_top10, list):
+        for item in raw_top10:
+            if not isinstance(item, dict):
+                continue
+            label = (
+                item.get("Name")
+                or item.get("Code")
+                or item.get("Ticker")
+                or item.get("Symbol")
+            )
+            val = None
+            for key_pct in ("Assets_%", "Fund_%", "Weight", "Percent"):
+                if key_pct in item:
+                    val = item[key_pct]
+                    break
+            if not label or val is None:
+                continue
+            try:
+                w = float(val)
+            except Exception:
+                continue
+            top10_list.append({"name": str(label), "weight": w})
+
+    # Normalisation douce des pourcentages (on garde les proportions)
+    def _renormalize(d: Dict[str, float]) -> Dict[str, float]:
+        s = sum(d.values())
+        if s <= 0:
+            return {}
+        return {k: 100.0 * v / s for k, v in d.items()}
+
+    alloc = _renormalize(alloc)
+    regions = _renormalize(regions)
+    sectors = _renormalize(sectors)
+
+    return {
+        "asset_allocation": alloc,
+        "regions": regions,
+        "sectors": sectors,
+        "top10": top10_list,
+    }
+
+
+def _accumulate_weighted(target: Dict[str, float], src: Dict[str, float], w_line: float) -> None:
+    """
+    Ajoute à 'target' les pourcentages d'un breakdown de fonds
+    pondérés par le poids du fonds dans le portefeuille.
+    src = {label: %du fonds}, w_line = poids du fonds dans le portefeuille (0-1).
+    """
+    for k, v in src.items():
+        target[k] = target.get(k, 0.0) + w_line * (v / 100.0)
+
+
+def aggregate_portfolio_breakdowns(
+    lines: List[Dict[str, Any]],
+    euro_rate: float,
+    fee_pct: float,
+) -> Dict[str, Any]:
+    """
+    Calcule la répartition globale du portefeuille à partir des breakdowns EODHD
+    et des montants investis nets (investi net des frais d'entrée).
+    On raisonne explicitement sur les MONTANTS INVESTIS (pas sur les valorisations
+    actuelles), ce qui est parfaitement déterministe à partir des données que tu saisis.
+    """
+    if not lines:
+        return {
+            "asset_allocation": {},
+            "regions": {},
+            "sectors": {},
+            "top10": [],
+        }
+
+    # 1) Poids des lignes dans le portefeuille (en % des montants nets investis)
+    total_net = 0.0
+    by_symbol_net: Dict[str, float] = {}
+
+    for ln in lines:
+        isin_or_name = ln.get("isin") or ln.get("name")
+        if not isin_or_name:
+            continue
+
+        # EUROFUND : pas de fundamentals EODHD, on le traitera à part
+        if str(isin_or_name).upper() == "EUROFUND":
+            symbol = "EUROFUND"
+        else:
+            sym_used = ln.get("sym_used", "")
+            if not sym_used:
+                # On réutilise la logique existante pour trouver le symbole
+                df_tmp, sym, _dbg = get_price_series(isin_or_name, None, euro_rate)
+                symbol = sym
+                ln["sym_used"] = sym
+            else:
+                symbol = sym_used
+
+        if not symbol:
+            continue
+
+        try:
+            brut = float(ln.get("amount_gross", 0.0))
+        except Exception:
+            brut = 0.0
+        if brut <= 0:
+            continue
+
+        net = brut * (1.0 - fee_pct / 100.0)
+        if net <= 0:
+            continue
+
+        total_net += net
+        by_symbol_net[symbol] = by_symbol_net.get(symbol, 0.0) + net
+
+    if total_net <= 0:
+        return {
+            "asset_allocation": {},
+            "regions": {},
+            "sectors": {},
+            "top10": [],
+        }
+
+    # 2) Breakdowns globaux pondérés
+    alloc_tot: Dict[str, float] = {}
+    regions_tot: Dict[str, float] = {}
+    sectors_tot: Dict[str, float] = {}
+    top10_tot: Dict[str, float] = {}
+
+    for symbol, net_amt in by_symbol_net.items():
+        w_line = net_amt / total_net  # poids de la ligne dans le portefeuille
+
+        if symbol == "EUROFUND":
+            # Convention : 100% "Fonds en euros" dans une catégorie dédiée
+            _accumulate_weighted(alloc_tot, {"Fonds en euros": 100.0}, w_line)
+            continue
+
+        bks = get_fund_breakdowns(symbol)
+        alloc = bks.get("asset_allocation", {}) or {}
+        regs = bks.get("regions", {}) or {}
+        sect = bks.get("sectors", {}) or {}
+        top10 = bks.get("top10", []) or []
+
+        _accumulate_weighted(alloc_tot, alloc, w_line)
+        _accumulate_weighted(regs_tot := regions_tot, regs, w_line)
+        _accumulate_weighted(sectors_tot, sect, w_line)
+
+        for h in top10:
+            nm = h.get("name")
+            wt = h.get("weight")
+            if nm is None or wt is None:
+                continue
+            try:
+                wt = float(wt)
+            except Exception:
+                continue
+            top10_tot[nm] = top10_tot.get(nm, 0.0) + w_line * (wt / 100.0)
+
+    # 3) Remise en pourcentage pour lisibilité
+    def _as_percent(d: Dict[str, float]) -> Dict[str, float]:
+        s = sum(d.values())
+        if s <= 0:
+            return {}
+        return {k: 100.0 * v / s for k, v in d.items()}
+
+    alloc_tot = _as_percent(alloc_tot)
+    regions_tot = _as_percent(regions_tot)
+    sectors_tot = _as_percent(sectors_tot)
+
+    # Top 10 lignes sous-jacentes les plus importantes
+    sorted_holdings = sorted(top10_tot.items(), key=lambda kv: kv[1], reverse=True)
+    top10_list = [
+        {"name": nm, "weight": 100.0 * w}
+        for nm, w in sorted_holdings[:10]
+    ]
+
+    return {
+        "asset_allocation": alloc_tot,
+        "regions": regions_tot,
+        "sectors": sectors_tot,
+        "top10": top10_list,
+    }
+
+
+def _pie_chart_from_dict(title: str, d: Dict[str, float]):
+    if not d:
+        st.caption(f"{title} : données indisponibles.")
+        return
+    df = (
+        pd.DataFrame({"Label": list(d.keys()), "Poids": list(d.values())})
+        .sort_values("Poids", ascending=False)
+    )
+    chart = (
+        alt.Chart(df)
+        .mark_arc()
+        .encode(
+            theta=alt.Theta("Poids:Q", title="Poids (%)"),
+            color=alt.Color("Label:N", legend=alt.Legend(title=title)),
+            tooltip=["Label", alt.Tooltip("Poids:Q", format=".1f")],
+        )
+        .properties(height=260, width=260)
+    )
+    st.altair_chart(chart, use_container_width=False)
+
+
+def _bar_chart_top_holdings(title: str, holdings: List[Dict[str, Any]]):
+    if not holdings:
+        st.caption(f"{title} : données indisponibles.")
+        return
+    df = (
+        pd.DataFrame(holdings)
+        .sort_values("weight", ascending=False)
+        .head(10)
+    )
+    chart = (
+        alt.Chart(df)
+        .mark_bar()
+        .encode(
+            x=alt.X("weight:Q", title="Poids (%)"),
+            y=alt.Y("name:N", sort="-x", title=""),
+            tooltip=["name", alt.Tooltip("weight:Q", format=".1f")],
+        )
+        .properties(height=260)
+    )
+    st.altair_chart(chart, use_container_width=True)
 
 
 def _symbol_candidates(isin_or_name: str) -> List[str]:
@@ -1202,6 +1571,68 @@ with st.container(border=True):
         f"""
 Aujourd’hui, avec votre allocation actuelle, votre portefeuille vaut **{to_eur(valA)}**.  
 Avec l’allocation Valority, il serait autour de **{to_eur(valB)}**, soit environ **{to_eur(gain_vs_client)}** de plus."""
+    )
+# ------------------------------------------------------------
+# Synthèse chiffrée : cartes Client / Valority
+# ------------------------------------------------------------
+# (ce bloc reste tel quel, ne le modifie pas)
+...
+gain_vs_client = max(valB - valA, 0.0)
+st.markdown(
+    f"""
+### Et si vous aviez investi avec Valority ?
+
+Aujourd’hui, avec votre allocation actuelle, votre portefeuille vaut **{to_eur(valA)}**.  
+Avec l’allocation Valority, il serait autour de **{to_eur(valB)}**, soit environ **{to_eur(gain_vs_client)}** de plus."""
+)
+
+# ------------------------------------------------------------
+# Analyse de diversification (fondamentaux EODHD)
+# ------------------------------------------------------------
+st.markdown("## Analyse de la diversification (données EODHD Fundamentals)")
+
+EURO_RATE_CUR = st.session_state.get("EURO_RATE_PREVIEW", 2.0)
+FEE_A_CUR = st.session_state.get("FEE_A", 0.0)
+FEE_B_CUR = st.session_state.get("FEE_B", 0.0)
+
+for label, port_key, fee_pct in [
+    ("Portefeuille 1 — Client", "A_lines", FEE_A_CUR),
+    ("Portefeuille 2 — Valority", "B_lines", FEE_B_CUR),
+]:
+    lines = st.session_state.get(port_key, [])
+    if not lines:
+        continue
+
+    st.markdown(f"### {label}")
+    agg = aggregate_portfolio_breakdowns(lines, EURO_RATE_CUR, fee_pct)
+
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.markdown("**Répartition par classe d'actifs**")
+        _pie_chart_from_dict("", agg.get("asset_allocation", {}) or {})
+    with col2:
+        st.markdown("**Répartition géographique**")
+        _pie_chart_from_dict("", agg.get("regions", {}) or {})
+    with col3:
+        st.markdown("**Répartition sectorielle**")
+        _pie_chart_from_dict("", agg.get("sectors", {}) or {})
+
+    st.markdown("**Top 10 lignes sous-jacentes du portefeuille**")
+    _bar_chart_top_holdings("", agg.get("top10", []) or [])
+
+# ------------------------------------------------------------
+# Tables positions
+# ------------------------------------------------------------
+positions_table("Portefeuille 1 — Client", "A_lines")
+positions_table("Portefeuille 2 — Valority", "B_lines")
+
+with st.expander("Aide rapide"):
+    st.markdown(
+        """
+- Dans chaque portefeuille, vous pouvez ajouter des lignes soit depuis la liste de fonds recommandés, soit via la saisie libre (ISIN).
+- Les montants investis, les dates d'achat, les versements mensuels et ponctuels et les frais d'entrée sont pris en compte dans les calculs.
+- La section **Analyse de la diversification** utilise les données fondamentales EODHD pour visualiser la répartition globale du portefeuille (classes d'actifs, régions, secteurs, principaux titres en portefeuille).
+"""
     )
 
 # ------------------------------------------------------------

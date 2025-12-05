@@ -122,26 +122,6 @@ def eodhd_search(q: str) -> List[Dict[str, Any]]:
         pass
     return []
 
-
-@st.cache_data(show_spinner=False, ttl=3600)
-def eodhd_prices_daily(symbol: str) -> pd.DataFrame:
-    try:
-        js = eodhd_get(f"/eod/{symbol}", params={"period": "d"})
-        if not isinstance(js, list) or len(js) == 0:
-            return pd.DataFrame()
-        df = pd.DataFrame(js)
-        df["date"] = pd.to_datetime(df["date"])
-        df.set_index("date", inplace=True)
-        if "adjusted_close" in df.columns and pd.notnull(df["adjusted_close"]).any():
-            df["Close"] = df["adjusted_close"].astype(float)
-        elif "close" in df.columns:
-            df["Close"] = df["close"].astype(float)
-        else:
-            return pd.DataFrame()
-        return df[["Close"]].sort_index()
-    except Exception:
-        return pd.DataFrame()
-
 # ------------------------------------------------------------
 # EODHD Fundamentals : récupération + normalisation des breakdowns
 # ------------------------------------------------------------
@@ -149,8 +129,8 @@ def eodhd_prices_daily(symbol: str) -> pd.DataFrame:
 @st.cache_data(show_spinner=False, ttl=3600)
 def eodhd_fundamentals(symbol: str) -> Dict[str, Any]:
     """
-    Récupère le JSON complet des fondamentaux EODHD pour un symbole
-    (fonds/ETF/action).
+    Appel bas niveau de l'API /fundamentals/{symbol} d'EODHD.
+    On renvoie toujours un dict (éventuellement vide).
     """
     try:
         js = eodhd_get(f"/fundamentals/{symbol}", params=None)
@@ -200,6 +180,7 @@ def _normalize_breakdown(raw: Any) -> Dict[str, float]:
                         val = v[key_pct]
                         break
             else:
+                # Valeur directe : {"Stocks": 90}
                 val = v
             try:
                 if val is not None:
@@ -229,6 +210,7 @@ def _normalize_breakdown(raw: Any) -> Dict[str, float]:
     out = {k: v for k, v in out.items() if v is not None and v > 0}
     return out
 
+
 @st.cache_data(show_spinner=False, ttl=3600)
 def get_fund_breakdowns(symbol: str) -> Dict[str, Dict[str, float] | List[Dict[str, Any]]]:
     """
@@ -238,15 +220,20 @@ def get_fund_breakdowns(symbol: str) -> Dict[str, Dict[str, float] | List[Dict[s
       - 'sectors': {secteur: %}
       - 'top10': liste de dicts {name, weight}
 
-    Logique renforcée :
+    Logique :
     - on essaie plusieurs symboles pour les fundamentals :
         1) le symbole utilisé pour les prix (ex. FR0011253624.EUFUND)
-        2) l'ISIN nu (ex. FR0011253624)
-        3) les codes retournés par eodhd_search()
-    - si EODHD renvoie un champ 'error' / 'Error', on le signale dans l'UI.
+        2) la racine sans suffixe (ex. FR0011253624)
+        3) les codes retournés par /search/{base}?type=fund
+    - on ne retient un symbole que si au moins un des blocs de breakdown est présent.
     """
 
     def _try_symbol(sym: str) -> Optional[Dict[str, Any]]:
+        """
+        Teste un symbole sur /fundamentals.
+        On ne renvoie le JSON que si on trouve au moins un bloc de breakdown.
+        Sinon -> None (pour laisser la main au candidat suivant).
+        """
         if not sym:
             return None
         js = eodhd_fundamentals(sym)
@@ -276,15 +263,14 @@ def get_fund_breakdowns(symbol: str) -> Dict[str, Dict[str, float] | List[Dict[s
             ],
         )
         if not has_any_breakdown:
-            # Pas fatal : on retourne quand même le JSON, mais on saura
-            # que les breakdowns sont vides pour ce symbole.
-            return js
+            # Pas de breakdown pour ce symbole -> on laisse la boucle essayer un autre candidat
+            return None
 
         return js
 
     # 1) liste des symboles à tester
     candidates: List[str] = []
-    base = symbol.strip()
+    base = (symbol or "").strip()
     if base:
         candidates.append(base)
         if "." in base:
@@ -292,20 +278,21 @@ def get_fund_breakdowns(symbol: str) -> Dict[str, Dict[str, float] | List[Dict[s
             root = base.split(".", 1)[0]
             candidates.append(root)
 
-        # On ajoute les symboles issus de la recherche EODHD
+        # On ajoute les symboles issus de la recherche EODHD, en filtrant sur les fonds
         try:
-            search_res = eodhd_search(base)
-            for it in search_res:
-                code = it.get("Code")
-                exch = it.get("Exchange")
-                if code and exch:
-                    candidates.append(f"{code}.{exch}")
-                elif code:
-                    candidates.append(code)
+            search_res = eodhd_get(f"/search/{base}", params={"type": "fund"})
+            if isinstance(search_res, list):
+                for it in search_res:
+                    code = it.get("Code")
+                    exch = it.get("Exchange")
+                    if code and exch:
+                        candidates.append(f"{code}.{exch}")
+                    elif code:
+                        candidates.append(code)
         except Exception:
             pass
 
-    # on dédoublonne
+    # on dédoublonne en respectant l'ordre
     seen = set()
     uniq_candidates: List[str] = []
     for c in candidates:

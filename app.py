@@ -144,6 +144,7 @@ def eodhd_prices_daily(symbol: str) -> pd.DataFrame:
 
 # ------------------------------------------------------------
 # EODHD Fundamentals : récupération + normalisation des breakdowns
+# (section corrigée)
 # ------------------------------------------------------------
 
 @st.cache_data(show_spinner=False, ttl=3600)
@@ -229,6 +230,7 @@ def _normalize_breakdown(raw: Any) -> Dict[str, float]:
     out = {k: v for k, v in out.items() if v is not None and v > 0}
     return out
 
+
 @st.cache_data(show_spinner=False, ttl=3600)
 def get_fund_breakdowns(symbol: str) -> Dict[str, Dict[str, float] | List[Dict[str, Any]]]:
     """
@@ -242,7 +244,7 @@ def get_fund_breakdowns(symbol: str) -> Dict[str, Dict[str, float] | List[Dict[s
     - on essaie plusieurs symboles pour les fundamentals :
         1) le symbole utilisé pour les prix (ex. FR0011253624.EUFUND)
         2) l'ISIN nu (ex. FR0011253624)
-        3) les codes retournés par eodhd_search()
+        3) les codes retournés par /search/{base}?type=fund
     - si EODHD renvoie un champ 'error' / 'Error', on le signale dans l'UI.
     """
 
@@ -292,16 +294,17 @@ def get_fund_breakdowns(symbol: str) -> Dict[str, Dict[str, float] | List[Dict[s
             root = base.split(".", 1)[0]
             candidates.append(root)
 
-        # On ajoute les symboles issus de la recherche EODHD
+        # On ajoute les symboles issus de la recherche EODHD, en filtrant sur les fonds
         try:
-            search_res = eodhd_search(base)
-            for it in search_res:
-                code = it.get("Code")
-                exch = it.get("Exchange")
-                if code and exch:
-                    candidates.append(f"{code}.{exch}")
-                elif code:
-                    candidates.append(code)
+            search_res = eodhd_get(f"/search/{base}", params={"type": "fund"})
+            if isinstance(search_res, list):
+                for it in search_res:
+                    code = it.get("Code")
+                    exch = it.get("Exchange")
+                    if code and exch:
+                        candidates.append(f"{code}.{exch}")
+                    elif code:
+                        candidates.append(code)
         except Exception:
             pass
 
@@ -558,6 +561,9 @@ def _bar_chart_top_holdings(title: str, holdings: List[Dict[str, Any]]):
     )
     st.altair_chart(chart, use_container_width=True)
 
+# ------------------------------------------------------------
+# Helpers symboles / séries de prix
+# ------------------------------------------------------------
 def _symbol_candidates(isin_or_name: str) -> List[str]:
     val = str(isin_or_name).strip()
     if not val:
@@ -615,9 +621,6 @@ def get_price_series(
         if start is not None:
             df = df.loc[df.index >= start]
         return df, "EUROFUND", json.dumps(debug)
-
-        # (note : ce return interrompt la suite pour EUROFUND,
-        # donc le reste ne s'applique qu'aux autres fonds)
 
     cands = _symbol_candidates(val)
     debug["cands"] = cands
@@ -1303,7 +1306,7 @@ with st.sidebar:
     st.session_state["ALLOC_MODE"] = ALLOC_LABELS[mode_label]
     alloc_mode_code = st.session_state["ALLOC_MODE"]
 
-    # Si mode personnalisé : détail des versements par ligne + sécurité (Option A)
+    # Si mode personnalisé : détail des versements par ligne + sécurité
     if alloc_mode_code == "custom":
         st.caption("Paramétrage détaillé des versements personnalisés.")
 
@@ -1403,7 +1406,7 @@ with st.sidebar:
                         f"Le total des versements mensuels personnalisés est de {to_eur(total_mB)}, "
                         f"alors que le montant mensuel brut saisi pour le portefeuille Valority est de {to_eur(M_B_global)}."
                     )
-                if ONE_B_global > 0 and abs(total_oB - ONE_B_global) > 1e-6:
+                if ONE_B_global > 0 and abs(total_oB - ONE_oB_global) > 1e-6:
                     st.warning(
                         f"Le total des versements ponctuels personnalisés est de {to_eur(total_oB)}, "
                         f"alors que le montant ponctuel brut saisi pour le portefeuille Valority est de {to_eur(ONE_B_global)}."
@@ -1618,22 +1621,9 @@ with st.container(border=True):
 Aujourd’hui, avec votre allocation actuelle, votre portefeuille vaut **{to_eur(valA)}**.  
 Avec l’allocation Valority, il serait autour de **{to_eur(valB)}**, soit environ **{to_eur(gain_vs_client)}** de plus."""
     )
-# ------------------------------------------------------------
-# Synthèse chiffrée : cartes Client / Valority
-# ------------------------------------------------------------
-# (ce bloc reste tel quel, ne le modifie pas)
-...
-gain_vs_client = max(valB - valA, 0.0)
-st.markdown(
-    f"""
-### Et si vous aviez investi avec Valority ?
-
-Aujourd’hui, avec votre allocation actuelle, votre portefeuille vaut **{to_eur(valA)}**.  
-Avec l’allocation Valority, il serait autour de **{to_eur(valB)}**, soit environ **{to_eur(gain_vs_client)}** de plus."""
-)
 
 # ------------------------------------------------------------
-# Analyse de diversification (fondamentaux EODHD)
+# Analyse de la diversification (fondamentaux EODHD)
 # ------------------------------------------------------------
 st.markdown("## Analyse de la diversification (données EODHD Fundamentals)")
 
@@ -1665,21 +1655,6 @@ for label, port_key, fee_pct in [
 
     st.markdown("**Top 10 lignes sous-jacentes du portefeuille**")
     _bar_chart_top_holdings("", agg.get("top10", []) or [])
-
-# ------------------------------------------------------------
-# Tables positions
-# ------------------------------------------------------------
-positions_table("Portefeuille 1 — Client", "A_lines")
-positions_table("Portefeuille 2 — Valority", "B_lines")
-
-with st.expander("Aide rapide"):
-    st.markdown(
-        """
-- Dans chaque portefeuille, vous pouvez ajouter des lignes soit depuis la liste de fonds recommandés, soit via la saisie libre (ISIN).
-- Les montants investis, les dates d'achat, les versements mensuels et ponctuels et les frais d'entrée sont pris en compte dans les calculs.
-- La section **Analyse de la diversification** utilise les données fondamentales EODHD pour visualiser la répartition globale du portefeuille (classes d'actifs, régions, secteurs, principaux titres en portefeuille).
-"""
-    )
 
 # ------------------------------------------------------------
 # Tables positions

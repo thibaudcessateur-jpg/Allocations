@@ -142,31 +142,21 @@ def eodhd_prices_daily(symbol: str) -> pd.DataFrame:
     except Exception:
         return pd.DataFrame()
 
-# ------------------------------------------------------------
 # EODHD Fundamentals : récupération + normalisation des breakdowns
-# (section corrigée)
 # ------------------------------------------------------------
 
 @st.cache_data(show_spinner=False, ttl=3600)
 def eodhd_fundamentals(symbol: str) -> Dict[str, Any]:
-    """
-    Récupère le JSON complet des fondamentaux EODHD pour un symbole
-    (fonds/ETF/action).
-    """
+    """Récupère le JSON complet des fondamentaux EODHD pour un symbole (fonds/ETF/action)."""
     try:
         js = eodhd_get(f"/fundamentals/{symbol}", params=None)
-        if isinstance(js, dict):
-            return js
-        return {}
+        return js if isinstance(js, dict) else {}
     except Exception:
         return {}
 
 
 def _deep_find_first(node: Any, key_candidates: List[str]) -> Any:
-    """
-    Parcours récursif du JSON pour trouver la première valeur dont la clé
-    est dans key_candidates. Retourne la valeur trouvée ou None.
-    """
+    """Recherche récursive de la première valeur dont la clé est dans *key_candidates*."""
     if isinstance(node, dict):
         for k, v in node.items():
             if k in key_candidates:
@@ -183,20 +173,29 @@ def _deep_find_first(node: Any, key_candidates: List[str]) -> Any:
 
 
 def _normalize_breakdown(raw: Any) -> Dict[str, float]:
-    """
-    Transforme un breakdown quelle que soit sa forme en dict {label: float%}.
-    Gère à la fois les dicts et les listes d'objets.
+    """Transforme un breakdown EODHD en dict {label: float%}.
+
+    - Accepte soit un dict (label -> %), soit une liste d'objets.
+    - Essaie plusieurs noms de champs pour les pourcentages.
     """
     out: Dict[str, float] = {}
 
-    # Cas dict -> soit { "Stocks": {"Fund_%": 90}, ... } soit { "Stocks": 90, ... }
+    # Cas dict simple : {label: valeur}
     if isinstance(raw, dict):
         for k, v in raw.items():
             label = str(k)
             val = None
             if isinstance(v, dict):
-                # Noms possibles des champs de pourcentage
-                for key_pct in ("Fund_%", "Assets_%", "Net_Assets_%", "Equity_%", "Weight", "Percent"):
+                for key_pct in (
+                    "Fund_%",
+                    "Assets_%",
+                    "Net_Assets_%",
+                    "Equity_%",
+                    "Weight",
+                    "Percent",
+                    "Percentage",
+                    "Value",
+                ):
                     if key_pct in v:
                         val = v[key_pct]
                         break
@@ -208,14 +207,29 @@ def _normalize_breakdown(raw: Any) -> Dict[str, float]:
             except Exception:
                 continue
 
-    # Cas liste -> chaque élément est normalement un dict
+    # Cas liste d'objets : chaque élément est un dict avec Name/Region/Sector + %.
     if isinstance(raw, list):
         for item in raw:
             if not isinstance(item, dict):
                 continue
-            label = item.get("Name") or item.get("Region") or item.get("Sector") or item.get("Code")
+            label = (
+                item.get("Name")
+                or item.get("Region")
+                or item.get("Sector")
+                or item.get("Code")
+                or item.get("Label")
+            )
             val = None
-            for key_pct in ("Fund_%", "Assets_%", "Net_Assets_%", "Equity_%", "Weight", "Percent"):
+            for key_pct in (
+                "Fund_%",
+                "Assets_%",
+                "Net_Assets_%",
+                "Equity_%",
+                "Weight",
+                "Percent",
+                "Percentage",
+                "Value",
+            ):
                 if key_pct in item:
                     val = item[key_pct]
                     break
@@ -226,25 +240,141 @@ def _normalize_breakdown(raw: Any) -> Dict[str, float]:
             except Exception:
                 continue
 
-    # On enlève les zéros / négatifs
-    out = {k: v for k, v in out.items() if v is not None and v > 0}
     return out
+
+
+def _renormalize(d: Dict[str, float]) -> Dict[str, float]:
+    """Normalise en pourcentage (somme = 100), en conservant les proportions."""
+    s = sum(d.values())
+    if s <= 0:
+        return {}
+    return {k: 100.0 * v / s for k, v in d.items()}
+
+
+def _iter_all_dicts(node: Any):
+    """Itère sur tous les dictionnaires imbriqués d'un JSON."""
+    if isinstance(node, dict):
+        yield node
+        for v in node.values():
+            yield from _iter_all_dicts(v)
+    elif isinstance(node, list):
+        for it in node:
+            yield from _iter_all_dicts(it)
+
+
+def _guess_breakdown_from_structure(js: Dict[str, Any]) -> Dict[str, Dict[str, float]]:
+    """Heuristique générique pour retrouver Asset Allocation / Regions / Sectors.
+
+    On cherche dans tout le JSON des dicts dont les valeurs :
+      - sont toutes numériques,
+      - sont entre 0 et 100,
+      - et dont la somme est proche de 100 (entre 80 et 120).
+    Ensuite on classe ces dicts en 3 familles via les libellés.
+    """
+    asset_alloc: Dict[str, float] = {}
+    regions: Dict[str, float] = {}
+    sectors: Dict[str, float] = {}
+
+    def classify(labels: List[str]) -> str | None:
+        lower = [lbl.lower() for lbl in labels]
+
+        # Allocation par classe d'actifs
+        if any(any(word in lbl for word in ["cash", "bond", "stock", "equity", "other"]) for lbl in lower):
+            return "asset"
+
+        # Régions géographiques
+        if any(
+            any(word in lbl for word in ["america", "europe", "asia", "pacific", "japan", "uk", "africa", "emerging"])
+            for lbl in lower
+        ):
+            return "regions"
+
+        # Secteurs
+        if any(
+            any(
+                word in lbl
+                for word in [
+                    "tech",
+                    "health",
+                    "financial",
+                    "energy",
+                    "industrial",
+                    "utilities",
+                    "consumer",
+                    "real estate",
+                    "materials",
+                    "communication",
+                    "telecom",
+                    "services",
+                ]
+            )
+            for lbl in lower
+        ):
+            return "sectors"
+
+        return None
+
+    for d in _iter_all_dicts(js):
+        # Candidat : dict avec quelques clés, toutes numériques, somme ~ 100
+        if not isinstance(d, dict) or len(d) < 2:
+            continue
+
+        labels = list(d.keys())
+        vals: List[float] = []
+        ok = True
+        for v in d.values():
+            try:
+                fv = float(v)
+            except Exception:
+                ok = False
+                break
+            if not (-5.0 <= fv <= 105.0):
+                ok = False
+                break
+            vals.append(fv)
+        if not ok or not vals:
+            continue
+
+        total = sum(vals)
+        if not (80.0 <= total <= 120.0):
+            continue
+
+        kind = classify(labels)
+        if not kind:
+            continue
+
+        norm = _renormalize({str(k): float(v) for k, v in d.items()})
+
+        if kind == "asset" and not asset_alloc:
+            asset_alloc = norm
+        elif kind == "regions" and not regions:
+            regions = norm
+        elif kind == "sectors" and not sectors:
+            sectors = norm
+
+        if asset_alloc and regions and sectors:
+            break
+
+    return {
+        "asset_allocation": asset_alloc,
+        "regions": regions,
+        "sectors": sectors,
+    }
 
 
 @st.cache_data(show_spinner=False, ttl=3600)
 def get_fund_breakdowns(symbol: str) -> Dict[str, Dict[str, float] | List[Dict[str, Any]]]:
-    """
-    Retourne un dict avec :
+    """Retourne :
       - 'asset_allocation': {classe: %}
       - 'regions': {région: %}
       - 'sectors': {secteur: %}
       - 'top10': liste de dicts {name, weight}
 
-    Logique renforcée :
+    Logique :
     - on essaie plusieurs symboles pour les fundamentals :
         1) le symbole utilisé pour les prix (ex. FR0011253624.EUFUND)
-        2) l'ISIN nu (ex. FR0011253624)
-        3) les codes retournés par /search/{base}?type=fund
+        2) la racine sans suffixe (ex. FR0011253624)
+        3) les codes retournés par eodhd_search()
     - si EODHD renvoie un champ 'error' / 'Error', on le signale dans l'UI.
     """
 
@@ -255,61 +385,37 @@ def get_fund_breakdowns(symbol: str) -> Dict[str, Dict[str, float] | List[Dict[s
         if not js:
             return None
 
-        # Si EODHD renvoie explicitement une erreur, on la remonte
         err_msg = js.get("error") or js.get("Error")
         if err_msg:
             st.caption(f"⚠️ EODHD Fundamentals indisponibles pour **{sym}** : {err_msg}")
             return None
 
-        # Est-ce qu'on voit au moins une des clés "structurantes" dans le JSON ?
-        has_any_breakdown = _deep_find_first(
-            js,
-            [
-                "Asset_Allocation",
-                "AssetAllocation",
-                "World_Regions",
-                "WorldRegions",
-                "Sector_Weights",
-                "SectorWeights",
-                "Sector_Weightings",
-                "Top_10_Holdings",
-                "Top10Holdings",
-                "Top_Holdings",
-            ],
-        )
-        if not has_any_breakdown:
-            # Pas fatal : on retourne quand même le JSON, mais on saura
-            # que les breakdowns sont vides pour ce symbole.
-            return js
-
         return js
 
     # 1) liste des symboles à tester
     candidates: List[str] = []
-    base = symbol.strip()
+    base = (symbol or "").strip()
     if base:
         candidates.append(base)
         if "." in base:
-            # ex. FR0011253624.EUFUND -> FR0011253624
             root = base.split(".", 1)[0]
             candidates.append(root)
 
-        # On ajoute les symboles issus de la recherche EODHD, en filtrant sur les fonds
+        # symboles supplémentaires via le Search API
         try:
-            search_res = eodhd_get(f"/search/{base}", params={"type": "fund"})
-            if isinstance(search_res, list):
-                for it in search_res:
-                    code = it.get("Code")
-                    exch = it.get("Exchange")
-                    if code and exch:
-                        candidates.append(f"{code}.{exch}")
-                    elif code:
-                        candidates.append(code)
+            search_res = eodhd_search(base)
+            for it in search_res:
+                code = it.get("Code")
+                exch = it.get("Exchange")
+                if code and exch:
+                    candidates.append(f"{code}.{exch}")
+                elif code:
+                    candidates.append(code)
         except Exception:
             pass
 
-    # on dédoublonne
-    seen = set()
+    # dédoublonnage
+    seen: set[str] = set()
     uniq_candidates: List[str] = []
     for c in candidates:
         if c and c not in seen:
@@ -324,7 +430,6 @@ def get_fund_breakdowns(symbol: str) -> Dict[str, Dict[str, float] | List[Dict[s
             break
 
     if not js_used:
-        # Aucun symbole n'a donné de fondamentaux exploitables
         return {
             "asset_allocation": {},
             "regions": {},
@@ -332,7 +437,7 @@ def get_fund_breakdowns(symbol: str) -> Dict[str, Dict[str, float] | List[Dict[s
             "top10": [],
         }
 
-    # On cherche les blocs dans tout le JSON
+    # 2) tentative "classique" avec les clés EODHD usuelles
     raw_alloc = _deep_find_first(js_used, ["Asset_Allocation", "AssetAllocation"])
     raw_regions = _deep_find_first(js_used, ["World_Regions", "WorldRegions"])
     raw_sectors = _deep_find_first(js_used, ["Sector_Weights", "SectorWeights", "Sector_Weightings"])
@@ -354,7 +459,7 @@ def get_fund_breakdowns(symbol: str) -> Dict[str, Dict[str, float] | List[Dict[s
                 or item.get("Symbol")
             )
             val = None
-            for key_pct in ("Assets_%", "Fund_%", "Weight", "Percent"):
+            for key_pct in ("Assets_%", "Fund_%", "Weight", "Percent", "Percentage", "Value"):
                 if key_pct in item:
                     val = item[key_pct]
                     break
@@ -366,13 +471,14 @@ def get_fund_breakdowns(symbol: str) -> Dict[str, Dict[str, float] | List[Dict[s
                 continue
             top10_list.append({"name": str(label), "weight": w})
 
-    # Normalisation douce des pourcentages (on garde les proportions)
-    def _renormalize(d: Dict[str, float]) -> Dict[str, float]:
-        s = sum(d.values())
-        if s <= 0:
-            return {}
-        return {k: 100.0 * v / s for k, v in d.items()}
+    # 3) Si rien trouvé via les clés standard, on tente une détection heuristique
+    if not alloc and not regions and not sectors:
+        guessed = _guess_breakdown_from_structure(js_used)
+        alloc = guessed.get("asset_allocation", {})
+        regions = guessed.get("regions", {})
+        sectors = guessed.get("sectors", {})
 
+    # 4) Renormalisation douce
     alloc = _renormalize(alloc)
     regions = _renormalize(regions)
     sectors = _renormalize(sectors)
@@ -383,6 +489,9 @@ def get_fund_breakdowns(symbol: str) -> Dict[str, Dict[str, float] | List[Dict[s
         "sectors": sectors,
         "top10": top10_list,
     }
+
+
+
 
 
 def _accumulate_weighted(target: Dict[str, float], src: Dict[str, float], w_line: float) -> None:

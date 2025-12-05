@@ -1784,3 +1784,129 @@ with st.expander("Aide rapide"):
   avec un contrôle automatique de cohérence par rapport aux montants bruts saisis.
         """
     )
+
+
+# ------------------------------------------------------------
+# 🔍 Debug EODHD (prix & fondamentaux)
+# ------------------------------------------------------------
+with st.expander("🔍 Debug EODHD (symboles / fundamentals)", expanded=False):
+    st.markdown(
+        """
+Ce bloc permet de voir **exactement** ce que renvoie EODHD pour une ligne de portefeuille :
+- symboles candidats utilisés pour les prix,
+- résultat de `/search`,
+- JSON brut de `/fundamentals/{symbol}`,
+- ce que `get_fund_breakdowns` parvient (ou pas) à extraire.
+"""
+    )
+
+    # Choix du portefeuille à inspecter
+    port_choice = st.radio(
+        "Portefeuille à inspecter",
+        options=["Client (A)", "Valority (B)"],
+        horizontal=True,
+        key="dbg_port_choice",
+    )
+
+    if "A" in port_choice:
+        lines_dbg = st.session_state.get("A_lines", [])
+        port_key_dbg = "A_lines"
+    else:
+        lines_dbg = st.session_state.get("B_lines", [])
+        port_key_dbg = "B_lines"
+
+    if not lines_dbg:
+        st.info("Aucune ligne dans ce portefeuille pour l’instant.")
+    else:
+        # Liste des lignes sous forme lisible
+        options = []
+        for i, ln in enumerate(lines_dbg):
+            lbl = ln.get("name") or ln.get("isin") or f"Ligne {i+1}"
+            isin = ln.get("isin", "")
+            options.append(f"{i+1}. {lbl} ({isin})")
+
+        idx_str = st.selectbox(
+            "Choisis une ligne à inspecter",
+            options=options,
+            key="dbg_line_choice",
+        )
+        idx = options.index(idx_str)
+        ln = lines_dbg[idx]
+
+        st.markdown("**Ligne sélectionnée :**")
+        st.json(
+            {
+                "name": ln.get("name"),
+                "isin": ln.get("isin"),
+                "sym_used": ln.get("sym_used"),
+                "buy_date": str(ln.get("buy_date")),
+                "amount_gross": ln.get("amount_gross"),
+            }
+        )
+
+        ident = (ln.get("isin") or ln.get("name") or "").strip()
+        if not ident:
+            st.warning("La ligne n’a ni ISIN ni nom exploitable.")
+        else:
+            st.markdown(f"**Identifiant utilisé (ISIN ou nom) :** `{ident}`")
+
+            # 1) Symboles candidats utilisés pour les PRIX
+            try:
+                cands = _symbol_candidates(ident)
+            except Exception as e:
+                cands = []
+                st.error(f"Erreur dans _symbol_candidates : {e}")
+
+            st.markdown("**Symboles candidats pour les PRIX (via `_symbol_candidates`) :**")
+            if not cands:
+                st.write("Aucun candidat.")
+            else:
+                st.write(cands)
+
+            # 2) Résultat brut de /search
+            st.markdown("**Résultat brut de `/search` (EODHD) :**")
+            try:
+                search_res = eodhd_search(ident)
+                st.json(search_res)
+            except Exception as e:
+                st.error(f"Erreur lors de l’appel à eodhd_search : {e}")
+                search_res = []
+
+            # 3) Choix du symbole à tester pour les fondamentaux
+            sym_default = ln.get("sym_used") or (cands[0] if cands else "")
+            sym_to_test = st.text_input(
+                "Symbole EODHD à tester pour les fondamentaux",
+                value=sym_default,
+                key="dbg_sym_to_test",
+                help="Tu peux modifier ce symbole manuellement pour tester différentes variantes.",
+            )
+
+            if sym_to_test:
+                if st.button("Charger les fondamentaux pour ce symbole", key="dbg_load_fund"):
+                    # 3a) JSON brut de /fundamentals/{symbol}
+                    try:
+                        js_fund = eodhd_fundamentals(sym_to_test)
+                    except Exception as e:
+                        js_fund = {}
+                        st.error(f"Erreur lors de l’appel à eodhd_fundamentals : {e}")
+
+                    if not js_fund:
+                        st.warning("Aucun JSON de fondamentaux renvoyé pour ce symbole.")
+                    else:
+                        st.markdown("**Clés de premier niveau de `/fundamentals` :**")
+                        st.write(list(js_fund.keys()))
+
+                        # On affiche un extrait pour inspection (le JSON complet peut être très long)
+                        st.markdown("**Extrait du JSON brut (fundamentals) :**")
+                        st.json(js_fund)
+
+                    # 3b) Ce que notre fonction get_fund_breakdowns retourne
+                    st.markdown("**Sortie de `get_fund_breakdowns(sym_to_test)` :**")
+                    try:
+                        dbg_break = get_fund_breakdowns(sym_to_test)
+                        st.json(dbg_break)
+                    except Exception as e:
+                        st.error(f"Erreur dans get_fund_breakdowns : {e}")
+            else:
+                st.info("Renseigne un symbole EODHD à tester pour les fondamentaux.")
+

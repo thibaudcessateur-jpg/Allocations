@@ -14,113 +14,140 @@ import altair as alt
 # Constantes & univers de fonds recommandés
 # ------------------------------------------------------------
 TODAY = pd.Timestamp.today().normalize()
-APP_TITLE = "Comparateur de portefeuilles"
 
-RECO_FUNDS_CORE = [
-    ("R-co Valor C EUR", "FR0011253624"),
-    ("Vivalor International", "FR0014001LS1"),
-    ("CARMIGNAC Investissement A EUR", "FR0010148981"),
-    ("FIDELITY FUNDS - WORLD FUND", "LU0069449576"),
-    ("CLARTAN VALEURS", "LU1100076550"),
-    ("CARMIGNAC PATRIMOINE", "FR0010135103"),
-]
+FRAIS_ENTREE_DEFAULT = 0.0  # en % du montant investi
 
-RECO_FUNDS_DEF = [
-    ("Fonds en euros (EUROFUND)", "EUROFUND"),
-    ("SYCOYIELD 2030 RC", "FR001400MCQ6"),
-    ("R-Co Target 2029 HY", "FR0014002XJ3"),
-    ("Euro Bond 1-3 Years", "LU0321462953"),
-]
-
-# Libellés FR -> codes internes pour l'affectation des versements
-ALLOC_LABELS = {
-    "Répartition égale": "equal",
-    "Personnalisé": "custom",
-    "Tout sur une ligne": "single",
+# Exemple d’univers de fonds (à adapter à ta base réelle)
+UNIVERSE_FUNDS = {
+    "R-co VALOR": {
+        "isin": "FR0010588343",
+        "name": "R-Co Valor C EUR",
+        "type": "actions monde",
+    },
+    "Vivalor International": {
+        "isin": "FR0010621910",
+        "name": "Vivalor International",
+        "type": "actions internationales",
+    },
+    "CARMIGNAC Investissement": {
+        "isin": "FR0010148981",
+        "name": "Carmignac Investissement A EUR Acc",
+        "type": "actions monde",
+    },
+    "Fidelity World": {
+        "isin": "LU0261953909",
+        "name": "Fidelity Funds - World Fund A-Acc-EUR",
+        "type": "actions monde",
+    },
+    "Clartan Valeurs": {
+        "isin": "FR0010312921",
+        "name": "Clartan Valeurs C",
+        "type": "actions Europe / Monde",
+    },
+    "CARMIGNAC Patrimoine": {
+        "isin": "FR0010135103",
+        "name": "Carmignac Patrimoine A EUR Acc",
+        "type": "mixte patrimonial",
+    },
 }
 
+# ------------------------------------------------------------
+# Paramètres EODHD
+# ------------------------------------------------------------
+EODHD_BASE_URL = "https://eodhd.com/api"
+EODHD_API_TOKEN = st.secrets.get("EODHD_API_TOKEN", "")
+
+if not EODHD_API_TOKEN:
+    st.warning(
+        "⚠️ Clé API EODHD manquante dans `st.secrets`. "
+        "Ajoute `EODHD_API_TOKEN` dans ton fichier de configuration."
+    )
 
 # ------------------------------------------------------------
-# Utils format
+# Helpers généraux
 # ------------------------------------------------------------
-def to_eur(x: Any) -> str:
-    try:
-        v = float(x)
-    except Exception:
+
+
+def to_eur(x: float | int | None) -> str:
+    if x is None:
         return "—"
-    s = f"{v:,.2f}".replace(",", "X").replace(".", ",").replace("X", " ")
-    return s + " €"
+    return f"{x:,.0f} €".replace(",", " ").replace(".", ",")
 
 
-def fmt_date(x: Any) -> str:
-    try:
-        return pd.Timestamp(x).strftime("%d/%m/%Y")
-    except Exception:
+def to_pct(x: float | int | None, decimals: int = 2) -> str:
+    if x is None:
         return "—"
+    return f"{x:.{decimals}f} %".replace(".", ",")
 
 
-# ------------------------------------------------------------
-# XIRR
-# ------------------------------------------------------------
-def _npv(rate: float, cfs: List[Tuple[pd.Timestamp, float]]) -> float:
-    t0 = cfs[0][0]
-    return sum(cf / ((1 + rate) ** ((t - t0).days / 365.25)) for t, cf in cfs)
-
-
-def xirr(cash_flows: List[Tuple[pd.Timestamp, float]], guess: float = 0.1) -> Optional[float]:
-    if not cash_flows:
-        return None
-    cfs = sorted(cash_flows, key=lambda x: x[0])
+def safe_float(x: Any) -> Optional[float]:
     try:
-        r = guess
-        for _ in range(100):
-            f = _npv(r, cfs)
-            h = 1e-6
-            f1 = _npv(r + h, cfs)
-            d = (f1 - f) / h
-            if abs(d) < 1e-12:
-                break
-            r2 = r - f / d
-            if abs(r2 - r) < 1e-9:
-                r = r2
-                break
-            r = r2
-        return r
+        if x is None or (isinstance(x, float) and np.isnan(x)):
+            return None
+        return float(x)
     except Exception:
         return None
 
 
 # ------------------------------------------------------------
-# API EODHD
+# EODHD : fonction générique d'appel API
 # ------------------------------------------------------------
-def _get_api_key() -> str:
-    return st.secrets.get("EODHD_API_KEY", "")
-
 
 @st.cache_data(show_spinner=False, ttl=3600)
-def eodhd_get(path: str, params: Dict[str, Any] | None = None) -> Any:
-    base = "https://eodhd.com/api"
-    token = _get_api_key()
-    p = {"api_token": token, "fmt": "json"}
-    if params:
-        p.update(params)
-    r = requests.get(f"{base}{path}", params=p, timeout=20)
-    r.raise_for_status()
+def eodhd_get(path: str, params: Optional[Dict[str, Any]] = None) -> Any:
+    if not EODHD_API_TOKEN:
+        return None
+    if params is None:
+        params = {}
+    params = dict(params)
+    params["api_token"] = EODHD_API_TOKEN
+    params["fmt"] = "json"
+
+    url = f"{EODHD_BASE_URL}{path}"
+    resp = requests.get(url, params=params, timeout=20)
+    resp.raise_for_status()
     try:
-        return r.json()
+        return resp.json()
     except Exception:
         return None
 
+
+# ------------------------------------------------------------
+# EODHD Search : trouver un symbole à partir d'un nom ou d'un ISIN
+# ------------------------------------------------------------
 
 @st.cache_data(show_spinner=False, ttl=3600)
 def eodhd_search(q: str) -> List[Dict[str, Any]]:
-    try:
-        js = eodhd_get(f"/search/{q}")
-        if isinstance(js, list):
-            return js
-    except Exception:
-        pass
+    if not q:
+        return []
+    res = eodhd_get("/search/" + q, params={"limit": 50})
+    if isinstance(res, list):
+        return res
     return []
+
+
+# ------------------------------------------------------------
+# EODHD Prices : série quotidienne (avec adjusted_close)
+# ------------------------------------------------------------
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def eodhd_prices_daily(symbol: str) -> pd.DataFrame:
+    try:
+        js = eodhd_get(f"/eod/{symbol}", params={"period": "d"})
+        if not isinstance(js, list) or len(js) == 0:
+            return pd.DataFrame()
+        df = pd.DataFrame(js)
+        df["date"] = pd.to_datetime(df["date"])
+        df.set_index("date", inplace=True)
+        if "adjusted_close" in df.columns and pd.notnull(df["adjusted_close"]).any():
+            df["Close"] = df["adjusted_close"].astype(float)
+        elif "close" in df.columns:
+            df["Close"] = df["close"].astype(float)
+        else:
+            return pd.DataFrame()
+        return df[["Close"]].sort_index()
+    except Exception:
+        return pd.DataFrame()
 
 # ------------------------------------------------------------
 # EODHD Fundamentals : récupération + normalisation des breakdowns
@@ -129,8 +156,8 @@ def eodhd_search(q: str) -> List[Dict[str, Any]]:
 @st.cache_data(show_spinner=False, ttl=3600)
 def eodhd_fundamentals(symbol: str) -> Dict[str, Any]:
     """
-    Appel bas niveau de l'API /fundamentals/{symbol} d'EODHD.
-    On renvoie toujours un dict (éventuellement vide).
+    Récupère le JSON complet des fondamentaux EODHD pour un symbole
+    (fonds/ETF/action).
     """
     try:
         js = eodhd_get(f"/fundamentals/{symbol}", params=None)
@@ -371,105 +398,80 @@ def get_fund_breakdowns(symbol: str) -> Dict[str, Dict[str, float] | List[Dict[s
 
 def _accumulate_weighted(target: Dict[str, float], src: Dict[str, float], w_line: float) -> None:
     """
-    Ajoute à 'target' les pourcentages d'un breakdown de fonds
-    pondérés par le poids du fonds dans le portefeuille.
-    src = {label: %du fonds}, w_line = poids du fonds dans le portefeuille (0-1).
+    Ajoute dans 'target' le breakdown 'src' pondéré par w_line.
     """
     for k, v in src.items():
+        if v is None:
+            continue
         target[k] = target.get(k, 0.0) + w_line * (v / 100.0)
 
 
 def aggregate_portfolio_breakdowns(
     lines: List[Dict[str, Any]],
     euro_rate: float,
-    fee_pct: float,
 ) -> Dict[str, Any]:
     """
-    Calcule la répartition globale du portefeuille à partir des breakdowns EODHD
-    et des montants investis nets (investi net des frais d'entrée).
+    Agrège les breakdowns de chaque ligne de portefeuille (si disponible via EODHD)
+    en un breakdown global pondéré par le poids de chaque ligne.
     """
-    if not lines:
-        return {
-            "asset_allocation": {},
-            "regions": {},
-            "sectors": {},
-            "top10": [],
-        }
-
-    # 1) Poids des lignes dans le portefeuille (en % des montants nets investis)
-    total_net = 0.0
-    by_symbol_net: Dict[str, float] = {}
-
-    for ln in lines:
-        isin_or_name = ln.get("isin") or ln.get("name")
-        if not isin_or_name:
-            continue
-
-        # EUROFUND : pas de fundamentals EODHD, on le traite à part
-        if str(isin_or_name).upper() == "EUROFUND":
-            symbol = "EUROFUND"
-        else:
-            sym_used = ln.get("sym_used", "")
-            if not sym_used:
-                df_tmp, sym, _dbg = get_price_series(isin_or_name, None, euro_rate)
-                symbol = sym
-                ln["sym_used"] = sym
-            else:
-                symbol = sym_used
-
-        if not symbol:
-            continue
-
-        try:
-            brut = float(ln.get("amount_gross", 0.0))
-        except Exception:
-            brut = 0.0
-        if brut <= 0:
-            continue
-
-        net = brut * (1.0 - fee_pct / 100.0)
-        if net <= 0:
-            continue
-
-        total_net += net
-        by_symbol_net[symbol] = by_symbol_net.get(symbol, 0.0) + net
-
-    if total_net <= 0:
-        return {
-            "asset_allocation": {},
-            "regions": {},
-            "sectors": {},
-            "top10": [],
-        }
-
-    # 2) Breakdowns globaux pondérés
     alloc_tot: Dict[str, float] = {}
     regions_tot: Dict[str, float] = {}
     sectors_tot: Dict[str, float] = {}
     top10_tot: Dict[str, float] = {}
 
-    for symbol, net_amt in by_symbol_net.items():
-        w_line = net_amt / total_net  # poids de la ligne dans le portefeuille
+    # On commence par calculer la valeur de chaque ligne
+    total_val = 0.0
+    line_values: List[float] = []
 
-        if symbol == "EUROFUND":
-            # Convention : 100% "Fonds en euros"
-            _accumulate_weighted(alloc_tot, {"Fonds en euros": 100.0}, w_line)
+    for ln in lines:
+        amt = safe_float(ln.get("amount"))
+        px = safe_float(ln.get("last_price"))
+        if amt is None or px is None or px <= 0:
+            line_values.append(0.0)
+            continue
+        val = amt * px
+        total_val += val
+        line_values.append(val)
+
+    if total_val <= 0:
+        return {
+            "asset_allocation": {},
+            "regions": {},
+            "sectors": {},
+            "top10": [],
+        }
+
+    for ln, val_line in zip(lines, line_values):
+        if val_line <= 0:
+            continue
+        w_line = val_line / total_val
+
+        sym_used = ln.get("sym_used", "")
+        if not sym_used:
+            # On tente de retrouver un symbole via l'ISIN ou le nom
+            isin_or_name = ln.get("isin") or ln.get("name") or ""
+            df_tmp, sym, _dbg = get_price_series(isin_or_name, None, euro_rate)
+            if sym:
+                sym_used = sym
+                ln["sym_used"] = sym
+        if not sym_used:
             continue
 
-        bks = get_fund_breakdowns(symbol)
-        alloc = bks.get("asset_allocation", {}) or {}
-        regs = bks.get("regions", {}) or {}
-        sect = bks.get("sectors", {}) or {}
-        top10 = bks.get("top10", []) or []
+        bkd = get_fund_breakdowns(sym_used)
+        alloc = bkd.get("asset_allocation", {}) or {}
+        regions = bkd.get("regions", {}) or {}
+        sectors = bkd.get("sectors", {}) or {}
+        top10 = bkd.get("top10", []) or []
 
         _accumulate_weighted(alloc_tot, alloc, w_line)
-        _accumulate_weighted(regions_tot, regs, w_line)
-        _accumulate_weighted(sectors_tot, sect, w_line)
+        _accumulate_weighted(regions_tot, regions, w_line)
+        _accumulate_weighted(sectors_tot, sectors, w_line)
 
+        # Top10 agrégé
         for h in top10:
             nm = h.get("name")
-            wt = h.get("weight")
-            if nm is None or wt is None:
+            wt = safe_float(h.get("weight"))
+            if not nm or wt is None:
                 continue
             try:
                 wt = float(wt)
@@ -502,56 +504,18 @@ def aggregate_portfolio_breakdowns(
         "top10": top10_list,
     }
 
-
-def _pie_chart_from_dict(title: str, d: Dict[str, float]):
-    if not d:
-        st.caption(f"{title} : données indisponibles.")
-        return
-    df = (
-        pd.DataFrame({"Label": list(d.keys()), "Poids": list(d.values())})
-        .sort_values("Poids", ascending=False)
-    )
-    chart = (
-        alt.Chart(df)
-        .mark_arc()
-        .encode(
-            theta=alt.Theta("Poids:Q", title="Poids (%)"),
-            color=alt.Color("Label:N", legend=alt.Legend(title=title)),
-            tooltip=["Label", alt.Tooltip("Poids:Q", format=".1f")],
-        )
-        .properties(height=260, width=260)
-    )
-    st.altair_chart(chart, use_container_width=False)
-
-
-def _bar_chart_top_holdings(title: str, holdings: List[Dict[str, Any]]):
-    if not holdings:
-        st.caption(f"{title} : données indisponibles.")
-        return
-    df = (
-        pd.DataFrame(holdings)
-        .sort_values("weight", ascending=False)
-        .head(10)
-    )
-    chart = (
-        alt.Chart(df)
-        .mark_bar()
-        .encode(
-            x=alt.X("weight:Q", title="Poids (%)"),
-            y=alt.Y("name:N", sort="-x", title=""),
-            tooltip=["name", alt.Tooltip("weight:Q", format=".1f")],
-        )
-        .properties(height=260)
-    )
-    st.altair_chart(chart, use_container_width=True)
+# ------------------------------------------------------------
+# Helpers pour récupérer les prix et symboles
+# ------------------------------------------------------------
 
 def _symbol_candidates(isin_or_name: str) -> List[str]:
     val = str(isin_or_name).strip()
     if not val:
         return []
-    if val.upper() == "EUROFUND":
-        return ["EUROFUND"]
+
+    # On tente quelques variations classiques
     candidates = [f"{val}.EUFUND", f"{val}.FUND", val]
+
     try:
         res = eodhd_search(val)
         for it in res:
@@ -561,50 +525,31 @@ def _symbol_candidates(isin_or_name: str) -> List[str]:
                 candidates.append(f"{code}.{exch}")
     except Exception:
         pass
+
+    # Déduplication
     seen = set()
-    uniq = []
+    out: List[str] = []
     for c in candidates:
-        if c not in seen:
+        if c and c not in seen:
             seen.add(c)
-            uniq.append(c)
-    return uniq
-
-
-def _get_close_on(df: pd.DataFrame, d: pd.Timestamp) -> float:
-    if df.empty:
-        return np.nan
-    if d in df.index:
-        return float(df.loc[d, "Close"])
-    after = df.loc[df.index >= d]
-    if not after.empty:
-        return float(after.iloc[0]["Close"])
-    return float(df.iloc[-1]["Close"])
+            out.append(c)
+    return out
 
 
 @st.cache_data(show_spinner=False, ttl=3600)
 def get_price_series(
-    isin_or_name: str, start: Optional[pd.Timestamp], euro_rate: float
+    isin_or_name: str,
+    start: Optional[pd.Timestamp],
+    euro_rate: float,
 ) -> Tuple[pd.DataFrame, str, str]:
     """
-    EUROFUND : série capitalisée à euro_rate %/an à partir de 1.0
+    Retourne (df, symbole_retenu, debug_json)
+    df contient une colonne 'Close' indexée par date.
     """
-    debug = {"cands": []}
     val = str(isin_or_name).strip()
+    debug = {"input": val}
     if not val:
         return pd.DataFrame(), "", json.dumps(debug)
-
-    if val.upper() == "EUROFUND":
-        idx = pd.bdate_range(start=pd.Timestamp("2000-01-03"), end=TODAY, freq="B")
-        days = (idx - idx[0]).days.values.astype(float)
-        rate = euro_rate / 100.0
-        growth = (1.0 + rate) ** (days / 365.25)
-        df = pd.DataFrame({"Close": growth}, index=idx)
-        if start is not None:
-            df = df.loc[df.index >= start]
-        return df, "EUROFUND", json.dumps(debug)
-
-        # (note : ce return interrompt la suite pour EUROFUND,
-        # donc le reste ne s'applique qu'aux autres fonds)
 
     cands = _symbol_candidates(val)
     debug["cands"] = cands
@@ -618,1072 +563,435 @@ def get_price_series(
 
 
 # ------------------------------------------------------------
-# Alternatives si date < 1ère VL
+# XIRR / TRI
 # ------------------------------------------------------------
-def suggest_alternative_funds(buy_date: pd.Timestamp, euro_rate: float) -> List[Tuple[str, str, pd.Timestamp]]:
-    """
-    Propose des fonds recommandés (core + défensifs) dont la première VL
-    est antérieure ou égale à la date d'achat donnée.
-    Retourne (nom, isin, date_inception).
-    """
-    alternatives: List[Tuple[str, str, pd.Timestamp]] = []
-    universe = RECO_FUNDS_CORE + RECO_FUNDS_DEF
 
-    for name, isin in universe:
-        df, _, _ = get_price_series(isin, None, euro_rate)
+def xnpv(rate: float, cash_flows: List[Tuple[pd.Timestamp, float]]) -> float:
+    t0 = cash_flows[0][0]
+    return sum(
+        cf / (1.0 + rate) ** ((t - t0).days / 365.0)
+        for (t, cf) in cash_flows
+    )
+
+
+def xirr(cash_flows: List[Tuple[pd.Timestamp, float]], guess: float = 0.1) -> Optional[float]:
+    if not cash_flows:
+        return None
+    try:
+        rate = guess
+        for _ in range(100):
+            f = xnpv(rate, cash_flows)
+            eps = 1e-7
+            f_der = (xnpv(rate + eps, cash_flows) - f) / eps
+            if abs(f_der) < 1e-12:
+                break
+            new_rate = rate - f / f_der
+            if abs(new_rate - rate) < 1e-7:
+                rate = new_rate
+                break
+            rate = new_rate
+        return 100.0 * rate
+    except Exception:
+        return None
+
+# ------------------------------------------------------------
+# UI : Configuration de la page
+# ------------------------------------------------------------
+
+st.set_page_config(
+    page_title="Simulation de portefeuilles Valority",
+    layout="wide",
+)
+
+st.title("Simulation de portefeuilles Valority")
+
+st.markdown(
+    """
+Cette application te permet de comparer **l'allocation actuelle** d'un client
+avec une **allocation recommandée Valority**, en simulant les performances
+historiques et la diversification.
+"""
+)
+
+# ------------------------------------------------------------
+# Saisie des paramètres globaux
+# ------------------------------------------------------------
+
+col1, col2, col3 = st.columns(3)
+
+with col1:
+    capital_initial = st.number_input(
+        "Capital initial investi (€)",
+        min_value=0.0,
+        value=50000.0,
+        step=1000.0,
+        format="%.0f",
+    )
+
+with col2:
+    frais_entree_pct = st.number_input(
+        "Frais d'entrée (%)",
+        min_value=0.0,
+        max_value=5.0,
+        value=FRAIS_ENTREE_DEFAULT,
+        step=0.10,
+        format="%.2f",
+    )
+
+with col3:
+    euro_rate = st.number_input(
+        "Taux de change EUR (pour conversion éventuelle)",
+        min_value=0.5,
+        max_value=2.0,
+        value=1.0,
+        step=0.01,
+        format="%.2f",
+        help="Si tous les fonds sont en EUR, laisse 1,00.",
+    )
+
+# ------------------------------------------------------------
+# Tables d'allocation Client / Valority
+# ------------------------------------------------------------
+
+st.markdown("## 1️⃣ Allocation actuelle du client")
+
+st.markdown(
+    """
+Renseigne les lignes de l'allocation actuelle du client.  
+Tu peux saisir un **ISIN** ou le **nom du fonds**.
+"""
+)
+
+if "A_lines" not in st.session_state:
+    st.session_state["A_lines"] = []
+
+if "B_lines" not in st.session_state:
+    st.session_state["B_lines"] = []
+
+def _new_line() -> Dict[str, Any]:
+    return {
+        "isin": "",
+        "name": "",
+        "amount": 0.0,
+        "last_price": None,
+        "sym_used": "",
+        "debug": "",
+    }
+
+def _line_editor(key_prefix: str, lines: List[Dict[str, Any]]) -> None:
+    """
+    Édition d'une liste de lignes (allocation client ou Valority).
+    """
+    to_delete = []
+    for i, ln in enumerate(lines):
+        with st.expander(f"Ligne {i+1}", expanded=True):
+            c1, c2, c3, c4 = st.columns([2, 3, 2, 1])
+            with c1:
+                ln["isin"] = st.text_input("ISIN", value=ln.get("isin", ""), key=f"{key_prefix}_isin_{i}")
+            with c2:
+                ln["name"] = st.text_input("Nom du fonds", value=ln.get("name", ""), key=f"{key_prefix}_name_{i}")
+            with c3:
+                ln["amount"] = st.number_input(
+                    "Montant investi (€)",
+                    min_value=0.0,
+                    value=float(ln.get("amount") or 0.0),
+                    step=1000.0,
+                    format="%.0f",
+                    key=f"{key_prefix}_amount_{i}",
+                )
+            with c4:
+                if st.button("Supprimer", key=f"{key_prefix}_del_{i}"):
+                    to_delete.append(i)
+
+            # Affichage éventuel d'infos de debug
+            if ln.get("debug"):
+                with st.expander("Debug symbole EODHD", expanded=False):
+                    st.code(ln["debug"], language="json")
+
+    # Suppression des lignes marquées
+    for idx in sorted(to_delete, reverse=True):
+        if 0 <= idx < len(lines):
+            lines.pop(idx)
+
+    # Bouton d'ajout
+    if st.button("Ajouter une ligne", key=f"{key_prefix}_add"):
+        lines.append(_new_line())
+
+
+_line_editor("A", st.session_state["A_lines"])
+
+st.markdown("---")
+st.markdown("## 2️⃣ Allocation recommandée Valority")
+
+_line_editor("B", st.session_state["B_lines"])
+
+# ------------------------------------------------------------
+# Simulation des performances
+# ------------------------------------------------------------
+
+st.markdown("## 3️⃣ Simulation historique des portefeuilles")
+
+st.markdown(
+    """
+On reconstruit l'historique des deux portefeuilles (Client vs Valority) à partir
+des prix EODHD des supports saisis, puis on compare les courbes et les TRI (XIRR).
+"""
+)
+
+# Helpers calculs lignes / portefeuilles
+
+def compute_line_metrics(
+    line: Dict[str, Any],
+    fee_pct: float,
+    euro_rate: float,
+) -> Tuple[Optional[float], Optional[float], Optional[float]]:
+    """
+    Calcule, pour une ligne, le montant net investi, le prix d'achat moyen
+    (approximatif) et la quantité d'unités.
+    """
+    amt = safe_float(line.get("amount"))
+    if amt is None or amt <= 0:
+        return None, None, None
+
+    net_amt = amt * (1.0 - fee_pct / 100.0)
+    buy_px = safe_float(line.get("last_price"))
+    if buy_px is None or buy_px <= 0:
+        isin_or_name = line.get("isin") or line.get("name")
+        dfp, sym, dbg = get_price_series(isin_or_name, None, euro_rate)
+        line["sym_used"] = sym
+        line["debug"] = dbg
+        if dfp.empty:
+            return net_amt, None, None
+        buy_px = float(dfp["Close"].iloc[0])
+        line["last_price"] = buy_px
+
+    qty_disp = net_amt / buy_px if buy_px > 0 else None
+    return net_amt, buy_px, qty_disp
+
+
+def build_portfolio_series(
+    lines: List[Dict[str, Any]],
+    fee_pct: float,
+    euro_rate: float,
+) -> Tuple[pd.Series, Dict[str, Any]]:
+    """
+    Construit l'historique de valeur d'un portefeuille.
+    Retourne (serie_valeur, infos_debug).
+    """
+    all_series: List[pd.Series] = []
+    debug: Dict[str, Any] = {"lines": []}
+
+    for i, ln in enumerate(lines):
+        net_amt, buy_px, qty = compute_line_metrics(ln, fee_pct, euro_rate)
+        if net_amt is None or buy_px is None or qty is None:
+            continue
+
+        isin_or_name = ln.get("isin") or ln.get("name")
+        df, sym, dbg = get_price_series(isin_or_name, None, euro_rate)
+        ln["sym_used"] = sym
+        ln["debug"] = dbg
+
         if df.empty:
             continue
-        inception = df.index.min()
-        if inception <= buy_date:
-            alternatives.append((name, isin, inception))
 
-    return alternatives
-
-
-# ------------------------------------------------------------
-# Calendrier versements & poids
-# ------------------------------------------------------------
-def _month_schedule(d0: pd.Timestamp, d1: pd.Timestamp) -> List[pd.Timestamp]:
-    if d0 > d1:
-        return []
-    out = []
-    cur = pd.Timestamp(d0.year, d0.month, 1)
-    stop = pd.Timestamp(d1.year, d1.month, 1)
-    while cur <= stop:
-        bdays = pd.bdate_range(start=cur, end=cur + pd.offsets.MonthEnd(0))
-        if len(bdays) > 0:
-            out.append(bdays[0])
-        cur = cur + pd.offsets.MonthBegin(1)
-    return out
-
-
-def _weights_for(
-    lines: List[Dict[str, Any]],
-    alloc_mode: str,
-    custom_weights: Dict[int, float],
-    single_target: Optional[int],
-) -> Dict[int, float]:
-    keys = [id(ln) for ln in lines]
-    if len(keys) == 0:
-        return {}
-    if alloc_mode == "equal":
-        w = 1.0 / len(keys)
-        return {k: w for k in keys}
-    if alloc_mode == "custom":
-        tot = sum(max(0.0, float(custom_weights.get(id(ln), 0.0))) for ln in lines)
-        if tot <= 0:
-            w = 1.0 / len(keys)
-            return {k: w for k in keys}
-        return {id(ln): max(0.0, float(custom_weights.get(id(ln), 0.0))) / tot for ln in lines}
-    if alloc_mode == "single":
-        target = single_target
-        return {id(ln): (1.0 if id(ln) == target else 0.0) for ln in lines}
-    w = 1.0 / len(keys)
-    return {k: w for k in keys}
-
-
-# ------------------------------------------------------------
-# Calcul par ligne (avec frais)
-# ------------------------------------------------------------
-def compute_line_metrics(
-    line: Dict[str, Any], fee_pct: float, euro_rate: float
-) -> Tuple[float, float, float]:
-    amt_brut = float(line.get("amount_gross", 0.0))
-    net_amt = amt_brut * (1.0 - fee_pct / 100.0)
-    buy_ts = pd.Timestamp(line.get("buy_date"))
-    px_manual = line.get("buy_px", None)
-
-    dfp, _, _ = get_price_series(line.get("isin") or line.get("name"), buy_ts, euro_rate)
-    if str(line.get("sym_used", "")).upper() == "EUROFUND" or str(line.get("isin", "")).upper() == "EUROFUND":
-        px = _get_close_on(dfp, buy_ts)
-    else:
-        if px_manual not in (None, "", 0, "0"):
-            try:
-                px = float(px_manual)
-            except Exception:
-                px = _get_close_on(dfp, buy_ts)
-        else:
-            px = _get_close_on(dfp, buy_ts)
-
-    qty = (net_amt / px) if px and px > 0 else 0.0
-    return float(net_amt), float(px), float(qty)
-
-
-# ------------------------------------------------------------
-# Simulation d'un portefeuille (avec contrôle 1ère VL)
-# + distinction poids mensuels / ponctuels
-# ------------------------------------------------------------
-def simulate_portfolio(
-    lines: List[Dict[str, Any]],
-    monthly_amt_gross: float,
-    one_amt_gross: float,
-    one_date: date,
-    alloc_mode: str,
-    custom_weights_monthly: Optional[Dict[int, float]],
-    custom_weights_oneoff: Optional[Dict[int, float]],
-    single_target: Optional[int],
-    euro_rate: float,
-    fee_pct: float,
-    portfolio_label: str = "",
-) -> Tuple[pd.DataFrame, float, float, float, Optional[float], pd.Timestamp, pd.Timestamp]:
-    if not lines:
-        return pd.DataFrame(), 0.0, 0.0, 0.0, None, TODAY, TODAY
-
-    price_map: Dict[int, pd.Series] = {}
-    eff_buy_date: Dict[int, pd.Timestamp] = {}
-    buy_price_used: Dict[int, float] = {}
-
-    invalid_found = False
-    date_warnings = st.session_state.setdefault("DATE_WARNINGS", [])
-
-    for ln in lines:
-        key_id = id(ln)
-        df_full, sym, _ = get_price_series(ln.get("isin") or ln.get("name"), None, euro_rate)
-        if df_full.empty:
-            continue
-
-        inception = df_full.index.min()
-        d_buy = pd.Timestamp(ln["buy_date"])
-
-        if d_buy < inception:
-            invalid_found = True
-            ln["invalid_date"] = True
-            ln["inception_date"] = inception
-
-            alts = suggest_alternative_funds(d_buy, euro_rate)
-            if alts:
-                alt_lines = [
-                    f"- {name} ({isin}), historique depuis le {fmt_date(incep)}"
-                    for name, isin, incep in alts
-                ]
-                alt_msg = "\n".join(alt_lines)
-            else:
-                alt_msg = "Aucun fonds recommandé ne dispose d'un historique suffisant pour cette date."
-
-            date_warnings.append(
-                f"[{portfolio_label}] {ln.get('name','(sans nom)')} "
-                f"({ln.get('isin','—')}) :\n"
-                f"- Date d'achat saisie : {fmt_date(d_buy)}\n"
-                f"- 1ère VL disponible : {fmt_date(inception)}\n\n"
-                f"Impossible de simuler ce fonds sur toute la période demandée.\n"
-                f"Propositions d'alternatives pour l'analyse historique :\n{alt_msg}"
-            )
-            continue
-
-        ln["sym_used"] = sym
-        df = df_full
-
-        if d_buy in df.index:
-            px_buy = float(df.loc[d_buy, "Close"])
-            eff_dt = d_buy
-        else:
-            after = df.loc[df.index >= d_buy]
-            if after.empty:
-                px_buy = float(df.iloc[-1]["Close"])
-                eff_dt = df.index[-1]
-            else:
-                px_buy = float(after.iloc[0]["Close"])
-                eff_dt = after.index[0]
-        px_manual = ln.get("buy_px", None)
-        px_for_qty = float(px_manual) if (px_manual not in (None, "", 0, "0")) else px_buy
-        price_map[key_id] = df["Close"].astype(float)
-        eff_buy_date[key_id] = eff_dt
-        buy_price_used[key_id] = px_for_qty
-
-    if invalid_found and not price_map:
-        return pd.DataFrame(), 0.0, 0.0, 0.0, None, TODAY, TODAY
-    if not price_map:
-        return pd.DataFrame(), 0.0, 0.0, 0.0, None, TODAY, TODAY
-
-    start_min = min(eff_buy_date.values())
-    start_full = max(eff_buy_date.values())
-
-    bidx = pd.bdate_range(start=start_min, end=TODAY, freq="B")
-    prices = pd.DataFrame(index=bidx)
-    for key_id, s in price_map.items():
-        prices[key_id] = s.reindex(bidx).ffill()
-
-    qty_events = pd.DataFrame(0.0, index=bidx, columns=prices.columns)
-    total_brut = 0.0
-    total_net = 0.0
-    cash_flows: List[Tuple[pd.Timestamp, float]] = []
-
-    # Achats initiaux
-    for ln in lines:
-        key_id = id(ln)
-        if key_id not in prices.columns:
-            continue
-        brut = float(ln.get("amount_gross", 0.0))
-        net = brut * (1.0 - fee_pct / 100.0)
-        px = float(buy_price_used[key_id])
-        dt = eff_buy_date[key_id]
-        if brut > 0 and px > 0:
-            q = net / px
-            tgt = dt if dt in qty_events.index else qty_events.index[qty_events.index >= dt][0]
-            qty_events.loc[tgt, key_id] += q
-            total_brut += brut
-            total_net += net
-            cash_flows.append((tgt, -brut))
-
-    # Poids pour versements mensuels / ponctuels
-    weights_monthly = _weights_for(
-        lines,
-        alloc_mode,
-        custom_weights_monthly or {},
-        single_target,
-    )
-    weights_oneoff = _weights_for(
-        lines,
-        alloc_mode,
-        custom_weights_oneoff or {},
-        single_target,
-    )
-
-    # Versement ponctuel
-    if one_amt_gross > 0:
-        dt = pd.Timestamp(one_date)
-        if dt not in qty_events.index:
-            after = qty_events.index[qty_events.index >= dt]
-            if len(after) > 0:
-                dt = after[0]
-            else:
-                dt = None
-        if dt is not None:
-            net_amt = one_amt_gross * (1.0 - fee_pct / 100.0)
-            for ln in lines:
-                key_id = id(ln)
-                w = weights_oneoff.get(key_id, 0.0)
-                if w <= 0 or key_id not in prices.columns:
-                    continue
-                px = float(prices.loc[dt, key_id])
-                if px > 0:
-                    qty_events.loc[dt, key_id] += (net_amt * w) / px
-            total_brut += float(one_amt_gross)
-            total_net += float(net_amt)
-            cash_flows.append((dt, -float(one_amt_gross)))
-
-    # Mensuels
-    if monthly_amt_gross > 0:
-        sched = _month_schedule(start_min, TODAY)
-        for dt in sched:
-            if dt not in qty_events.index:
-                after = qty_events.index[qty_events.index >= dt]
-                if len(after) == 0:
-                    continue
-                dt = after[0]
-            net_m = monthly_amt_gross * (1.0 - fee_pct / 100.0)
-            for ln in lines:
-                key_id = id(ln)
-                w = weights_monthly.get(key_id, 0.0)
-                if w <= 0 or key_id not in prices.columns:
-                    continue
-                px = float(prices.loc[dt, key_id])
-                if px > 0:
-                    qty_events.loc[dt, key_id] += (net_m * w) / px
-            total_brut += float(monthly_amt_gross)
-            total_net += float(net_m)
-            cash_flows.append((dt, -float(monthly_amt_gross)))
-
-    qty_cum = qty_events.cumsum()
-    values = (qty_cum * prices).sum(axis=1)
-    df_val = pd.DataFrame({"Valeur": values})
-    final_val = float(df_val["Valeur"].iloc[-1]) if not df_val.empty else 0.0
-
-    cash_flows.append((TODAY, final_val))
-    irr = xirr(cash_flows)
-
-    return df_val, total_brut, total_net, final_val, (irr * 100.0 if irr is not None else None), start_min, start_full
-
-
-# ------------------------------------------------------------
-# Cartes lignes (édition / suppression)
-# ------------------------------------------------------------
-def _line_card(line: Dict[str, Any], idx: int, port_key: str):
-    state_key = f"edit_mode_{port_key}_{idx}"
-    if state_key not in st.session_state:
-        st.session_state[state_key] = False
-
-    fee_pct = st.session_state.get("FEE_A", 0.0) if port_key == "A_lines" else st.session_state.get("FEE_B", 0.0)
-    euro_rate = st.session_state.get("EURO_RATE_PREVIEW", 2.0)
-    net_amt, buy_px, qty_disp = compute_line_metrics(line, fee_pct, euro_rate)
-
-    with st.container(border=True):
-        cols = st.columns([3, 2, 2, 2, 1])
-        with cols[0]:
-            st.markdown(f"**{line.get('name','—')}**")
-            st.caption(f"ISIN / Code : `{line.get('isin','—')}`")
-            st.caption(f"Symbole EODHD : `{line.get('sym_used','—')}`")
-            if line.get("invalid_date"):
-                st.markdown(
-                    f"⚠️ Date d'achat antérieure à la 1ère VL ({fmt_date(line.get('inception_date'))}).",
-                )
-        with cols[1]:
-            st.markdown(f"Investi (brut)\n\n**{to_eur(line.get('amount_gross', 0.0))}**")
-            st.caption(f"Net après frais {fee_pct:.1f}% : **{to_eur(net_amt)}**")
-            st.caption(f"Date d'achat : {fmt_date(line.get('buy_date'))}")
-        with cols[2]:
-            st.markdown(f"VL d'achat\n\n**{to_eur(buy_px)}**")
-            st.caption(f"Quantité : {qty_disp:.6f}")
-            if line.get("note"):
-                st.caption(line["note"])
-        with cols[3]:
-            try:
-                dfl, _, _ = get_price_series(line.get("isin") or line.get("name"), None, euro_rate)
-                last = float(dfl["Close"].iloc[-1]) if not dfl.empty else np.nan
-                st.markdown(f"VL actuelle : **{to_eur(last)}**")
-            except Exception:
-                st.markdown("VL actuelle : —")
-        with cols[4]:
-            if not st.session_state[state_key]:
-                if st.button("✏️", key=f"edit_{port_key}_{idx}", help="Modifier"):
-                    st.session_state[state_key] = True
-                    st.experimental_rerun()
-            if st.button("🗑️", key=f"del_{port_key}_{idx}", help="Supprimer"):
-                st.session_state[port_key].pop(idx)
-                st.experimental_rerun()
-
-        if st.session_state[state_key]:
-            with st.form(key=f"form_edit_{port_key}_{idx}", clear_on_submit=False):
-                c1, c2, c3, c4 = st.columns([2, 2, 2, 1])
-                with c1:
-                    new_amount = st.text_input("Montant investi (brut) €", value=str(line.get("amount_gross", "")))
-                with c2:
-                    new_date = st.date_input("Date d’achat", value=pd.Timestamp(line.get("buy_date")).date())
-                with c3:
-                    new_px = st.text_input("Prix d’achat (optionnel)", value=str(line.get("buy_px", "")))
-                with c4:
-                    st.caption(" ")
-                    submitted = st.form_submit_button("💾 Enregistrer")
-                if submitted:
-                    try:
-                        amt_gross = float(str(new_amount).replace(" ", "").replace(",", "."))
-                        assert amt_gross > 0
-                    except Exception:
-                        st.warning("Montant brut invalide.")
-                        st.stop()
-                    buy_ts = pd.Timestamp(new_date)
-                    line["amount_gross"] = float(amt_gross)
-                    line["buy_date"] = buy_ts
-                    if new_px.strip():
-                        try:
-                            line["buy_px"] = float(str(new_px).replace(",", "."))
-                        except Exception:
-                            line["buy_px"] = ""
-                    else:
-                        line["buy_px"] = ""
-                    line.pop("invalid_date", None)
-                    line.pop("inception_date", None)
-                    st.session_state[state_key] = False
-                    st.success("Ligne mise à jour.")
-                    st.experimental_rerun()
-
-
-# ------------------------------------------------------------
-# Tables positions (initiale / actuelle)
-# ------------------------------------------------------------
-def positions_table(title: str, port_key: str):
-    fee_pct = st.session_state.get("FEE_A", 0.0) if port_key == "A_lines" else st.session_state.get("FEE_B", 0.0)
-    euro_rate = st.session_state.get("EURO_RATE_PREVIEW", 2.0)
-    lines = st.session_state.get(port_key, [])
-
-    rows_init = []
-    rows_curr = []
-
-    for ln in lines:
-        net_amt, buy_px, qty = compute_line_metrics(ln, fee_pct, euro_rate)
-
-        dfl, _, _ = get_price_series(ln.get("isin") or ln.get("name"), None, euro_rate)
-        if not dfl.empty:
-            last_date = dfl.index[-1]
-            last_px = float(dfl["Close"].iloc[-1])
-        else:
-            last_date = None
-            last_px = np.nan
-
-        val_now = qty * last_px if last_px == last_px else 0.0
-        perf_abs = val_now - net_amt
-        perf_pct = (val_now / net_amt - 1.0) * 100.0 if net_amt > 0 else np.nan
-
-        rows_init.append(
+        s = df["Close"] * qty
+        s.name = f"{sym}"
+        all_series.append(s)
+        debug["lines"].append(
             {
-                "Nom": ln.get("name", ""),
-                "ISIN / Code": ln.get("isin", ""),
-                "Montant brut €": float(ln.get("amount_gross", 0.0)),
-                "Net investi €": net_amt,
-                "VL achat €": buy_px,
-                "Quantité": qty,
-                "Date d'achat": fmt_date(ln.get("buy_date")),
+                "index": i,
+                "sym": sym,
+                "qty": qty,
+                "net_amt": net_amt,
+                "first_date": str(df.index.min().date()),
+                "last_date": str(df.index.max().date()),
             }
         )
 
-        rows_curr.append(
-            {
-                "Nom": ln.get("name", ""),
-                "ISIN / Code": ln.get("isin", ""),
-                "Valeur actuelle €": val_now,
-                "VL actuelle €": last_px,
-                "Perf €": perf_abs,
-                "Perf %": perf_pct,
-                "Date valeur": fmt_date(last_date),
-            }
-        )
+    if not all_series:
+        return pd.Series(dtype=float), debug
 
-    st.markdown(f"### {title} — Position initiale")
-    df_init = pd.DataFrame(rows_init)
-    if df_init.empty:
-        st.info("Aucune ligne.")
-    else:
-        st.dataframe(
-            df_init.style.format(
-                {
-                    "Montant brut €": to_eur,
-                    "Net investi €": to_eur,
-                    "VL achat €": to_eur,
-                    "Quantité": "{:,.6f}".format,
-                }
-            ),
-            hide_index=True,
-            use_container_width=True,
-        )
-
-    st.markdown(f"### {title} — Situation actuelle")
-    df_curr = pd.DataFrame(rows_curr)
-    if df_curr.empty:
-        st.info("Aucune ligne.")
-    else:
-        st.dataframe(
-            df_curr.style.format(
-                {
-                    "Valeur actuelle €": to_eur,
-                    "VL actuelle €": to_eur,
-                    "Perf €": to_eur,
-                    "Perf %": "{:,.2f}%".format,
-                }
-            ),
-            hide_index=True,
-            use_container_width=True,
-        )
+    # Alignement des séries
+    df_all = pd.concat(all_series, axis=1).fillna(method="ffill")
+    portfolio = df_all.sum(axis=1)
+    portfolio.name = "Valeur portefeuille"
+    return portfolio, debug
 
 
-# ------------------------------------------------------------
-# Blocs de saisie : soit fonds recommandés, soit saisie libre
-# ------------------------------------------------------------
-def _add_from_reco_block(port_key: str, label: str):
-    st.subheader(label)
-    cat = st.selectbox(
-        "Catégorie",
-        ["Core (référence)", "Défensif"],
-        key=f"reco_cat_{port_key}",
-    )
-    if "Core" in cat:
-        fonds_list = RECO_FUNDS_CORE
-    else:
-        fonds_list = RECO_FUNDS_DEF
-    options = [f"{nm} ({isin})" for nm, isin in fonds_list]
-    choice = st.selectbox("Fonds recommandé", options, key=f"reco_choice_{port_key}")
-    idx = options.index(choice) if choice in options else 0
-    name, isin = fonds_list[idx]
+# Construction des deux séries
+serie_A, debug_A = build_portfolio_series(st.session_state["A_lines"], frais_entree_pct, euro_rate)
+serie_B, debug_B = build_portfolio_series(st.session_state["B_lines"], frais_entree_pct, euro_rate)
 
-    c1, c2 = st.columns([2, 2])
-    with c1:
-        amount = st.text_input("Montant investi (brut) €", value="", key=f"reco_amt_{port_key}")
-    with c2:
-        buy_date = st.date_input(
-            "Date d’achat",
-            value=pd.Timestamp("2024-01-02").date(),
-            key=f"reco_date_{port_key}",
-        )
-    px = st.text_input("Prix d’achat (optionnel)", value="", key=f"reco_px_{port_key}")
-
-    if st.button("➕ Ajouter ce fonds recommandé", key=f"reco_add_{port_key}"):
-        try:
-            amt = float(str(amount).replace(" ", "").replace(",", "."))
-            assert amt > 0
-        except Exception:
-            st.warning("Montant invalide.")
-            return
-        ln = {
-            "name": name,
-            "isin": isin,
-            "amount_gross": float(amt),
-            "buy_date": pd.Timestamp(buy_date),
-            "buy_px": float(str(px).replace(",", ".")) if px.strip() else "",
-            "note": "",
-            "sym_used": "",
-        }
-        st.session_state[port_key].append(ln)
-        st.success("Fonds recommandé ajouté.")
-
-
-def _add_line_form_free(port_key: str, label: str):
-    st.subheader(label)
-    with st.form(key=f"form_add_free_{port_key}", clear_on_submit=False):
-        c1, c2 = st.columns([3, 2])
-        with c1:
-            name = st.text_input("Nom du fonds (libre)", value="")
-            isin = st.text_input("ISIN ou code (peut être 'EUROFUND')", value="")
-        with c2:
-            amount = st.text_input("Montant investi (brut) €", value="")
-            buy_date = st.date_input(
-                "Date d’achat",
-                value=pd.Timestamp("2024-01-02").date(),
-            )
-        px = st.text_input("Prix d’achat (optionnel)", value="")
-        note = st.text_input("Note (optionnel)", value="")
-        add_btn = st.form_submit_button("➕ Ajouter cette ligne")
-
-    if not add_btn:
-        return
-
-    isin_final = isin.strip()
-    name_final = name.strip()
-
-    if not name_final and isin_final:
-        res = eodhd_search(isin_final)
-        match = None
-        for it in res:
-            if it.get("ISIN") == isin_final:
-                match = it
-                break
-        if match is None and res:
-            match = res[0]
-        if match:
-            name_final = match.get("Name", isin_final)
-
-    if not name_final and isin_final.upper() == "EUROFUND":
-        name_final = "Fonds en euros (EUROFUND)"
-
-    if not name_final:
-        name_final = isin_final or "—"
-
-    try:
-        amt = float(str(amount).replace(" ", "").replace(",", "."))
-        assert amt > 0
-    except Exception:
-        st.warning("Montant invalide.")
-        return
-
-    ln = {
-        "name": name_final,
-        "isin": isin_final or name_final,
-        "amount_gross": float(amt),
-        "buy_date": pd.Timestamp(buy_date),
-        "buy_px": float(str(px).replace(",", ".")) if px.strip() else "",
-        "note": note.strip(),
-        "sym_used": "",
-    }
-    st.session_state[port_key].append(ln)
-    st.success("Ligne ajoutée.")
-
-
-# ------------------------------------------------------------
-# Layout principal
-# ------------------------------------------------------------
-st.set_page_config(page_title=APP_TITLE, layout="wide")
-st.title(APP_TITLE)
-
-# Init state
-st.session_state.setdefault("A_lines", [])
-st.session_state.setdefault("B_lines", [])
-st.session_state.setdefault("EURO_RATE_PREVIEW", 2.0)
-st.session_state.setdefault("FEE_A", 3.0)
-st.session_state.setdefault("FEE_B", 2.0)
-st.session_state.setdefault("M_A", 0.0)
-st.session_state.setdefault("M_B", 0.0)
-st.session_state.setdefault("ONE_A", 0.0)
-st.session_state.setdefault("ONE_B", 0.0)
-st.session_state.setdefault("ONE_A_DATE", pd.Timestamp("2024-07-01").date())
-st.session_state.setdefault("ONE_B_DATE", pd.Timestamp("2024-07-01").date())
-st.session_state.setdefault("ALLOC_MODE", "equal")
-st.session_state.setdefault("DATE_WARNINGS", [])
-
-# Sidebar : fonds euros, frais, versements, règle d'affectation
-with st.sidebar:
-    st.header("Fonds en euros — Paramètre global")
-    EURO_RATE = st.number_input(
-        "Taux annuel du fonds en euros (%)",
-        0.0,
-        10.0,
-        st.session_state.get("EURO_RATE_PREVIEW", 2.0),
-        0.10,
-        key="EURO_RATE_PREVIEW",
-    )
-    st.caption("Utilisez le symbole EUROFUND pour ajouter le fonds en euros.")
-
-    st.header("Frais d’entrée (%)")
-    FEE_A = st.number_input(
-        "Frais d’entrée — Portefeuille 1 (Client)",
-        0.0,
-        10.0,
-        st.session_state.get("FEE_A", 3.0),
-        0.10,
-        key="FEE_A",
-    )
-    FEE_B = st.number_input(
-        "Frais d’entrée — Portefeuille 2 (Valority)",
-        0.0,
-        10.0,
-        st.session_state.get("FEE_B", 2.0),
-        0.10,
-        key="FEE_B",
-    )
-    st.caption("Les frais s’appliquent sur chaque investissement (initial, mensuel, ponctuel).")
-
-    st.header("Paramètres de versement")
-    with st.expander("Portefeuille 1 — Client"):
-        M_A = st.number_input(
-            "Mensuel brut (€)",
-            0.0,
-            1_000_000.0,
-            st.session_state.get("M_A", 0.0),
-            100.0,
-            key="M_A",
-        )
-        ONE_A = st.number_input(
-            "Ponctuel brut (€)",
-            0.0,
-            1_000_000.0,
-            st.session_state.get("ONE_A", 0.0),
-            100.0,
-            key="ONE_A",
-        )
-        ONE_A_DATE = st.date_input(
-            "Date du ponctuel",
-            value=st.session_state.get("ONE_A_DATE", pd.Timestamp("2024-07-01").date()),
-            key="ONE_A_DATE",
-        )
-    with st.expander("Portefeuille 2 — Valority"):
-        M_B = st.number_input(
-            "Mensuel brut (€)",
-            0.0,
-            1_000_000.0,
-            st.session_state.get("M_B", 0.0),
-            100.0,
-            key="M_B",
-        )
-        ONE_B = st.number_input(
-            "Ponctuel brut (€)",
-            0.0,
-            1_000_000.0,
-            st.session_state.get("ONE_B", 0.0),
-            100.0,
-            key="ONE_B",
-        )
-        ONE_B_DATE = st.date_input(
-            "Date du ponctuel",
-            value=st.session_state.get("ONE_B_DATE", pd.Timestamp("2024-07-01").date()),
-            key="ONE_B_DATE",
-        )
-
-    # Règle d'affectation en français + stockage en code interne
-    st.header("Règle d’affectation des versements")
-    current_code = st.session_state.get("ALLOC_MODE", "equal")
-    inv_labels = {v: k for k, v in ALLOC_LABELS.items()}
-    current_label = inv_labels.get(current_code, "Répartition égale")
-
-    mode_label = st.selectbox(
-        "Mode",
-        list(ALLOC_LABELS.keys()),
-        index=list(ALLOC_LABELS.keys()).index(current_label),
-        help="Répartition des versements entre les lignes.",
-    )
-    st.session_state["ALLOC_MODE"] = ALLOC_LABELS[mode_label]
-    alloc_mode_code = st.session_state["ALLOC_MODE"]
-
-    # Si mode personnalisé : détail des versements par ligne + sécurité (Option A)
-    if alloc_mode_code == "custom":
-        st.caption("Paramétrage détaillé des versements personnalisés.")
-
-        # Portefeuille 1 - Client
-        with st.expander("Affectation des versements — Portefeuille 1 (Client)", expanded=False):
-            linesA = st.session_state.get("A_lines", [])
-            if not linesA:
-                st.info("Ajoutez au moins une ligne dans le Portefeuille Client.")
-            else:
-                custom_m_A: Dict[int, float] = {}
-                custom_o_A: Dict[int, float] = {}
-                for i, ln in enumerate(linesA):
-                    label_ligne = ln.get("name") or ln.get("isin") or f"Ligne {i+1}"
-                    m_key = f"CUST_M_A_{i}"
-                    o_key = f"CUST_O_A_{i}"
-
-                    m_val = st.number_input(
-                        f"Mensuel affecté à « {label_ligne} » (€)",
-                        0.0,
-                        1_000_000.0,
-                        value=float(st.session_state.get(m_key, 0.0)),
-                        step=50.0,
-                        key=m_key,
-                    )
-                    o_val = st.number_input(
-                        f"Ponctuel affecté à « {label_ligne} » (€)",
-                        0.0,
-                        1_000_000.0,
-                        value=float(st.session_state.get(o_key, 0.0)),
-                        step=50.0,
-                        key=o_key,
-                    )
-                    custom_m_A[id(ln)] = float(m_val)
-                    custom_o_A[id(ln)] = float(o_val)
-
-                st.session_state["CUSTOM_M_A"] = custom_m_A
-                st.session_state["CUSTOM_O_A"] = custom_o_A
-
-                total_mA = sum(custom_m_A.values())
-                total_oA = sum(custom_o_A.values())
-                M_A_global = st.session_state.get("M_A", 0.0)
-                ONE_A_global = st.session_state.get("ONE_A", 0.0)
-
-                if M_A_global > 0 and abs(total_mA - M_A_global) > 1e-6:
-                    st.warning(
-                        f"Le total des versements mensuels personnalisés est de {to_eur(total_mA)}, "
-                        f"alors que le montant mensuel brut saisi pour le portefeuille Client est de {to_eur(M_A_global)}."
-                    )
-                if ONE_A_global > 0 and abs(total_oA - ONE_A_global) > 1e-6:
-                    st.warning(
-                        f"Le total des versements ponctuels personnalisés est de {to_eur(total_oA)}, "
-                        f"alors que le montant ponctuel brut saisi pour le portefeuille Client est de {to_eur(ONE_A_global)}."
-                    )
-
-        # Portefeuille 2 - Valority
-        with st.expander("Affectation des versements — Portefeuille 2 (Valority)", expanded=False):
-            linesB = st.session_state.get("B_lines", [])
-            if not linesB:
-                st.info("Ajoutez au moins une ligne dans le Portefeuille Valority.")
-            else:
-                custom_m_B: Dict[int, float] = {}
-                custom_o_B: Dict[int, float] = {}
-                for i, ln in enumerate(linesB):
-                    label_ligne = ln.get("name") or ln.get("isin") or f"Ligne {i+1}"
-                    m_key = f"CUST_M_B_{i}"
-                    o_key = f"CUST_O_B_{i}"
-
-                    m_val = st.number_input(
-                        f"Mensuel affecté à « {label_ligne} » (€)",
-                        0.0,
-                        1_000_000.0,
-                        value=float(st.session_state.get(m_key, 0.0)),
-                        step=50.0,
-                        key=m_key,
-                    )
-                    o_val = st.number_input(
-                        f"Ponctuel affecté à « {label_ligne} » (€)",
-                        0.0,
-                        1_000_000.0,
-                        value=float(st.session_state.get(o_key, 0.0)),
-                        step=50.0,
-                        key=o_key,
-                    )
-                    custom_m_B[id(ln)] = float(m_val)
-                    custom_o_B[id(ln)] = float(o_val)
-
-                st.session_state["CUSTOM_M_B"] = custom_m_B
-                st.session_state["CUSTOM_O_B"] = custom_o_B
-
-                total_mB = sum(custom_m_B.values())
-                total_oB = sum(custom_o_B.values())
-                M_B_global = st.session_state.get("M_B", 0.0)
-                ONE_B_global = st.session_state.get("ONE_B", 0.0)
-
-                if M_B_global > 0 and abs(total_mB - M_B_global) > 1e-6:
-                    st.warning(
-                        f"Le total des versements mensuels personnalisés est de {to_eur(total_mB)}, "
-                        f"alors que le montant mensuel brut saisi pour le portefeuille Valority est de {to_eur(M_B_global)}."
-                    )
-                if ONE_B_global > 0 and abs(total_oB - ONE_B_global) > 1e-6:
-                    st.warning(
-                        f"Le total des versements ponctuels personnalisés est de {to_eur(total_oB)}, "
-                        f"alors que le montant ponctuel brut saisi pour le portefeuille Valority est de {to_eur(ONE_B_global)}."
-                    )
-
-# Onglets principaux : Client / Valority
-tabs = st.tabs(["Portefeuille Client", "Portefeuille Valority"])
-
-with tabs[0]:
-    subtabs = st.tabs(["Fonds recommandés", "Saisie libre"])
-    with subtabs[0]:
-        _add_from_reco_block("A_lines", "Ajouter un fonds recommandé (Client)")
-    with subtabs[1]:
-        _add_line_form_free("A_lines", "Portefeuille 1 — Client : saisie libre")
-    st.markdown("#### Lignes actuelles — Portefeuille Client")
-    for i, ln in enumerate(st.session_state.get("A_lines", [])):
-        _line_card(ln, i, "A_lines")
-
-with tabs[1]:
-    subtabs = st.tabs(["Fonds recommandés", "Saisie libre"])
-    with subtabs[0]:
-        _add_from_reco_block("B_lines", "Ajouter un fonds recommandé (Valority)")
-    with subtabs[1]:
-        _add_line_form_free("B_lines", "Portefeuille 2 — Valority : saisie libre")
-    st.markdown("#### Lignes actuelles — Portefeuille Valority")
-    for i, ln in enumerate(st.session_state.get("B_lines", [])):
-        _line_card(ln, i, "B_lines")
-
-# Simulation des deux portefeuilles
-single_target_A = id(st.session_state["A_lines"][0]) if st.session_state["A_lines"] else None
-single_target_B = id(st.session_state["B_lines"][0]) if st.session_state["B_lines"] else None
-
-# Préparation des poids personnalisés (mensuels / ponctuels)
-alloc_mode_code = st.session_state.get("ALLOC_MODE", "equal")
-
-custom_month_weights_A: Optional[Dict[int, float]] = None
-custom_oneoff_weights_A: Optional[Dict[int, float]] = None
-custom_month_weights_B: Optional[Dict[int, float]] = None
-custom_oneoff_weights_B: Optional[Dict[int, float]] = None
-
-if alloc_mode_code == "custom":
-    # Portefeuille A
-    cmA = st.session_state.get("CUSTOM_M_A", {}) or {}
-    coA = st.session_state.get("CUSTOM_O_A", {}) or {}
-    tot_mA = sum(v for v in cmA.values() if v > 0)
-    tot_oA = sum(v for v in coA.values() if v > 0)
-    if tot_mA > 0:
-        custom_month_weights_A = {k: v / tot_mA for k, v in cmA.items() if v > 0}
-    if tot_oA > 0:
-        custom_oneoff_weights_A = {k: v / tot_oA for k, v in coA.items() if v > 0}
-
-    # Portefeuille B
-    cmB = st.session_state.get("CUSTOM_M_B", {}) or {}
-    coB = st.session_state.get("CUSTOM_O_B", {}) or {}
-    tot_mB = sum(v for v in cmB.values() if v > 0)
-    tot_oB = sum(v for v in coB.values() if v > 0)
-    if tot_mB > 0:
-        custom_month_weights_B = {k: v / tot_mB for k, v in cmB.items() if v > 0}
-    if tot_oB > 0:
-        custom_oneoff_weights_B = {k: v / tot_oB for k, v in coB.items() if v > 0}
-
-# Reset warnings avant chaque run
-st.session_state["DATE_WARNINGS"] = []
-
-dfA, brutA, netA, valA, xirrA, startA_min, fullA = simulate_portfolio(
-    st.session_state.get("A_lines", []),
-    st.session_state.get("M_A", 0.0),
-    st.session_state.get("ONE_A", 0.0),
-    st.session_state.get("ONE_A_DATE", pd.Timestamp("2024-07-01").date()),
-    alloc_mode_code,
-    custom_month_weights_A,
-    custom_oneoff_weights_A,
-    single_target_A,
-    st.session_state.get("EURO_RATE_PREVIEW", 2.0),
-    st.session_state.get("FEE_A", 0.0),
-    portfolio_label="Client",
-)
-
-dfB, brutB, netB, valB, xirrB, startB_min, fullB = simulate_portfolio(
-    st.session_state.get("B_lines", []),
-    st.session_state.get("M_B", 0.0),
-    st.session_state.get("ONE_B", 0.0),
-    st.session_state.get("ONE_B_DATE", pd.Timestamp("2024-07-01").date()),
-    alloc_mode_code,
-    custom_month_weights_B,
-    custom_oneoff_weights_B,
-    single_target_B,
-    st.session_state.get("EURO_RATE_PREVIEW", 2.0),
-    st.session_state.get("FEE_B", 0.0),
-    portfolio_label="Valority",
-)
-
-# ------------------------------------------------------------
-# Avertissements sur les dates / 1ère VL
-# ------------------------------------------------------------
-if st.session_state.get("DATE_WARNINGS"):
-    with st.expander("⚠️ Problèmes d'historique / dates de VL"):
-        for msg in st.session_state["DATE_WARNINGS"]:
-            st.warning(msg)
-
-# ------------------------------------------------------------
-# Graphique (évolution des portefeuilles)
-# ------------------------------------------------------------
-st.subheader("Évolution de la valeur des portefeuilles")
-full_dates = [d for d in [fullA, fullB] if isinstance(d, pd.Timestamp)]
-start_plot = max(full_dates) if full_dates else TODAY
-
-idx = pd.bdate_range(start=start_plot, end=TODAY, freq="B")
-chart_df = pd.DataFrame(index=idx)
-if not dfA.empty:
-    chart_df["Client"] = dfA.reindex(idx)["Valeur"].ffill()
-if not dfB.empty:
-    chart_df["Valority"] = dfB.reindex(idx)["Valeur"].ffill()
-chart_df = chart_df.reset_index().rename(columns={"index": "Date"})
-chart_df = chart_df.melt("Date", var_name="variable", value_name="Valeur (€)")
-
-if chart_df.dropna().empty:
-    st.info("Ajoutez des lignes et/ou vérifiez vos paramètres pour afficher le graphique.")
+if serie_A.empty and serie_B.empty:
+    st.info("Ajoute au moins une ligne dans l'un des portefeuilles pour lancer la simulation.")
 else:
-    base = alt.Chart(chart_df).mark_line().encode(
-        x=alt.X("Date:T", title="Date"),
-        y=alt.Y("Valeur (€):Q", title="Valeur (€)"),
-        color="variable:N",
-    ).properties(height=360, width="container")
-    st.altair_chart(base, use_container_width=True)
+    df_plot = pd.DataFrame(
+        {
+            "date": pd.to_datetime(
+                sorted(set(serie_A.index.to_list() + serie_B.index.to_list()))
+            )
+        }
+    ).set_index("date")
 
-# ------------------------------------------------------------
-# Synthèse chiffrée : cartes Client / Valority
-# ------------------------------------------------------------
-st.subheader("Synthèse chiffrée")
+    if not serie_A.empty:
+        df_plot = df_plot.join(serie_A, how="left")
+    if not serie_B.empty:
+        df_plot = df_plot.join(serie_B, how="left")
 
-period_dates = [d for d in [startA_min, startB_min] if isinstance(d, pd.Timestamp)]
-if period_dates:
-    start_global = min(period_dates)
-    st.caption(f"Période analysée : du **{fmt_date(start_global)}** au **{fmt_date(TODAY)}**")
+    df_plot = df_plot.fillna(method="ffill").dropna(how="all")
 
-perf_tot_client = (valA / netA - 1.0) * 100.0 if netA > 0 else None
-perf_tot_valority = (valB / netB - 1.0) * 100.0 if netB > 0 else None
+    df_melt = df_plot.reset_index().melt(
+        id_vars="date",
+        var_name="Portefeuille",
+        value_name="Valeur",
+    )
+    df_melt = df_melt.dropna(subset=["Valeur"])
 
-col_client, col_valority = st.columns(2)
-
-with col_client:
-    with st.container(border=True):
-        st.markdown("#### 🧍 Situation actuelle — Client")
-        st.metric("Valeur actuelle", to_eur(valA))
-        st.markdown(
-            f"""
-- Montants réellement investis (après frais) : **{to_eur(netA)}**
-- Montants versés (brut) : {to_eur(brutA)}
-- Rendement total depuis le début : **{(perf_tot_client or 0):.2f}%**"""
-            if perf_tot_client is not None
-            else f"""
-- Montants réellement investis (après frais) : **{to_eur(netA)}**
-- Montants versés (brut) : {to_eur(brutA)}
-- Rendement total depuis le début : **—**"""
+    chart = (
+        alt.Chart(df_melt)
+        .mark_line()
+        .encode(
+            x="date:T",
+            y=alt.Y("Valeur:Q", title="Valeur de portefeuille (€)"),
+            color="Portefeuille:N",
+            tooltip=["date:T", "Portefeuille:N", "Valeur:Q"],
         )
-        st.markdown(
-            f"- Rendement annualisé (XIRR) : **{xirrA:.2f}%**"
-            if xirrA is not None
-            else "- Rendement annualisé (XIRR) : **—**"
+        .properties(width=900, height=400)
+    )
+    st.altair_chart(chart, use_container_width=True)
+
+    # Calcul TRI (XIRR) sur les cash-flows : investissement initial + valeur finale
+    cash_flows_A: List[Tuple[pd.Timestamp, float]] = []
+    cash_flows_B: List[Tuple[pd.Timestamp, float]] = []
+
+    if not serie_A.empty:
+        first_date_A = serie_A.index.min()
+        last_date_A = serie_A.index.max()
+        total_invested_A = sum(
+            safe_float(ln.get("amount") or 0.0) for ln in st.session_state["A_lines"]
         )
+        if total_invested_A and total_invested_A > 0:
+            cash_flows_A.append((first_date_A, -total_invested_A))
+            cash_flows_A.append((last_date_A, float(serie_A.iloc[-1])))
 
-with col_valority:
-    with st.container(border=True):
-        st.markdown("#### 🏢 Simulation — Allocation Valority")
-        st.metric("Valeur actuelle simulée", to_eur(valB))
-        st.markdown(
-            f"""
-- Montants réellement investis (après frais) : **{to_eur(netB)}**
-- Montants versés (brut) : {to_eur(brutB)}
-- Rendement total depuis le début : **{(perf_tot_valority or 0):.2f}%**"""
-            if perf_tot_valority is not None
-            else f"""
-- Montants réellement investis (après frais) : **{to_eur(netB)}**
-- Montants versés (brut) : {to_eur(brutB)}
-- Rendement total depuis le début : **—**"""
+    if not serie_B.empty:
+        first_date_B = serie_B.index.min()
+        last_date_B = serie_B.index.max()
+        total_invested_B = sum(
+            safe_float(ln.get("amount") or 0.0) for ln in st.session_state["B_lines"]
         )
-        st.markdown(
-            f"- Rendement annualisé (XIRR) : **{xirrB:.2f}%**"
-            if xirrB is not None
-            else "- Rendement annualisé (XIRR) : **—**"
-        )
+        if total_invested_B and total_invested_B > 0:
+            cash_flows_B.append((first_date_B, -total_invested_B))
+            cash_flows_B.append((last_date_B, float(serie_B.iloc[-1])))
 
-# ------------------------------------------------------------
-# Comparaison directe : "Et si c’était avec nous ?"
-# ------------------------------------------------------------
-st.subheader("📌 Comparaison : Client vs Valority")
+    xirr_A = xirr(cash_flows_A) if cash_flows_A else None
+    xirr_B = xirr(cash_flows_B) if cash_flows_B else None
 
-gain_vs_client = (valB - valA) if (valA and valB) else 0.0
-delta_xirr = (xirrB - xirrA) if (xirrA is not None and xirrB is not None) else None
-perf_diff_tot = (
-    (perf_tot_valority - perf_tot_client) if (perf_tot_client is not None and perf_tot_valority is not None) else None
-)
-
-with st.container(border=True):
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        st.metric("Gain en valeur", to_eur(gain_vs_client))
-    with c2:
+    colA, colB = st.columns(2)
+    with colA:
+        st.subheader("Portefeuille actuel du client")
         st.metric(
-            "Surperformance totale",
-            f"{perf_diff_tot:+.2f}%" if perf_diff_tot is not None else "—",
+            "Valeur finale",
+            to_eur(float(serie_A.iloc[-1])) if not serie_A.empty else "—",
         )
-    with c3:
+        st.metric(
+            "TRI (XIRR)",
+            to_pct(xirr_A) if xirr_A is not None else "—",
+        )
+    with colB:
+        st.subheader("Portefeuille Valority")
+        st.metric(
+            "Valeur finale",
+            to_eur(float(serie_B.iloc[-1])) if not serie_B.empty else "—",
+        )
+        st.metric(
+            "TRI (XIRR)",
+            to_pct(xirr_B) if xirr_B is not None else "—",
+        )
+
+    if xirr_A is not None and xirr_B is not None:
+        delta_xirr = xirr_B - xirr_A
         st.metric(
             "Surperformance annualisée (Δ XIRR)",
             f"{delta_xirr:+.2f}%" if delta_xirr is not None else "—",
         )
 
-    st.markdown(
-        f"""
+    # Synthèse textuelle
+    if not serie_A.empty and not serie_B.empty:
+        valA = float(serie_A.iloc[-1])
+        valB = float(serie_B.iloc[-1])
+        gain_vs_client = max(valB - valA, 0.0)
+        st.markdown(
+            f"""
 Aujourd’hui, avec votre allocation actuelle, votre portefeuille vaut **{to_eur(valA)}**.  
 Avec l’allocation Valority, il serait autour de **{to_eur(valB)}**, soit environ **{to_eur(gain_vs_client)}** de plus."""
-    )
-# ------------------------------------------------------------
-# Synthèse chiffrée : cartes Client / Valority
-# ------------------------------------------------------------
-# (ce bloc reste tel quel, ne le modifie pas)
-...
-gain_vs_client = max(valB - valA, 0.0)
-st.markdown(
-    f"""
-### Et si vous aviez investi avec Valority ?
-
-Aujourd’hui, avec votre allocation actuelle, votre portefeuille vaut **{to_eur(valA)}**.  
-Avec l’allocation Valority, il serait autour de **{to_eur(valB)}**, soit environ **{to_eur(gain_vs_client)}** de plus."""
-)
+        )
 
 # ------------------------------------------------------------
-# Analyse de diversification (fondamentaux EODHD)
+# Analyse de la diversification (Fundamentals)
 # ------------------------------------------------------------
+
 st.markdown("## Analyse de la diversification (données EODHD Fundamentals)")
 
-EURO_RATE_CUR = st.session_state.get("EURO_RATE_PREVIEW", 2.0)
-FEE_A_CUR = st.session_state.get("FEE_A", 0.0)
-FEE_B_CUR = st.session_state.get("FEE_B", 0.0)
+if st.button("Analyser la diversification des deux portefeuilles"):
+    if not st.session_state["A_lines"] and not st.session_state["B_lines"]:
+        st.info("Ajoute des lignes dans au moins un portefeuille pour analyser la diversification.")
+    else:
+        agg_A = aggregate_portfolio_breakdowns(st.session_state["A_lines"], euro_rate)
+        agg_B = aggregate_portfolio_breakdowns(st.session_state["B_lines"], euro_rate)
 
-for label, port_key, fee_pct in [
-    ("Portefeuille 1 — Client", "A_lines", FEE_A_CUR),
-    ("Portefeuille 2 — Valority", "B_lines", FEE_B_CUR),
-]:
-    lines = st.session_state.get(port_key, [])
-    if not lines:
-        continue
+        def _pie_chart_from_dict(title: str, d: Dict[str, float]):
+            if not d:
+                st.caption(f"{title} : données indisponibles.")
+                return
+            df = pd.DataFrame(
+                {
+                    "Label": list(d.keys()),
+                    "Poids": list(d.values()),
+                }
+            )
+            chart = (
+                alt.Chart(df)
+                .mark_arc()
+                .encode(
+                    theta="Poids:Q",
+                    color="Label:N",
+                    tooltip=["Label:N", "Poids:Q"],
+                )
+                .properties(title=title)
+            )
+            st.altair_chart(chart, use_container_width=True)
 
-    st.markdown(f"### {label}")
-    agg = aggregate_portfolio_breakdowns(lines, EURO_RATE_CUR, fee_pct)
+        colA1, colB1 = st.columns(2)
+        with colA1:
+            st.subheader("Portefeuille client")
+            _pie_chart_from_dict("Allocation d'actifs", agg_A.get("asset_allocation", {}) or {})
+            _pie_chart_from_dict("Régions", agg_A.get("regions", {}) or {})
+            _pie_chart_from_dict("Secteurs", agg_A.get("sectors", {}) or {})
 
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        st.markdown("**Répartition par classe d'actifs**")
-        _pie_chart_from_dict("", agg.get("asset_allocation", {}) or {})
-    with col2:
-        st.markdown("**Répartition géographique**")
-        _pie_chart_from_dict("", agg.get("regions", {}) or {})
-    with col3:
-        st.markdown("**Répartition sectorielle**")
-        _pie_chart_from_dict("", agg.get("sectors", {}) or {})
+        with colB1:
+            st.subheader("Portefeuille Valority")
+            _pie_chart_from_dict("Allocation d'actifs", agg_B.get("asset_allocation", {}) or {})
+            _pie_chart_from_dict("Régions", agg_B.get("regions", {}) or {})
+            _pie_chart_from_dict("Secteurs", agg_B.get("sectors", {}) or {})
 
-    st.markdown("**Top 10 lignes sous-jacentes du portefeuille**")
-    _bar_chart_top_holdings("", agg.get("top10", []) or [])
+        st.markdown("### Top 10 lignes sous-jacentes (portefeuille Valority)")
+
+        top10_B = agg_B.get("top10", []) or []
+        if not top10_B:
+            st.caption("Top 10 indisponible (données non fournies par EODHD).")
+        else:
+            df_top10 = pd.DataFrame(top10_B)
+            df_top10["Poids (%)"] = df_top10["weight"]
+            st.dataframe(df_top10[["name", "Poids (%)"]].rename(columns={"name": "Ligne"}))
+
 
 # ------------------------------------------------------------
-# Tables positions
+# Debug avancé (facultatif)
 # ------------------------------------------------------------
-positions_table("Portefeuille 1 — Client", "A_lines")
-positions_table("Portefeuille 2 — Valority", "B_lines")
 
-with st.expander("Aide rapide"):
-    st.markdown(
-        """
-- Dans chaque portefeuille, vous pouvez ajouter des lignes soit depuis la liste de fonds recommandés, soit via la saisie libre (ISIN).
-- Les montants investis, les dates d'achat, les versements mensuels et ponctuels et les frais d'entrée sont pris en compte dans les calculs.
-- La section **Analyse de la diversification** utilise les données fondamentales EODHD pour visualiser la répartition globale du portefeuille (classes d'actifs, régions, secteurs, principaux titres en portefeuille).
-"""
-    )
-
-# ------------------------------------------------------------
-# Tables positions
-# ------------------------------------------------------------
-positions_table("Portefeuille 1 — Client", "A_lines")
-positions_table("Portefeuille 2 — Valority", "B_lines")
-
-with st.expander("Aide rapide"):
-    st.markdown(
-        """
-- Dans chaque portefeuille, vous pouvez **soit** ajouter des *fonds recommandés* (onglet dédié),
-  **soit** utiliser la *saisie libre* avec ISIN / code.
-- Pour le **fonds en euros**, utilisez le symbole **EUROFUND** (taux paramétrable dans la barre de gauche).
-- Les frais d’entrée s’appliquent à chaque investissement.
-- Le **rendement total** est la performance globale depuis l’origine (valeur actuelle / net investi).
-- Le **rendement annualisé** utilise le XIRR (prise en compte des dates et montants).
-- En mode **Personnalisé**, vous pouvez affecter précisément les versements mensuels et ponctuels à chaque ligne,
-  avec un contrôle automatique de cohérence par rapport aux montants bruts saisis.
-        """
-    )
+with st.expander("🛠 Debug avancé (symboles, séries, fundamentals)", expanded=False):
+    st.write("### Debug portefeuille client")
+    st.json(debug_A)
+    st.write("### Debug portefeuille Valority")
+    st.json(debug_B)

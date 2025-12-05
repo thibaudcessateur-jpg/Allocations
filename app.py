@@ -1700,3 +1700,168 @@ with st.expander("Aide rapide"):
   avec un contrôle automatique de cohérence par rapport aux montants bruts saisis.
         """
     )
+
+# =====================================================================
+#  BLOC FONDAMENTAUX FONDS : EODHD  ➜  fallback FT.com (option A)
+#  (à placer tout en bas du fichier, après le reste du code)
+# =====================================================================
+
+from bs4 import BeautifulSoup  # assure-toi d'avoir `beautifulsoup4` dans requirements.txt
+
+# On garde une référence vers l'ancienne version basée uniquement sur EODHD
+_old_get_fund_breakdowns = get_fund_breakdowns
+
+
+def _has_any_breakdown(d: Dict[str, Any] | None) -> bool:
+    if not isinstance(d, dict):
+        return False
+    return bool(
+        d.get("asset_allocation")
+        or d.get("regions")
+        or d.get("sectors")
+        or d.get("top10")
+    )
+
+
+def _ft_parse_percent_block(text_block: str) -> Dict[str, float]:
+    """
+    Parse un bloc de texte de type :
+
+        Non-UK stock 70.68%
+        Cash 22.10%
+        ...
+
+    et renvoie {label: valeur_float}.
+    """
+    out: Dict[str, float] = {}
+    for line in text_block.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        m = re.match(r"(.+?)\s+([0-9]+(?:\.[0-9]+)?)%$", line)
+        if not m:
+            continue
+        label = m.group(1).strip()
+        try:
+            val = float(m.group(2))
+        except Exception:
+            continue
+        out[label] = val
+    return out
+
+
+def _ft_extract_breakdowns_from_html(html: str) -> Dict[str, Dict[str, float]]:
+    """
+    À partir du HTML de la page FT.com, essaie d'extraire :
+      - asset_allocation
+      - sectors
+      - regions
+
+    En se basant sur les sections textuelles :
+      "Asset type", "Top 5 sectors", "Top 5 regions".
+    Si rien n'est trouvé, renvoie des dicts vides.
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    text = soup.get_text("\n", strip=True)
+    text_lower = text.lower()
+
+    def _slice_between(start_marker: str, end_marker: str | None) -> str | None:
+        s = text_lower.find(start_marker.lower())
+        if s == -1:
+            return None
+        e = len(text)
+        if end_marker:
+            e2 = text_lower.find(end_marker.lower(), s + len(start_marker))
+            if e2 != -1:
+                e = e2
+        return text[s:e]
+
+    asset_block = _slice_between("Asset type", "Top 5 sectors")
+    sectors_block = _slice_between("Top 5 sectors", "Top 5 regions")
+    regions_block = _slice_between("Top 5 regions", "Objective")
+
+    asset_allocation = _ft_parse_percent_block(asset_block or "") if asset_block else {}
+    sectors = _ft_parse_percent_block(sectors_block or "") if sectors_block else {}
+    regions = _ft_parse_percent_block(regions_block or "") if regions_block else {}
+
+    return {
+        "asset_allocation": asset_allocation,
+        "sectors": sectors,
+        "regions": regions,
+    }
+
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def _ft_breakdowns_from_isin(isin: str) -> Dict[str, Dict[str, float]]:
+    """
+    Essaie de récupérer les breakdowns d'un fonds via FT.com
+    à partir de son ISIN, par exemple :
+        https://markets.ft.com/data/funds/tearsheet/summary?s=FR0011253624:eur
+
+    Si rien n'est trouvé ou en cas d'erreur réseau, renvoie des dicts vides.
+    """
+    isin_clean = (isin or "").replace(" ", "").upper()
+    if len(isin_clean) != 12:
+        return {"asset_allocation": {}, "regions": {}, "sectors": {}}
+
+    candidates = [
+        f"{isin_clean}:eur",
+        f"{isin_clean}:eur&locale=en",
+        f"{isin_clean}:eur&locale=fr",
+    ]
+
+    for sym in candidates:
+        url = f"https://markets.ft.com/data/funds/tearsheet/summary?s={sym}"
+        try:
+            r = requests.get(url, timeout=10)
+        except Exception:
+            continue
+        if r.status_code != 200:
+            continue
+
+        bd = _ft_extract_breakdowns_from_html(r.text)
+        if any(bd.get(k) for k in ("asset_allocation", "regions", "sectors")):
+            return bd
+
+    return {"asset_allocation": {}, "regions": {}, "sectors": {}}
+
+
+def get_fund_breakdowns(symbol: str) -> Dict[str, Dict[str, float] | List[Dict[str, Any]]]:
+    """
+    Nouvelle version enrichie :
+
+    1) On appelle l'ancienne version basée sur EODHD uniquement.
+       Si elle renvoie déjà quelque chose de non-vide, on la garde.
+    2) Sinon, si le 'symbol' ressemble à un ISIN (ou contient un ISIN),
+       on essaie de récupérer les breakdowns via FT.com.
+    3) Si FT.com ne renvoie rien, on retourne un dict vide comme avant.
+    """
+    # 1) EODHD d'abord (ancienne logique)
+    base = symbol or ""
+    res = _old_get_fund_breakdowns(base)
+    if _has_any_breakdown(res):
+        return res
+
+    # 2) Essai via FT.com si on arrive à extraire un ISIN
+    #    Cas typique : "FR0011253624.EUFUND" -> "FR0011253624"
+    candidate_isin = base.strip()
+    if "." in candidate_isin:
+        candidate_isin = candidate_isin.split(".", 1)[0]
+
+    ft_data = _ft_breakdowns_from_isin(candidate_isin)
+    if any(ft_data.get(k) for k in ("asset_allocation", "regions", "sectors")):
+        # On complète la structure attendue (ajout de 'top10' vide pour compatibilité)
+        return {
+            "asset_allocation": ft_data.get("asset_allocation", {}),
+            "regions": ft_data.get("regions", {}),
+            "sectors": ft_data.get("sectors", {}),
+            "top10": [],
+        }
+
+    # 3) Rien trouvé : on retourne la même structure vide qu'avant
+    return {
+        "asset_allocation": {},
+        "regions": {},
+        "sectors": {},
+        "top10": [],
+    }

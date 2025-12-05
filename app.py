@@ -147,10 +147,50 @@ def eodhd_prices_daily(symbol: str) -> pd.DataFrame:
 
 @st.cache_data(show_spinner=False, ttl=3600)
 def eodhd_fundamentals(symbol: str) -> Dict[str, Any]:
-    """Récupère le JSON complet des fondamentaux EODHD pour un symbole (fonds/ETF/action)."""
+    """
+    Récupère les fondamentaux EODHD pour un symbole (fonds/ETF/action)
+    en utilisant toujours le paramètre `filter=` comme recommandé par la
+    documentation EODHD.
+
+    On demande en une seule fois :
+      - les blocs généraux : General, Highlights, Technicals, SplitsDividends, Earnings
+      - les blocs de breakdowns : Asset_Allocation, World_Regions, Sector_Weights, Top_10_Holdings
+
+    La fonction renvoie directement le JSON retourné par l'API (dict),
+    ou un dict vide en cas d'erreur réseau/parsing.
+    """
+    if not symbol:
+        return {}
+
+    # Sections à récupérer – tu peux en rajouter ensuite si besoin
+    filter_sections = [
+        "General",
+        "Highlights",
+        "Technicals",
+        "SplitsDividends",
+        "Earnings",
+        # Breakdowns (ETF / Mutual Funds)
+        "Asset_Allocation",
+        "World_Regions",
+        "Sector_Weights",
+        "Top_10_Holdings",
+    ]
+    filter_param = ",".join(filter_sections)
+
     try:
-        js = eodhd_get(f"/fundamentals/{symbol}", params=None)
-        return js if isinstance(js, dict) else {}
+        js = eodhd_get(
+            f"/fundamentals/{symbol}",
+            params={"filter": filter_param},
+        )
+
+        # Si l'API renvoie quelque chose de non-JSON ou non-dict
+        if not isinstance(js, dict):
+            return {}
+
+        # Si EODHD renvoie une erreur, elle sera visible via js["error"] ou js["Error"]
+        # et gérée par get_fund_breakdowns / le bloc debug.
+        return js
+
     except Exception:
         return {}
 

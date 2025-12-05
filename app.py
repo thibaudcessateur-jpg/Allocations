@@ -142,61 +142,30 @@ def eodhd_prices_daily(symbol: str) -> pd.DataFrame:
     except Exception:
         return pd.DataFrame()
 
+# ------------------------------------------------------------
 # EODHD Fundamentals : récupération + normalisation des breakdowns
 # ------------------------------------------------------------
 
 @st.cache_data(show_spinner=False, ttl=3600)
 def eodhd_fundamentals(symbol: str) -> Dict[str, Any]:
     """
-    Récupère les fondamentaux EODHD pour un symbole (fonds/ETF/action)
-    en utilisant toujours le paramètre `filter=` comme recommandé par la
-    documentation EODHD.
-
-    On demande en une seule fois :
-      - les blocs généraux : General, Highlights, Technicals, SplitsDividends, Earnings
-      - les blocs de breakdowns : Asset_Allocation, World_Regions, Sector_Weights, Top_10_Holdings
-
-    La fonction renvoie directement le JSON retourné par l'API (dict),
-    ou un dict vide en cas d'erreur réseau/parsing.
+    Récupère le JSON complet des fondamentaux EODHD pour un symbole
+    (fonds/ETF/action).
     """
-    if not symbol:
-        return {}
-
-    # Sections à récupérer – tu peux en rajouter ensuite si besoin
-    filter_sections = [
-        "General",
-        "Highlights",
-        "Technicals",
-        "SplitsDividends",
-        "Earnings",
-        # Breakdowns (ETF / Mutual Funds)
-        "Asset_Allocation",
-        "World_Regions",
-        "Sector_Weights",
-        "Top_10_Holdings",
-    ]
-    filter_param = ",".join(filter_sections)
-
     try:
-        js = eodhd_get(
-            f"/fundamentals/{symbol}",
-            params={"filter": filter_param},
-        )
-
-        # Si l'API renvoie quelque chose de non-JSON ou non-dict
-        if not isinstance(js, dict):
-            return {}
-
-        # Si EODHD renvoie une erreur, elle sera visible via js["error"] ou js["Error"]
-        # et gérée par get_fund_breakdowns / le bloc debug.
-        return js
-
+        js = eodhd_get(f"/fundamentals/{symbol}", params=None)
+        if isinstance(js, dict):
+            return js
+        return {}
     except Exception:
         return {}
 
 
 def _deep_find_first(node: Any, key_candidates: List[str]) -> Any:
-    """Recherche récursive de la première valeur dont la clé est dans *key_candidates*."""
+    """
+    Parcours récursif du JSON pour trouver la première valeur dont la clé
+    est dans key_candidates. Retourne la valeur trouvée ou None.
+    """
     if isinstance(node, dict):
         for k, v in node.items():
             if k in key_candidates:
@@ -213,29 +182,20 @@ def _deep_find_first(node: Any, key_candidates: List[str]) -> Any:
 
 
 def _normalize_breakdown(raw: Any) -> Dict[str, float]:
-    """Transforme un breakdown EODHD en dict {label: float%}.
-
-    - Accepte soit un dict (label -> %), soit une liste d'objets.
-    - Essaie plusieurs noms de champs pour les pourcentages.
+    """
+    Transforme un breakdown quelle que soit sa forme en dict {label: float%}.
+    Gère à la fois les dicts et les listes d'objets.
     """
     out: Dict[str, float] = {}
 
-    # Cas dict simple : {label: valeur}
+    # Cas dict -> soit { "Stocks": {"Fund_%": 90}, ... } soit { "Stocks": 90, ... }
     if isinstance(raw, dict):
         for k, v in raw.items():
             label = str(k)
             val = None
             if isinstance(v, dict):
-                for key_pct in (
-                    "Fund_%",
-                    "Assets_%",
-                    "Net_Assets_%",
-                    "Equity_%",
-                    "Weight",
-                    "Percent",
-                    "Percentage",
-                    "Value",
-                ):
+                # Noms possibles des champs de pourcentage
+                for key_pct in ("Fund_%", "Assets_%", "Net_Assets_%", "Equity_%", "Weight", "Percent"):
                     if key_pct in v:
                         val = v[key_pct]
                         break
@@ -247,29 +207,14 @@ def _normalize_breakdown(raw: Any) -> Dict[str, float]:
             except Exception:
                 continue
 
-    # Cas liste d'objets : chaque élément est un dict avec Name/Region/Sector + %.
+    # Cas liste -> chaque élément est normalement un dict
     if isinstance(raw, list):
         for item in raw:
             if not isinstance(item, dict):
                 continue
-            label = (
-                item.get("Name")
-                or item.get("Region")
-                or item.get("Sector")
-                or item.get("Code")
-                or item.get("Label")
-            )
+            label = item.get("Name") or item.get("Region") or item.get("Sector") or item.get("Code")
             val = None
-            for key_pct in (
-                "Fund_%",
-                "Assets_%",
-                "Net_Assets_%",
-                "Equity_%",
-                "Weight",
-                "Percent",
-                "Percentage",
-                "Value",
-            ):
+            for key_pct in ("Fund_%", "Assets_%", "Net_Assets_%", "Equity_%", "Weight", "Percent"):
                 if key_pct in item:
                     val = item[key_pct]
                     break
@@ -280,140 +225,23 @@ def _normalize_breakdown(raw: Any) -> Dict[str, float]:
             except Exception:
                 continue
 
+    # On enlève les zéros / négatifs
+    out = {k: v for k, v in out.items() if v is not None and v > 0}
     return out
-
-
-def _renormalize(d: Dict[str, float]) -> Dict[str, float]:
-    """Normalise en pourcentage (somme = 100), en conservant les proportions."""
-    s = sum(d.values())
-    if s <= 0:
-        return {}
-    return {k: 100.0 * v / s for k, v in d.items()}
-
-
-def _iter_all_dicts(node: Any):
-    """Itère sur tous les dictionnaires imbriqués d'un JSON."""
-    if isinstance(node, dict):
-        yield node
-        for v in node.values():
-            yield from _iter_all_dicts(v)
-    elif isinstance(node, list):
-        for it in node:
-            yield from _iter_all_dicts(it)
-
-
-def _guess_breakdown_from_structure(js: Dict[str, Any]) -> Dict[str, Dict[str, float]]:
-    """Heuristique générique pour retrouver Asset Allocation / Regions / Sectors.
-
-    On cherche dans tout le JSON des dicts dont les valeurs :
-      - sont toutes numériques,
-      - sont entre 0 et 100,
-      - et dont la somme est proche de 100 (entre 80 et 120).
-    Ensuite on classe ces dicts en 3 familles via les libellés.
-    """
-    asset_alloc: Dict[str, float] = {}
-    regions: Dict[str, float] = {}
-    sectors: Dict[str, float] = {}
-
-    def classify(labels: List[str]) -> str | None:
-        lower = [lbl.lower() for lbl in labels]
-
-        # Allocation par classe d'actifs
-        if any(any(word in lbl for word in ["cash", "bond", "stock", "equity", "other"]) for lbl in lower):
-            return "asset"
-
-        # Régions géographiques
-        if any(
-            any(word in lbl for word in ["america", "europe", "asia", "pacific", "japan", "uk", "africa", "emerging"])
-            for lbl in lower
-        ):
-            return "regions"
-
-        # Secteurs
-        if any(
-            any(
-                word in lbl
-                for word in [
-                    "tech",
-                    "health",
-                    "financial",
-                    "energy",
-                    "industrial",
-                    "utilities",
-                    "consumer",
-                    "real estate",
-                    "materials",
-                    "communication",
-                    "telecom",
-                    "services",
-                ]
-            )
-            for lbl in lower
-        ):
-            return "sectors"
-
-        return None
-
-    for d in _iter_all_dicts(js):
-        # Candidat : dict avec quelques clés, toutes numériques, somme ~ 100
-        if not isinstance(d, dict) or len(d) < 2:
-            continue
-
-        labels = list(d.keys())
-        vals: List[float] = []
-        ok = True
-        for v in d.values():
-            try:
-                fv = float(v)
-            except Exception:
-                ok = False
-                break
-            if not (-5.0 <= fv <= 105.0):
-                ok = False
-                break
-            vals.append(fv)
-        if not ok or not vals:
-            continue
-
-        total = sum(vals)
-        if not (80.0 <= total <= 120.0):
-            continue
-
-        kind = classify(labels)
-        if not kind:
-            continue
-
-        norm = _renormalize({str(k): float(v) for k, v in d.items()})
-
-        if kind == "asset" and not asset_alloc:
-            asset_alloc = norm
-        elif kind == "regions" and not regions:
-            regions = norm
-        elif kind == "sectors" and not sectors:
-            sectors = norm
-
-        if asset_alloc and regions and sectors:
-            break
-
-    return {
-        "asset_allocation": asset_alloc,
-        "regions": regions,
-        "sectors": sectors,
-    }
-
 
 @st.cache_data(show_spinner=False, ttl=3600)
 def get_fund_breakdowns(symbol: str) -> Dict[str, Dict[str, float] | List[Dict[str, Any]]]:
-    """Retourne :
+    """
+    Retourne un dict avec :
       - 'asset_allocation': {classe: %}
       - 'regions': {région: %}
       - 'sectors': {secteur: %}
       - 'top10': liste de dicts {name, weight}
 
-    Logique :
+    Logique renforcée :
     - on essaie plusieurs symboles pour les fundamentals :
         1) le symbole utilisé pour les prix (ex. FR0011253624.EUFUND)
-        2) la racine sans suffixe (ex. FR0011253624)
+        2) l'ISIN nu (ex. FR0011253624)
         3) les codes retournés par eodhd_search()
     - si EODHD renvoie un champ 'error' / 'Error', on le signale dans l'UI.
     """
@@ -425,23 +253,46 @@ def get_fund_breakdowns(symbol: str) -> Dict[str, Dict[str, float] | List[Dict[s
         if not js:
             return None
 
+        # Si EODHD renvoie explicitement une erreur, on la remonte
         err_msg = js.get("error") or js.get("Error")
         if err_msg:
             st.caption(f"⚠️ EODHD Fundamentals indisponibles pour **{sym}** : {err_msg}")
             return None
 
+        # Est-ce qu'on voit au moins une des clés "structurantes" dans le JSON ?
+        has_any_breakdown = _deep_find_first(
+            js,
+            [
+                "Asset_Allocation",
+                "AssetAllocation",
+                "World_Regions",
+                "WorldRegions",
+                "Sector_Weights",
+                "SectorWeights",
+                "Sector_Weightings",
+                "Top_10_Holdings",
+                "Top10Holdings",
+                "Top_Holdings",
+            ],
+        )
+        if not has_any_breakdown:
+            # Pas fatal : on retourne quand même le JSON, mais on saura
+            # que les breakdowns sont vides pour ce symbole.
+            return js
+
         return js
 
     # 1) liste des symboles à tester
     candidates: List[str] = []
-    base = (symbol or "").strip()
+    base = symbol.strip()
     if base:
         candidates.append(base)
         if "." in base:
+            # ex. FR0011253624.EUFUND -> FR0011253624
             root = base.split(".", 1)[0]
             candidates.append(root)
 
-        # symboles supplémentaires via le Search API
+        # On ajoute les symboles issus de la recherche EODHD
         try:
             search_res = eodhd_search(base)
             for it in search_res:
@@ -454,8 +305,8 @@ def get_fund_breakdowns(symbol: str) -> Dict[str, Dict[str, float] | List[Dict[s
         except Exception:
             pass
 
-    # dédoublonnage
-    seen: set[str] = set()
+    # on dédoublonne
+    seen = set()
     uniq_candidates: List[str] = []
     for c in candidates:
         if c and c not in seen:
@@ -470,6 +321,7 @@ def get_fund_breakdowns(symbol: str) -> Dict[str, Dict[str, float] | List[Dict[s
             break
 
     if not js_used:
+        # Aucun symbole n'a donné de fondamentaux exploitables
         return {
             "asset_allocation": {},
             "regions": {},
@@ -477,7 +329,7 @@ def get_fund_breakdowns(symbol: str) -> Dict[str, Dict[str, float] | List[Dict[s
             "top10": [],
         }
 
-    # 2) tentative "classique" avec les clés EODHD usuelles
+    # On cherche les blocs dans tout le JSON
     raw_alloc = _deep_find_first(js_used, ["Asset_Allocation", "AssetAllocation"])
     raw_regions = _deep_find_first(js_used, ["World_Regions", "WorldRegions"])
     raw_sectors = _deep_find_first(js_used, ["Sector_Weights", "SectorWeights", "Sector_Weightings"])
@@ -499,7 +351,7 @@ def get_fund_breakdowns(symbol: str) -> Dict[str, Dict[str, float] | List[Dict[s
                 or item.get("Symbol")
             )
             val = None
-            for key_pct in ("Assets_%", "Fund_%", "Weight", "Percent", "Percentage", "Value"):
+            for key_pct in ("Assets_%", "Fund_%", "Weight", "Percent"):
                 if key_pct in item:
                     val = item[key_pct]
                     break
@@ -511,14 +363,13 @@ def get_fund_breakdowns(symbol: str) -> Dict[str, Dict[str, float] | List[Dict[s
                 continue
             top10_list.append({"name": str(label), "weight": w})
 
-    # 3) Si rien trouvé via les clés standard, on tente une détection heuristique
-    if not alloc and not regions and not sectors:
-        guessed = _guess_breakdown_from_structure(js_used)
-        alloc = guessed.get("asset_allocation", {})
-        regions = guessed.get("regions", {})
-        sectors = guessed.get("sectors", {})
+    # Normalisation douce des pourcentages (on garde les proportions)
+    def _renormalize(d: Dict[str, float]) -> Dict[str, float]:
+        s = sum(d.values())
+        if s <= 0:
+            return {}
+        return {k: 100.0 * v / s for k, v in d.items()}
 
-    # 4) Renormalisation douce
     alloc = _renormalize(alloc)
     regions = _renormalize(regions)
     sectors = _renormalize(sectors)
@@ -529,9 +380,6 @@ def get_fund_breakdowns(symbol: str) -> Dict[str, Dict[str, float] | List[Dict[s
         "sectors": sectors,
         "top10": top10_list,
     }
-
-
-
 
 
 def _accumulate_weighted(target: Dict[str, float], src: Dict[str, float], w_line: float) -> None:
@@ -710,9 +558,6 @@ def _bar_chart_top_holdings(title: str, holdings: List[Dict[str, Any]]):
     )
     st.altair_chart(chart, use_container_width=True)
 
-# ------------------------------------------------------------
-# Helpers symboles / séries de prix
-# ------------------------------------------------------------
 def _symbol_candidates(isin_or_name: str) -> List[str]:
     val = str(isin_or_name).strip()
     if not val:
@@ -770,6 +615,9 @@ def get_price_series(
         if start is not None:
             df = df.loc[df.index >= start]
         return df, "EUROFUND", json.dumps(debug)
+
+        # (note : ce return interrompt la suite pour EUROFUND,
+        # donc le reste ne s'applique qu'aux autres fonds)
 
     cands = _symbol_candidates(val)
     debug["cands"] = cands
@@ -1455,7 +1303,7 @@ with st.sidebar:
     st.session_state["ALLOC_MODE"] = ALLOC_LABELS[mode_label]
     alloc_mode_code = st.session_state["ALLOC_MODE"]
 
-    # Si mode personnalisé : détail des versements par ligne + sécurité
+    # Si mode personnalisé : détail des versements par ligne + sécurité (Option A)
     if alloc_mode_code == "custom":
         st.caption("Paramétrage détaillé des versements personnalisés.")
 
@@ -1555,7 +1403,7 @@ with st.sidebar:
                         f"Le total des versements mensuels personnalisés est de {to_eur(total_mB)}, "
                         f"alors que le montant mensuel brut saisi pour le portefeuille Valority est de {to_eur(M_B_global)}."
                     )
-                if ONE_B_global > 0 and abs(total_oB - ONE_oB_global) > 1e-6:
+                if ONE_B_global > 0 and abs(total_oB - ONE_B_global) > 1e-6:
                     st.warning(
                         f"Le total des versements ponctuels personnalisés est de {to_eur(total_oB)}, "
                         f"alors que le montant ponctuel brut saisi pour le portefeuille Valority est de {to_eur(ONE_B_global)}."
@@ -1770,9 +1618,22 @@ with st.container(border=True):
 Aujourd’hui, avec votre allocation actuelle, votre portefeuille vaut **{to_eur(valA)}**.  
 Avec l’allocation Valority, il serait autour de **{to_eur(valB)}**, soit environ **{to_eur(gain_vs_client)}** de plus."""
     )
+# ------------------------------------------------------------
+# Synthèse chiffrée : cartes Client / Valority
+# ------------------------------------------------------------
+# (ce bloc reste tel quel, ne le modifie pas)
+...
+gain_vs_client = max(valB - valA, 0.0)
+st.markdown(
+    f"""
+### Et si vous aviez investi avec Valority ?
+
+Aujourd’hui, avec votre allocation actuelle, votre portefeuille vaut **{to_eur(valA)}**.  
+Avec l’allocation Valority, il serait autour de **{to_eur(valB)}**, soit environ **{to_eur(gain_vs_client)}** de plus."""
+)
 
 # ------------------------------------------------------------
-# Analyse de la diversification (fondamentaux EODHD)
+# Analyse de diversification (fondamentaux EODHD)
 # ------------------------------------------------------------
 st.markdown("## Analyse de la diversification (données EODHD Fundamentals)")
 
@@ -1814,6 +1675,21 @@ positions_table("Portefeuille 2 — Valority", "B_lines")
 with st.expander("Aide rapide"):
     st.markdown(
         """
+- Dans chaque portefeuille, vous pouvez ajouter des lignes soit depuis la liste de fonds recommandés, soit via la saisie libre (ISIN).
+- Les montants investis, les dates d'achat, les versements mensuels et ponctuels et les frais d'entrée sont pris en compte dans les calculs.
+- La section **Analyse de la diversification** utilise les données fondamentales EODHD pour visualiser la répartition globale du portefeuille (classes d'actifs, régions, secteurs, principaux titres en portefeuille).
+"""
+    )
+
+# ------------------------------------------------------------
+# Tables positions
+# ------------------------------------------------------------
+positions_table("Portefeuille 1 — Client", "A_lines")
+positions_table("Portefeuille 2 — Valority", "B_lines")
+
+with st.expander("Aide rapide"):
+    st.markdown(
+        """
 - Dans chaque portefeuille, vous pouvez **soit** ajouter des *fonds recommandés* (onglet dédié),
   **soit** utiliser la *saisie libre* avec ISIN / code.
 - Pour le **fonds en euros**, utilisez le symbole **EUROFUND** (taux paramétrable dans la barre de gauche).
@@ -1824,129 +1700,3 @@ with st.expander("Aide rapide"):
   avec un contrôle automatique de cohérence par rapport aux montants bruts saisis.
         """
     )
-
-
-# ------------------------------------------------------------
-# 🔍 Debug EODHD (prix & fondamentaux)
-# ------------------------------------------------------------
-with st.expander("🔍 Debug EODHD (symboles / fundamentals)", expanded=False):
-    st.markdown(
-        """
-Ce bloc permet de voir **exactement** ce que renvoie EODHD pour une ligne de portefeuille :
-- symboles candidats utilisés pour les prix,
-- résultat de `/search`,
-- JSON brut de `/fundamentals/{symbol}`,
-- ce que `get_fund_breakdowns` parvient (ou pas) à extraire.
-"""
-    )
-
-    # Choix du portefeuille à inspecter
-    port_choice = st.radio(
-        "Portefeuille à inspecter",
-        options=["Client (A)", "Valority (B)"],
-        horizontal=True,
-        key="dbg_port_choice",
-    )
-
-    if "A" in port_choice:
-        lines_dbg = st.session_state.get("A_lines", [])
-        port_key_dbg = "A_lines"
-    else:
-        lines_dbg = st.session_state.get("B_lines", [])
-        port_key_dbg = "B_lines"
-
-    if not lines_dbg:
-        st.info("Aucune ligne dans ce portefeuille pour l’instant.")
-    else:
-        # Liste des lignes sous forme lisible
-        options = []
-        for i, ln in enumerate(lines_dbg):
-            lbl = ln.get("name") or ln.get("isin") or f"Ligne {i+1}"
-            isin = ln.get("isin", "")
-            options.append(f"{i+1}. {lbl} ({isin})")
-
-        idx_str = st.selectbox(
-            "Choisis une ligne à inspecter",
-            options=options,
-            key="dbg_line_choice",
-        )
-        idx = options.index(idx_str)
-        ln = lines_dbg[idx]
-
-        st.markdown("**Ligne sélectionnée :**")
-        st.json(
-            {
-                "name": ln.get("name"),
-                "isin": ln.get("isin"),
-                "sym_used": ln.get("sym_used"),
-                "buy_date": str(ln.get("buy_date")),
-                "amount_gross": ln.get("amount_gross"),
-            }
-        )
-
-        ident = (ln.get("isin") or ln.get("name") or "").strip()
-        if not ident:
-            st.warning("La ligne n’a ni ISIN ni nom exploitable.")
-        else:
-            st.markdown(f"**Identifiant utilisé (ISIN ou nom) :** `{ident}`")
-
-            # 1) Symboles candidats utilisés pour les PRIX
-            try:
-                cands = _symbol_candidates(ident)
-            except Exception as e:
-                cands = []
-                st.error(f"Erreur dans _symbol_candidates : {e}")
-
-            st.markdown("**Symboles candidats pour les PRIX (via `_symbol_candidates`) :**")
-            if not cands:
-                st.write("Aucun candidat.")
-            else:
-                st.write(cands)
-
-            # 2) Résultat brut de /search
-            st.markdown("**Résultat brut de `/search` (EODHD) :**")
-            try:
-                search_res = eodhd_search(ident)
-                st.json(search_res)
-            except Exception as e:
-                st.error(f"Erreur lors de l’appel à eodhd_search : {e}")
-                search_res = []
-
-            # 3) Choix du symbole à tester pour les fondamentaux
-            sym_default = ln.get("sym_used") or (cands[0] if cands else "")
-            sym_to_test = st.text_input(
-                "Symbole EODHD à tester pour les fondamentaux",
-                value=sym_default,
-                key="dbg_sym_to_test",
-                help="Tu peux modifier ce symbole manuellement pour tester différentes variantes.",
-            )
-
-            if sym_to_test:
-                if st.button("Charger les fondamentaux pour ce symbole", key="dbg_load_fund"):
-                    # 3a) JSON brut de /fundamentals/{symbol}
-                    try:
-                        js_fund = eodhd_fundamentals(sym_to_test)
-                    except Exception as e:
-                        js_fund = {}
-                        st.error(f"Erreur lors de l’appel à eodhd_fundamentals : {e}")
-
-                    if not js_fund:
-                        st.warning("Aucun JSON de fondamentaux renvoyé pour ce symbole.")
-                    else:
-                        st.markdown("**Clés de premier niveau de `/fundamentals` :**")
-                        st.write(list(js_fund.keys()))
-
-                        # On affiche un extrait pour inspection (le JSON complet peut être très long)
-                        st.markdown("**Extrait du JSON brut (fundamentals) :**")
-                        st.json(js_fund)
-
-                    # 3b) Ce que notre fonction get_fund_breakdowns retourne
-                    st.markdown("**Sortie de `get_fund_breakdowns(sym_to_test)` :**")
-                    try:
-                        dbg_break = get_fund_breakdowns(sym_to_test)
-                        st.json(dbg_break)
-                    except Exception as e:
-                        st.error(f"Erreur dans get_fund_breakdowns : {e}")
-            else:
-                st.info("Renseigne un symbole EODHD à tester pour les fondamentaux.")
-

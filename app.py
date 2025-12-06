@@ -1418,7 +1418,7 @@ with col_valority:
             else "- Rendement annualisé (XIRR) : **—**"
         )
 
-    ef build_html_report(report: Dict[str, Any]) -> str:
+    def build_html_report(report: Dict[str, Any]) -> str:
     """
     Construit un rapport HTML exportable pour le client.
     Le contenu repose sur 'report', préparé plus bas dans le code.

@@ -1325,7 +1325,44 @@ dfB, brutB, netB, valB, xirrB, startB_min, fullB = simulate_portfolio(
     st.session_state.get("EURO_RATE_PREVIEW", 2.0),
     st.session_state.get("FEE_B", 0.0),
     portfolio_label="Valority",
+
+    # Préparation des DataFrames pour le rapport
+    dfA_val = dfA.reset_index().rename(columns={"Date": "Date", "Valeur": "Valeur portefeuille"})
+    dfB_val = dfB.reset_index().rename(columns={"Date": "Date", "Valeur": "Valeur portefeuille"})
+
+    df_client_lines = portfolio_summary_dataframe("A_lines")
+    df_valority_lines = portfolio_summary_dataframe("B_lines")
+
+    report_data = {
+        "as_of": TODAY.strftime("%d/%m/%Y"),
+        "client_summary": {
+            "val": valA,
+            "net": netA,
+            "brut": brutA,
+            "perf_tot_pct": perf_tot_client or 0.0,
+            "irr_pct": irrA_pct or 0.0,
+        },
+        "valority_summary": {
+            "val": valB,
+            "net": netB,
+            "brut": brutB,
+            "perf_tot_pct": perf_tot_val or 0.0,
+            "irr_pct": irrB_pct or 0.0,
+        },
+        "comparison": {
+            "delta_val": valB - valA,
+            "delta_perf_pct": (perf_tot_val or 0.0) - (perf_tot_client or 0.0),
+        },
+        "df_client_lines": df_client_lines,
+        "df_valority_lines": df_valority_lines,
+        "dfA_val": dfA_val,
+        "dfB_val": dfB_val,
+    }
+
+    st.session_state["REPORT_DATA"] = report_data
+
 )
+
 
 # ------------------------------------------------------------
 # Avertissements sur les dates / 1ère VL
@@ -1418,6 +1455,16 @@ with col_valority:
             else "- Rendement annualisé (XIRR) : **—**"
         )
 
+    report_data = st.session_state.get("REPORT_DATA")
+    if report_data is not None:
+        html_report = build_html_report(report_data)
+        st.download_button(
+            "📄 Télécharger le rapport complet (HTML)",
+            data=html_report.encode("utf-8"),
+            file_name="rapport_portefeuille_valority.html",
+            mime="text/html",
+        )
+
 # ------------------------------------------------------------
 # Comparaison directe : "Et si c’était avec nous ?"
 # ------------------------------------------------------------
@@ -1456,6 +1503,148 @@ Avec l’allocation Valority, il serait autour de **{to_eur(valB)}**, soit envir
 # ------------------------------------------------------------
 positions_table("Portefeuille 1 — Client", "A_lines")
 positions_table("Portefeuille 2 — Valority", "B_lines")
+
+def build_html_report(report: Dict[str, Any]) -> str:
+    """
+    Construit un rapport HTML exportable pour le client.
+    Le contenu repose sur 'report', préparé plus bas dans le code.
+    """
+    as_of = report.get("as_of", "")
+    synthA = report.get("client_summary", {})
+    synthB = report.get("valority_summary", {})
+    comp = report.get("comparison", {})
+
+    dfA_lines = report.get("df_client_lines")
+    dfB_lines = report.get("df_valority_lines")
+    dfA_val = report.get("dfA_val")
+    dfB_val = report.get("dfB_val")
+
+    def _fmt_eur(x):
+        try:
+            return f"{x:,.2f} €".replace(",", " ").replace(".", ",")
+        except Exception:
+            return str(x)
+
+    # Tables en HTML
+    html_client_lines = dfA_lines.to_html(index=False, border=0, justify="left") if dfA_lines is not None else ""
+    html_valority_lines = dfB_lines.to_html(index=False, border=0, justify="left") if dfB_lines is not None else ""
+
+    if dfA_val is not None:
+        html_A_val = dfA_val.to_html(index=False, border=0, justify="left")
+    else:
+        html_A_val = ""
+
+    if dfB_val is not None:
+        html_B_val = dfB_val.to_html(index=False, border=0, justify="left")
+    else:
+        html_B_val = ""
+
+    html = f"""
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="utf-8" />
+<title>Rapport de portefeuille</title>
+<style>
+body {{
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  margin: 24px;
+  color: #222;
+}}
+h1, h2, h3 {{
+  margin-top: 24px;
+}}
+table {{
+  border-collapse: collapse;
+  width: 100%;
+  margin: 8px 0 16px 0;
+  font-size: 14px;
+}}
+th, td {{
+  border: 1px solid #ddd;
+  padding: 6px 8px;
+}}
+th {{
+  background-color: #f5f5f5;
+  text-align: left;
+}}
+.small {{
+  font-size: 12px;
+  color: #666;
+}}
+.block {{
+  border: 1px solid #eee;
+  border-radius: 8px;
+  padding: 12px 16px;
+  margin-bottom: 16px;
+  background-color: #fafafa;
+}}
+</style>
+</head>
+<body>
+
+<h1>Rapport de portefeuille</h1>
+<p class="small">Date de génération : {as_of}</p>
+
+<h2>1. Synthèse chiffrée</h2>
+
+<div class="block">
+  <h3>Situation actuelle — Client</h3>
+  <ul>
+    <li>Valeur actuelle : <b>{_fmt_eur(synthA.get("val", 0))}</b></li>
+    <li>Montants réellement investis (net) : {_fmt_eur(synthA.get("net", 0))}</li>
+    <li>Montants versés (brut) : {_fmt_eur(synthA.get("brut", 0))}</li>
+    <li>Rendement total depuis le début : <b>{synthA.get("perf_tot_pct", 0):.2f} %</b></li>
+    <li>Rendement annualisé (XIRR) : <b>{synthA.get("irr_pct", 0):.2f} %</b></li>
+  </ul>
+</div>
+
+<div class="block">
+  <h3>Simulation — Allocation Valority</h3>
+  <ul>
+    <li>Valeur actuelle simulée : <b>{_fmt_eur(synthB.get("val", 0))}</b></li>
+    <li>Montants réellement investis (net) : {_fmt_eur(synthB.get("net", 0))}</li>
+    <li>Montants versés (brut) : {_fmt_eur(synthB.get("brut", 0))}</li>
+    <li>Rendement total depuis le début : <b>{synthB.get("perf_tot_pct", 0):.2f} %</b></li>
+    <li>Rendement annualisé (XIRR) : <b>{synthB.get("irr_pct", 0):.2f} %</b></li>
+  </ul>
+</div>
+
+<div class="block">
+  <h3>Comparaison Client vs Valority</h3>
+  <ul>
+    <li>Différence de valeur finale : <b>{_fmt_eur(comp.get("delta_val", 0))}</b></li>
+    <li>Écart de performance totale (Valority – Client) :
+        <b>{comp.get("delta_perf_pct", 0):.2f} %</b></li>
+  </ul>
+</div>
+
+<h2>2. Détail des lignes</h2>
+
+<h3>Portefeuille Client</h3>
+{html_client_lines}
+
+<h3>Portefeuille Valority</h3>
+{html_valority_lines}
+
+<h2>3. Historique de la valeur des portefeuilles</h2>
+
+<h3>Client – Valeur du portefeuille par date</h3>
+{html_A_val}
+
+<h3>Valority – Valeur du portefeuille par date</h3>
+{html_B_val}
+
+<p class="small">
+Ce document est fourni à titre informatif uniquement et ne constitue pas un conseil en investissement
+personnalisé.
+</p>
+
+</body>
+</html>
+"""
+    return html
+
 
 with st.expander("Aide rapide"):
     st.markdown(
@@ -1524,6 +1713,14 @@ with st.expander("🔒 Analyse interne — Corrélation, volatilité et profil d
             if chartA is not None:
                 st.altair_chart(chartA, use_container_width=True)
 
+    diagA = diversification_diagnostics(linesA, euro_rate)
+
+    st.markdown("**Diagnostic de diversification — Portefeuille Client**")
+    st.markdown(diagA["comment"])
+    if diagA.get("suggestion"):
+        st.markdown(f"_Suggestion :_ {diagA['suggestion']}")
+
+
     st.markdown("---")
 
     # Portefeuille Valority
@@ -1564,6 +1761,129 @@ with st.expander("🔒 Analyse interne — Corrélation, volatilité et profil d
             chartB = _corr_heatmap_chart(corrB, "Corrélation des lignes — Portefeuille Valority")
             if chartB is not None:
                 st.altair_chart(chartB, use_container_width=True)
+                
+    diagB = diversification_diagnostics(linesB, euro_rate)
+
+    st.markdown("**Diagnostic de diversification — Portefeuille Valority**")
+    st.markdown(diagB["comment"])
+    if diagB.get("suggestion"):
+        st.markdown(f"_Suggestion :_ {diagB['suggestion']}")
+
+def diversification_diagnostics(
+    lines: List[Dict[str, Any]],
+    euro_rate: float,
+    years: int = 3,
+    min_points: int = 60,
+) -> Dict[str, Any]:
+    """
+    Analyse la diversification d'un portefeuille :
+    - corrélation moyenne / max
+    - indice de concentration (Herfindahl) et nombre effectif de lignes
+    - commentaire synthétique + suggestion.
+    """
+    corr = correlation_matrix_from_lines(lines, euro_rate, years=years, min_points=min_points)
+    diag: Dict[str, Any] = {
+        "avg_corr": None,
+        "max_corr": None,
+        "herfindahl": None,
+        "n_effective": None,
+        "comment": "Pas assez de données pour analyser la diversification.",
+        "suggestion": "",
+    }
+
+    if corr.empty or corr.shape[0] < 2:
+        return diag
+
+    mat = corr.values
+    mask = np.ones(mat.shape, dtype=bool)
+    np.fill_diagonal(mask, False)
+    vals = mat[mask]
+    if vals.size > 0:
+        avg_corr = float(np.nanmean(vals))
+        max_corr = float(np.nanmax(vals))
+    else:
+        avg_corr = None
+        max_corr = None
+
+    diag["avg_corr"] = avg_corr
+    diag["max_corr"] = max_corr
+
+    # Poids approximatifs par ligne (comme dans portfolio_risk_stats)
+    net_by_col: Dict[str, float] = {}
+    fee_A = st.session_state.get("FEE_A", 0.0)
+    fee_B = st.session_state.get("FEE_B", 0.0)
+
+    cols = list(corr.columns)
+    for ln in lines:
+        label = (ln.get("name") or ln.get("isin") or "Ligne").strip()
+        isin = (ln.get("isin") or "").strip()
+        key = f"{label} ({isin})" if isin else label
+
+        if key not in cols:
+            continue
+
+        net_A, _, _ = compute_line_metrics(ln, fee_A, euro_rate)
+        net_B, _, _ = compute_line_metrics(ln, fee_B, euro_rate)
+        net = max(net_A, net_B)
+        if net > 0:
+            net_by_col[key] = net
+
+    tot = sum(net_by_col.values())
+    if tot > 0:
+        weights = [net_by_col.get(c, 0.0) / tot for c in cols]
+        herfindahl = float(sum(w * w for w in weights))
+        n_eff = 1.0 / herfindahl if herfindahl > 0 else None
+        diag["herfindahl"] = herfindahl
+        diag["n_effective"] = n_eff
+
+    # Commentaire
+    comment_parts = []
+
+    if avg_corr is not None:
+        if avg_corr > 0.7:
+            comment_parts.append(
+                f"Les lignes du portefeuille sont fortement corrélées en moyenne (≈ {avg_corr:.2f}). "
+                "La diversification est limitée : les supports bougent souvent dans le même sens."
+            )
+        elif avg_corr > 0.4:
+            comment_parts.append(
+                f"La corrélation moyenne est modérée (≈ {avg_corr:.2f}). "
+                "La diversification existe mais pourrait être renforcée."
+            )
+        else:
+            comment_parts.append(
+                f"La corrélation moyenne est relativement faible (≈ {avg_corr:.2f}). "
+                "La diversification entre les lignes est globalement satisfaisante."
+            )
+
+    if diag["n_effective"] is not None:
+        neff = diag["n_effective"]
+        comment_parts.append(
+            f"Le nombre effectif de lignes (en tenant compte des poids) est d’environ {neff:.1f}, "
+            "ce qui donne une idée du niveau de concentration réel du portefeuille."
+        )
+
+    if not comment_parts:
+        comment = "Diversification difficile à interpréter avec les données disponibles."
+    else:
+        comment = " ".join(comment_parts)
+
+    diag["comment"] = comment
+
+    # Suggestion générique
+    if avg_corr is not None and avg_corr > 0.5:
+        diag["suggestion"] = (
+            "Pour améliorer la diversification, envisager l’ajout d’un support moins corrélé aux lignes "
+            "existantes (par exemple un fonds exposé à une autre zone géographique, un profil plus défensif "
+            "ou une classe d’actifs différente, selon le profil de risque du client)."
+        )
+    else:
+        diag["suggestion"] = (
+            "La diversification est déjà correcte ; les ajustements éventuels dépendront surtout des objectifs "
+            "de rendement et du profil de risque du client."
+        )
+
+    return diag
 
     st.markdown(
         """

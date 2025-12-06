@@ -1327,45 +1327,6 @@ dfB, brutB, netB, valB, xirrB, startB_min, fullB = simulate_portfolio(
     portfolio_label="Valority",
 )
 
-
-
-# ------------------------------------------------------------
-# Préparation du rapport exportable
-# ------------------------------------------------------------
-dfA_val = dfA.reset_index().rename(columns={"index": "Date", "Valeur": "Valeur portefeuille"})
-dfB_val = dfB.reset_index().rename(columns={"index": "Date", "Valeur": "Valeur portefeuille"})
-
-df_client_lines = portfolio_summary_dataframe("A_lines")
-df_valority_lines = portfolio_summary_dataframe("B_lines")
-
-report_data = {
-    "as_of": TODAY.strftime("%d/%m/%Y"),
-    "client_summary": {
-        "val": valA,
-        "net": netA,
-        "brut": brutA,
-        "perf_tot_pct": (valA / netA - 1.0) * 100 if netA > 0 else 0,
-        "irr_pct": xirrA or 0,
-    },
-    "valority_summary": {
-        "val": valB,
-        "net": netB,
-        "brut": brutB,
-        "perf_tot_pct": (valB / netB - 1.0) * 100 if netB > 0 else 0,
-        "irr_pct": xirrB or 0,
-    },
-    "comparison": {
-        "delta_val": valB - valA,
-        "delta_perf_pct": ((valB / netB - 1) - (valA / netA - 1)) * 100 if netA > 0 and netB > 0 else 0,
-    },
-    "df_client_lines": df_client_lines,
-    "df_valority_lines": df_valority_lines,
-    "dfA_val": dfA_val,
-    "dfB_val": dfB_val,
-}
-
-st.session_state["REPORT_DATA"] = report_data
-
 # ------------------------------------------------------------
 # Avertissements sur les dates / 1ère VL
 # ------------------------------------------------------------
@@ -1457,56 +1418,7 @@ with col_valority:
             else "- Rendement annualisé (XIRR) : **—**"
         )
 
-    report_data = st.session_state.get("REPORT_DATA")
-    if report_data is not None:
-        html_report = build_html_report(report_data)
-        st.download_button(
-            "📄 Télécharger le rapport complet (HTML)",
-            data=html_report.encode("utf-8"),
-            file_name="rapport_portefeuille_valority.html",
-            mime="text/html",
-        )
-
-# ------------------------------------------------------------
-# Comparaison directe : "Et si c’était avec nous ?"
-# ------------------------------------------------------------
-st.subheader("📌 Comparaison : Client vs Valority")
-
-gain_vs_client = (valB - valA) if (valA and valB) else 0.0
-delta_xirr = (xirrB - xirrA) if (xirrA is not None and xirrB is not None) else None
-perf_diff_tot = (
-    (perf_tot_valority - perf_tot_client) if (perf_tot_client is not None and perf_tot_valority is not None) else None
-)
-
-with st.container(border=True):
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        st.metric("Gain en valeur", to_eur(gain_vs_client))
-    with c2:
-        st.metric(
-            "Surperformance totale",
-            f"{perf_diff_tot:+.2f}%" if perf_diff_tot is not None else "—",
-        )
-    with c3:
-        st.metric(
-            "Surperformance annualisée (Δ XIRR)",
-            f"{delta_xirr:+.2f}%" if delta_xirr is not None else "—",
-        )
-
-    st.markdown(
-        f"""
-Aujourd’hui, avec votre allocation actuelle, votre portefeuille vaut **{to_eur(valA)}**.  
-Avec l’allocation Valority, il serait autour de **{to_eur(valB)}**, soit environ **{to_eur(gain_vs_client)}** de plus."""
-    )
-
-
-# ------------------------------------------------------------
-# Tables positions
-# ------------------------------------------------------------
-positions_table("Portefeuille 1 — Client", "A_lines")
-positions_table("Portefeuille 2 — Valority", "B_lines")
-
-def build_html_report(report: Dict[str, Any]) -> str:
+    ef build_html_report(report: Dict[str, Any]) -> str:
     """
     Construit un rapport HTML exportable pour le client.
     Le contenu repose sur 'report', préparé plus bas dans le code.
@@ -1647,6 +1559,54 @@ personnalisé.
 """
     return html
 
+    report_data = st.session_state.get("REPORT_DATA")
+    if report_data is not None:
+        html_report = build_html_report(report_data)
+        st.download_button(
+            "📄 Télécharger le rapport complet (HTML)",
+            data=html_report.encode("utf-8"),
+            file_name="rapport_portefeuille_valority.html",
+            mime="text/html",
+        )
+
+# ------------------------------------------------------------
+# Comparaison directe : "Et si c’était avec nous ?"
+# ------------------------------------------------------------
+st.subheader("📌 Comparaison : Client vs Valority")
+
+gain_vs_client = (valB - valA) if (valA and valB) else 0.0
+delta_xirr = (xirrB - xirrA) if (xirrA is not None and xirrB is not None) else None
+perf_diff_tot = (
+    (perf_tot_valority - perf_tot_client) if (perf_tot_client is not None and perf_tot_valority is not None) else None
+)
+
+with st.container(border=True):
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        st.metric("Gain en valeur", to_eur(gain_vs_client))
+    with c2:
+        st.metric(
+            "Surperformance totale",
+            f"{perf_diff_tot:+.2f}%" if perf_diff_tot is not None else "—",
+        )
+    with c3:
+        st.metric(
+            "Surperformance annualisée (Δ XIRR)",
+            f"{delta_xirr:+.2f}%" if delta_xirr is not None else "—",
+        )
+
+    st.markdown(
+        f"""
+Aujourd’hui, avec votre allocation actuelle, votre portefeuille vaut **{to_eur(valA)}**.  
+Avec l’allocation Valority, il serait autour de **{to_eur(valB)}**, soit environ **{to_eur(gain_vs_client)}** de plus."""
+    )
+
+
+# ------------------------------------------------------------
+# Tables positions
+# ------------------------------------------------------------
+positions_table("Portefeuille 1 — Client", "A_lines")
+positions_table("Portefeuille 2 — Valority", "B_lines")
 
 with st.expander("Aide rapide"):
     st.markdown(

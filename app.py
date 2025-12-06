@@ -236,6 +236,52 @@ def suggest_alternative_funds(buy_date: pd.Timestamp, euro_rate: float) -> List[
             alternatives.append((name, isin, inception))
 
     return alternatives
+def correlation_matrix_from_lines(
+    lines: List[Dict[str, Any]],
+    euro_rate: float,
+    years: int = 3,
+    min_points: int = 30,
+) -> pd.DataFrame:
+    """
+    Construit une matrice de corrélation des rendements quotidiens
+    pour les lignes d'un portefeuille donné.
+
+    - On récupère les VL quotidiennes via get_price_series
+    - On restreint à 'years' années de données (fenêtre glissante)
+    - On calcule les rendements journaliers (pct_change)
+    - On renvoie corrélation de ces rendements.
+    """
+    series_map: Dict[str, pd.Series] = {}
+    cutoff = TODAY - pd.Timedelta(days=365 * years)
+
+    for ln in lines:
+        label = ln.get("name") or ln.get("isin") or "Ligne"
+        key = f"{label} ({ln.get('isin','')})"
+
+        df, _, _ = get_price_series(ln.get("isin") or ln.get("name"), None, euro_rate)
+        if df.empty:
+            continue
+
+        s = df["Close"].astype(float)
+        s = s[s.index >= cutoff]
+        if s.size < min_points:
+            continue
+
+        series_map[key] = s
+
+    if len(series_map) < 2:
+        return pd.DataFrame()
+
+    df_prices = pd.DataFrame(series_map).dropna(how="all")
+    if df_prices.shape[0] < min_points:
+        return pd.DataFrame()
+
+    returns = df_prices.pct_change().dropna(how="any")
+    if returns.empty:
+        return pd.DataFrame()
+
+    corr = returns.corr()
+    return corr
 
 
 # ------------------------------------------------------------
@@ -575,6 +621,43 @@ def _line_card(line: Dict[str, Any], idx: int, port_key: str):
                     st.success("Ligne mise à jour.")
                     st.experimental_rerun()
 
+def portfolio_summary_dataframe(port_key: str) -> pd.DataFrame:
+    """
+    Construit un DataFrame synthétique par ligne :
+    Nom, ISIN, Net investi, Valeur actuelle, Perf € et Perf %.
+    """
+    fee_pct = st.session_state.get("FEE_A", 0.0) if port_key == "A_lines" else st.session_state.get("FEE_B", 0.0)
+    euro_rate = st.session_state.get("EURO_RATE_PREVIEW", 2.0)
+    lines = st.session_state.get(port_key, [])
+
+    rows: List[Dict[str, Any]] = []
+
+    for ln in lines:
+        net_amt, buy_px, qty = compute_line_metrics(ln, fee_pct, euro_rate)
+
+        dfl, _, _ = get_price_series(ln.get("isin") or ln.get("name"), None, euro_rate)
+        if not dfl.empty:
+            last_px = float(dfl["Close"].iloc[-1])
+        else:
+            last_px = np.nan
+
+        val_now = qty * last_px if last_px == last_px else 0.0
+        perf_abs = val_now - net_amt
+        perf_pct = (val_now / net_amt - 1.0) * 100.0 if net_amt > 0 else np.nan
+
+        rows.append(
+            {
+                "Nom": ln.get("name", ""),
+                "ISIN / Code": ln.get("isin", ""),
+                "Net investi €": net_amt,
+                "Valeur actuelle €": val_now,
+                "Perf €": perf_abs,
+                "Perf %": perf_pct,
+            }
+        )
+
+    df = pd.DataFrame(rows)
+    return df
 
 # ------------------------------------------------------------
 # Tables positions (initiale / actuelle)
@@ -1203,6 +1286,35 @@ with st.container(border=True):
 Aujourd’hui, avec votre allocation actuelle, votre portefeuille vaut **{to_eur(valA)}**.  
 Avec l’allocation Valority, il serait autour de **{to_eur(valB)}**, soit environ **{to_eur(gain_vs_client)}** de plus."""
     )
+# ------------------------------------------------------------
+# Vue simplifiée par ligne — Portefeuille Client + export
+# ------------------------------------------------------------
+st.subheader("Détail par ligne — Portefeuille Client (vue simplifiée)")
+
+df_client_simple = portfolio_summary_dataframe("A_lines")
+if df_client_simple.empty:
+    st.info("Aucune ligne dans le portefeuille Client.")
+else:
+    st.dataframe(
+        df_client_simple.style.format(
+            {
+                "Net investi €": to_eur,
+                "Valeur actuelle €": to_eur,
+                "Perf €": to_eur,
+                "Perf %": "{:,.2f}%".format,
+            }
+        ),
+        hide_index=True,
+        use_container_width=True,
+    )
+
+    csv_client = df_client_simple.to_csv(index=False).encode("utf-8")
+    st.download_button(
+        "📥 Télécharger le portefeuille Client (CSV)",
+        data=csv_client,
+        file_name="portefeuille_client_client_view.csv",
+        mime="text/csv",
+    )
 
 # ------------------------------------------------------------
 # Tables positions
@@ -1223,3 +1335,41 @@ with st.expander("Aide rapide"):
   avec un contrôle automatique de cohérence par rapport aux montants bruts saisis.
         """
     )
+# ------------------------------------------------------------
+# Analyse interne (corrélation des fonds) — section CGP
+# ------------------------------------------------------------
+st.markdown("---")
+with st.expander("🔒 Analyse interne — Corrélation des fonds (réservé au conseiller)", expanded=False):
+    st.caption(
+        "Cette section est pensée pour votre usage interne. "
+        "Elle calcule la corrélation des rendements quotidiens entre les fonds "
+        "sur les dernières années (par défaut ~3 ans)."
+    )
+
+    euro_rate = st.session_state.get("EURO_RATE_PREVIEW", 2.0)
+
+    linesA = st.session_state.get("A_lines", [])
+    linesB = st.session_state.get("B_lines", [])
+
+    corrA = correlation_matrix_from_lines(linesA, euro_rate)
+    corrB = correlation_matrix_from_lines(linesB, euro_rate)
+
+    if corrA.empty and corrB.empty:
+        st.info(
+            "Impossible de calculer une matrice de corrélation exploitable : "
+            "il faut au moins deux fonds avec un historique suffisant et commun."
+        )
+    else:
+        if not corrA.empty:
+            st.markdown("#### Portefeuille Client — matrice de corrélation")
+            st.dataframe(
+                corrA.style.format("{:.2f}"),
+                use_container_width=True,
+            )
+
+        if not corrB.empty:
+            st.markdown("#### Portefeuille Valority — matrice de corrélation")
+            st.dataframe(
+                corrB.style.format("{:.2f}"),
+                use_container_width=True,
+            )

@@ -658,21 +658,25 @@ def portfolio_summary_dataframe(port_key: str) -> pd.DataFrame:
 
     df = pd.DataFrame(rows)
     return df
-
 # ------------------------------------------------------------
-# Tables positions (initiale / actuelle)
+# Tableau synthétique par ligne (un seul tableau par portefeuille)
 # ------------------------------------------------------------
 def positions_table(title: str, port_key: str):
+    """
+    Affiche un seul tableau synthétique par portefeuille :
+    Nom, ISIN, Date d'achat, Net investi, Valeur actuelle, Perf € et Perf %.
+    """
     fee_pct = st.session_state.get("FEE_A", 0.0) if port_key == "A_lines" else st.session_state.get("FEE_B", 0.0)
     euro_rate = st.session_state.get("EURO_RATE_PREVIEW", 2.0)
     lines = st.session_state.get(port_key, [])
 
-    rows_init = []
-    rows_curr = []
+    rows: List[Dict[str, Any]] = []
 
     for ln in lines:
+        # Montant net investi, VL d'achat et quantité
         net_amt, buy_px, qty = compute_line_metrics(ln, fee_pct, euro_rate)
 
+        # Série de prix pour la valeur actuelle
         dfl, _, _ = get_price_series(ln.get("isin") or ln.get("name"), None, euro_rate)
         if not dfl.empty:
             last_date = dfl.index[-1]
@@ -681,62 +685,33 @@ def positions_table(title: str, port_key: str):
             last_date = None
             last_px = np.nan
 
+        # Valeur actuelle et performance
         val_now = qty * last_px if last_px == last_px else 0.0
         perf_abs = val_now - net_amt
         perf_pct = (val_now / net_amt - 1.0) * 100.0 if net_amt > 0 else np.nan
 
-        rows_init.append(
+        rows.append(
             {
                 "Nom": ln.get("name", ""),
                 "ISIN / Code": ln.get("isin", ""),
-                "Montant brut €": float(ln.get("amount_gross", 0.0)),
-                "Net investi €": net_amt,
-                "VL achat €": buy_px,
-                "Quantité": qty,
                 "Date d'achat": fmt_date(ln.get("buy_date")),
-            }
-        )
-
-        rows_curr.append(
-            {
-                "Nom": ln.get("name", ""),
-                "ISIN / Code": ln.get("isin", ""),
+                "Net investi €": net_amt,
                 "Valeur actuelle €": val_now,
-                "VL actuelle €": last_px,
                 "Perf €": perf_abs,
                 "Perf %": perf_pct,
-                "Date valeur": fmt_date(last_date),
             }
         )
 
-    st.markdown(f"### {title} — Position initiale")
-    df_init = pd.DataFrame(rows_init)
-    if df_init.empty:
+    st.markdown(f"### {title}")
+    df = pd.DataFrame(rows)
+    if df.empty:
         st.info("Aucune ligne.")
     else:
         st.dataframe(
-            df_init.style.format(
+            df.style.format(
                 {
-                    "Montant brut €": to_eur,
                     "Net investi €": to_eur,
-                    "VL achat €": to_eur,
-                    "Quantité": "{:,.6f}".format,
-                }
-            ),
-            hide_index=True,
-            use_container_width=True,
-        )
-
-    st.markdown(f"### {title} — Situation actuelle")
-    df_curr = pd.DataFrame(rows_curr)
-    if df_curr.empty:
-        st.info("Aucune ligne.")
-    else:
-        st.dataframe(
-            df_curr.style.format(
-                {
                     "Valeur actuelle €": to_eur,
-                    "VL actuelle €": to_eur,
                     "Perf €": to_eur,
                     "Perf %": "{:,.2f}%".format,
                 }
@@ -745,6 +720,194 @@ def positions_table(title: str, port_key: str):
             use_container_width=True,
         )
 
+# ------------------------------------------------------------
+# Analytics internes : retours, corrélation, volatilité
+# ------------------------------------------------------------
+
+def _build_returns_df(
+    lines: List[Dict[str, Any]],
+    euro_rate: float,
+    years: int = 3,
+    min_points: int = 60,
+) -> pd.DataFrame:
+    """
+    Construit un DataFrame de rendements journaliers (pct_change)
+    pour toutes les lignes du portefeuille avec un historique suffisant.
+    Index = dates, colonnes = "Nom (ISIN)".
+    """
+    cutoff = TODAY - pd.Timedelta(days=365 * years)
+    series_map: Dict[str, pd.Series] = {}
+
+    for ln in lines:
+        label = (ln.get("name") or ln.get("isin") or "Ligne").strip()
+        isin = (ln.get("isin") or "").strip()
+        key = f"{label} ({isin})" if isin else label
+
+        df, _, _ = get_price_series(ln.get("isin") or ln.get("name"), None, euro_rate)
+        if df.empty:
+            continue
+
+        s = df["Close"].astype(float)
+        s = s[s.index >= cutoff]
+        if s.size < min_points:
+            continue
+
+        series_map[key] = s
+
+    if not series_map:
+        return pd.DataFrame()
+
+    df_prices = pd.DataFrame(series_map).dropna(how="any")
+    if df_prices.shape[0] < min_points:
+        return pd.DataFrame()
+
+    returns = df_prices.pct_change().dropna(how="any")
+    return returns
+
+
+def correlation_matrix_from_lines(
+    lines: List[Dict[str, Any]],
+    euro_rate: float,
+    years: int = 3,
+    min_points: int = 60,
+) -> pd.DataFrame:
+    """
+    Matrice de corrélation entre les lignes du portefeuille,
+    basée sur les rendements journaliers.
+    """
+    rets = _build_returns_df(lines, euro_rate, years=years, min_points=min_points)
+    if rets.empty:
+        return pd.DataFrame()
+    return rets.corr()
+
+
+def volatility_table_from_lines(
+    lines: List[Dict[str, Any]],
+    euro_rate: float,
+    years: int = 3,
+    min_points: int = 60,
+) -> pd.DataFrame:
+    """
+    Volatilité annuelle par ligne (et écart-type quotidien).
+    """
+    rets = _build_returns_df(lines, euro_rate, years=years, min_points=min_points)
+    if rets.empty:
+        return pd.DataFrame()
+
+    rows = []
+    for col in rets.columns:
+        r = rets[col]
+        daily_std = float(r.std())
+        ann_std = daily_std * np.sqrt(252.0)
+        rows.append(
+            {
+                "Ligne": col,
+                "Écart-type quotidien %": daily_std * 100.0,
+                "Volatilité annuelle %": ann_std * 100.0,
+                "Nombre de points": int(r.count()),
+            }
+        )
+    df = pd.DataFrame(rows)
+    return df.sort_values("Volatilité annuelle %", ascending=False)
+
+
+def portfolio_risk_stats(
+    lines: List[Dict[str, Any]],
+    euro_rate: float,
+    years: int = 3,
+    min_points: int = 60,
+) -> Optional[Dict[str, float]]:
+    """
+    Calcule quelques stats globales de risque pour le portefeuille :
+    - volatilité annuelle
+    - max drawdown sur la période.
+    Pondération par montant net investi (approximatif).
+    """
+    rets = _build_returns_df(lines, euro_rate, years=years, min_points=min_points)
+    if rets.empty:
+        return None
+
+    # Pondération par net investi (approche simple)
+    net_by_col: Dict[str, float] = {}
+    fee_A = st.session_state.get("FEE_A", 0.0)
+    fee_B = st.session_state.get("FEE_B", 0.0)
+
+    # on détecte si c'est A ou B via présence dans session_state
+    # (on ne connait pas port_key ici, donc approximation : on regarde les deux)
+    for ln in lines:
+        label = (ln.get("name") or ln.get("isin") or "Ligne").strip()
+        isin = (ln.get("isin") or "").strip()
+        key = f"{label} ({isin})" if isin else label
+
+        # On essaie d'utiliser les deux grilles de frais, c'est approximatif
+        net_A, _, _ = compute_line_metrics(ln, fee_A, euro_rate)
+        net_B, _, _ = compute_line_metrics(ln, fee_B, euro_rate)
+        net = max(net_A, net_B)  # on prend le plus élevé comme proxy
+        if net > 0:
+            net_by_col[key] = net
+
+    # normalisation des poids
+    weights = {}
+    tot = sum(net_by_col.get(c, 0.0) for c in rets.columns)
+    if tot <= 0:
+        return None
+    for c in rets.columns:
+        w = net_by_col.get(c, 0.0) / tot
+        weights[c] = w
+
+    # série de rendement du portefeuille
+    w_vec = np.array([weights[c] for c in rets.columns])
+    rp = rets.to_numpy().dot(w_vec)
+    rp = pd.Series(rp, index=rets.index)
+
+    daily_std = float(rp.std())
+    vol_ann = daily_std * np.sqrt(252.0)
+
+    # max drawdown
+    cum = (1.0 + rp).cumprod()
+    running_max = cum.cummax()
+    dd = cum / running_max - 1.0
+    max_dd = float(dd.min())  # négatif
+
+    return {
+        "vol_ann_pct": vol_ann * 100.0,
+        "max_dd_pct": max_dd * 100.0,
+    }
+
+
+def _corr_heatmap_chart(corr: pd.DataFrame, title: str) -> Optional[alt.Chart]:
+    """
+    Construit une heatmap Altair pour visualiser la matrice de corrélation.
+    """
+    if corr.empty or corr.shape[0] < 2:
+        return None
+
+    df_corr = corr.copy()
+    df_corr["Ligne1"] = df_corr.index
+    df_melt = df_corr.melt(id_vars="Ligne1", var_name="Ligne2", value_name="corr")
+
+    base = (
+        alt.Chart(df_melt)
+        .encode(
+            x=alt.X("Ligne1:O", sort=None, title=""),
+            y=alt.Y("Ligne2:O", sort=None, title=""),
+        )
+    )
+
+    heat = base.mark_rect().encode(
+        color=alt.Color("corr:Q", scale=alt.Scale(domain=[-1, 1])),
+        tooltip=[
+            alt.Tooltip("Ligne1:N", title="Ligne 1"),
+            alt.Tooltip("Ligne2:N", title="Ligne 2"),
+            alt.Tooltip("corr:Q", title="Corrélation", format=".2f"),
+        ],
+    )
+
+    text = base.mark_text(baseline="middle").encode(
+        text=alt.Text("corr:Q", format=".2f"),
+    )
+
+    return (heat + text).properties(title=title, height=300)
 
 # ------------------------------------------------------------
 # Blocs de saisie : soit fonds recommandés, soit saisie libre
@@ -1335,41 +1498,111 @@ with st.expander("Aide rapide"):
   avec un contrôle automatique de cohérence par rapport aux montants bruts saisis.
         """
     )
+
 # ------------------------------------------------------------
-# Analyse interne (corrélation des fonds) — section CGP
+# Analyse interne — Corrélation & volatilité (réservé conseiller)
 # ------------------------------------------------------------
 st.markdown("---")
-with st.expander("🔒 Analyse interne — Corrélation des fonds (réservé au conseiller)", expanded=False):
+with st.expander("🔒 Analyse interne — Corrélation, volatilité et profil de risque", expanded=False):
     st.caption(
-        "Cette section est pensée pour votre usage interne. "
-        "Elle calcule la corrélation des rendements quotidiens entre les fonds "
-        "sur les dernières années (par défaut ~3 ans)."
+        "Section réservée au conseiller : analyse technique basée sur les valeurs liquidatives "
+        "(corrélations, volatilités, drawdown)."
     )
 
     euro_rate = st.session_state.get("EURO_RATE_PREVIEW", 2.0)
-
     linesA = st.session_state.get("A_lines", [])
     linesB = st.session_state.get("B_lines", [])
 
+    # Portefeuille Client
+    st.markdown("### Portefeuille 1 — Client")
     corrA = correlation_matrix_from_lines(linesA, euro_rate)
-    corrB = correlation_matrix_from_lines(linesB, euro_rate)
+    volA = volatility_table_from_lines(linesA, euro_rate)
+    riskA = portfolio_risk_stats(linesA, euro_rate)
 
-    if corrA.empty and corrB.empty:
-        st.info(
-            "Impossible de calculer une matrice de corrélation exploitable : "
-            "il faut au moins deux fonds avec un historique suffisant et commun."
-        )
+    if corrA.empty and volA.empty:
+        st.info("Pas assez d'historique ou de lignes pour analyser ce portefeuille.")
     else:
-        if not corrA.empty:
-            st.markdown("#### Portefeuille Client — matrice de corrélation")
+        if riskA is not None:
+            c1, c2 = st.columns(2)
+            with c1:
+                st.metric(
+                    "Volatilité annuelle estimée",
+                    f"{riskA['vol_ann_pct']:.2f} %",
+                )
+            with c2:
+                st.metric(
+                    "Max drawdown (historique sur la période)",
+                    f"{riskA['max_dd_pct']:.2f} %",
+                )
+
+        if not volA.empty:
+            st.markdown("**Volatilité par ligne**")
             st.dataframe(
-                corrA.style.format("{:.2f}"),
+                volA.style.format(
+                    {
+                        "Écart-type quotidien %": "{:,.2f}%".format,
+                        "Volatilité annuelle %": "{:,.2f}%".format,
+                    }
+                ),
+                use_container_width=True,
+            )
+
+        if not corrA.empty:
+            chartA = _corr_heatmap_chart(corrA, "Corrélation des lignes — Portefeuille Client")
+            if chartA is not None:
+                st.altair_chart(chartA, use_container_width=True)
+
+    st.markdown("---")
+
+    # Portefeuille Valority
+    st.markdown("### Portefeuille 2 — Valority")
+    corrB = correlation_matrix_from_lines(linesB, euro_rate)
+    volB = volatility_table_from_lines(linesB, euro_rate)
+    riskB = portfolio_risk_stats(linesB, euro_rate)
+
+    if corrB.empty and volB.empty:
+        st.info("Pas assez d'historique ou de lignes pour analyser ce portefeuille.")
+    else:
+        if riskB is not None:
+            c1, c2 = st.columns(2)
+            with c1:
+                st.metric(
+                    "Volatilité annuelle estimée",
+                    f"{riskB['vol_ann_pct']:.2f} %",
+                )
+            with c2:
+                st.metric(
+                    "Max drawdown (historique sur la période)",
+                    f"{riskB['max_dd_pct']:.2f} %",
+                )
+
+        if not volB.empty:
+            st.markdown("**Volatilité par ligne**")
+            st.dataframe(
+                volB.style.format(
+                    {
+                        "Écart-type quotidien %": "{:,.2f}%".format,
+                        "Volatilité annuelle %": "{:,.2f}%".format,
+                    }
+                ),
                 use_container_width=True,
             )
 
         if not corrB.empty:
-            st.markdown("#### Portefeuille Valority — matrice de corrélation")
-            st.dataframe(
-                corrB.style.format("{:.2f}"),
-                use_container_width=True,
-            )
+            chartB = _corr_heatmap_chart(corrB, "Corrélation des lignes — Portefeuille Valority")
+            if chartB is not None:
+                st.altair_chart(chartB, use_container_width=True)
+
+    st.markdown(
+        """
+**Interprétation rapide :**
+
+- Une corrélation proche de **+1** → les deux lignes bougent presque toujours dans le même sens.
+- Entre **0.5 et 0.8** → forte corrélation, diversification limitée.
+- Entre **0 et 0.5** → corrélation modérée à faible, diversification plus intéressante.
+- Corrélation **négative** → comportement opposé, contribution forte à la diversification.
+
+- La **volatilité annuelle** mesure l’ampleur des variations : plus elle est élevée, plus la ligne (ou le portefeuille) est “mouvant”.
+- Le **max drawdown** correspond à la pire baisse depuis un plus-haut sur la période : c’est un bon indicateur de “douleur maximale” vécue historiquement.
+        """
+    )

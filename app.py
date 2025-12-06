@@ -1622,6 +1622,13 @@ with st.expander("Aide rapide"):
   avec un contrôle automatique de cohérence par rapport aux montants bruts saisis.
         """
     )
+    
+diagA = diversification_diagnostics(linesA, euro_rate)
+
+    st.markdown("**Diagnostic de diversification — Portefeuille Client**")
+    st.markdown(diagA["comment"])
+    if diagA.get("suggestion"):
+        st.markdown(f"_Suggestion :_ {diagA['suggestion']}")
 
 # ------------------------------------------------------------
 # Analyse interne — Corrélation & volatilité (réservé conseiller)
@@ -1675,14 +1682,6 @@ with st.expander("🔒 Analyse interne — Corrélation, volatilité et profil d
             chartA = _corr_heatmap_chart(corrA, "Corrélation des lignes — Portefeuille Client")
             if chartA is not None:
                 st.altair_chart(chartA, use_container_width=True)
-
-    diagA = diversification_diagnostics(linesA, euro_rate)
-
-    st.markdown("**Diagnostic de diversification — Portefeuille Client**")
-    st.markdown(diagA["comment"])
-    if diagA.get("suggestion"):
-        st.markdown(f"_Suggestion :_ {diagA['suggestion']}")
-
 
     st.markdown("---")
 

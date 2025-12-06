@@ -1325,6 +1325,7 @@ dfB, brutB, netB, valB, xirrB, startB_min, fullB = simulate_portfolio(
     st.session_state.get("EURO_RATE_PREVIEW", 2.0),
     st.session_state.get("FEE_B", 0.0),
     portfolio_label="Valority",
+)
 
 
 

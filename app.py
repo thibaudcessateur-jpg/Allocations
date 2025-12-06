@@ -1622,13 +1622,6 @@ with st.expander("Aide rapide"):
   avec un contrôle automatique de cohérence par rapport aux montants bruts saisis.
         """
     )
-    
-diagA = diversification_diagnostics(linesA, euro_rate)
-
-    st.markdown("**Diagnostic de diversification — Portefeuille Client**")
-    st.markdown(diagA["comment"])
-    if diagA.get("suggestion"):
-        st.markdown(f"_Suggestion :_ {diagA['suggestion']}")
 
 # ------------------------------------------------------------
 # Analyse interne — Corrélation & volatilité (réservé conseiller)

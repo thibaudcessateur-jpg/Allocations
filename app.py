@@ -1449,35 +1449,7 @@ with st.container(border=True):
 Aujourd’hui, avec votre allocation actuelle, votre portefeuille vaut **{to_eur(valA)}**.  
 Avec l’allocation Valority, il serait autour de **{to_eur(valB)}**, soit environ **{to_eur(gain_vs_client)}** de plus."""
     )
-# ------------------------------------------------------------
-# Vue simplifiée par ligne — Portefeuille Client + export
-# ------------------------------------------------------------
-st.subheader("Détail par ligne — Portefeuille Client (vue simplifiée)")
 
-df_client_simple = portfolio_summary_dataframe("A_lines")
-if df_client_simple.empty:
-    st.info("Aucune ligne dans le portefeuille Client.")
-else:
-    st.dataframe(
-        df_client_simple.style.format(
-            {
-                "Net investi €": to_eur,
-                "Valeur actuelle €": to_eur,
-                "Perf €": to_eur,
-                "Perf %": "{:,.2f}%".format,
-            }
-        ),
-        hide_index=True,
-        use_container_width=True,
-    )
-
-    csv_client = df_client_simple.to_csv(index=False).encode("utf-8")
-    st.download_button(
-        "📥 Télécharger le portefeuille Client (CSV)",
-        data=csv_client,
-        file_name="portefeuille_client_client_view.csv",
-        mime="text/csv",
-    )
 
 # ------------------------------------------------------------
 # Tables positions

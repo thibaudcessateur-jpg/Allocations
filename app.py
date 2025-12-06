@@ -1326,43 +1326,44 @@ dfB, brutB, netB, valB, xirrB, startB_min, fullB = simulate_portfolio(
     st.session_state.get("FEE_B", 0.0),
     portfolio_label="Valority",
 
-    # Préparation des DataFrames pour le rapport
-    dfA_val = dfA.reset_index().rename(columns={"Date": "Date", "Valeur": "Valeur portefeuille"})
-    dfB_val = dfB.reset_index().rename(columns={"Date": "Date", "Valeur": "Valeur portefeuille"})
 
-    df_client_lines = portfolio_summary_dataframe("A_lines")
-    df_valority_lines = portfolio_summary_dataframe("B_lines")
 
-    report_data = {
-        "as_of": TODAY.strftime("%d/%m/%Y"),
-        "client_summary": {
-            "val": valA,
-            "net": netA,
-            "brut": brutA,
-            "perf_tot_pct": perf_tot_client or 0.0,
-            "irr_pct": irrA_pct or 0.0,
-        },
-        "valority_summary": {
-            "val": valB,
-            "net": netB,
-            "brut": brutB,
-            "perf_tot_pct": perf_tot_val or 0.0,
-            "irr_pct": irrB_pct or 0.0,
-        },
-        "comparison": {
-            "delta_val": valB - valA,
-            "delta_perf_pct": (perf_tot_val or 0.0) - (perf_tot_client or 0.0),
-        },
-        "df_client_lines": df_client_lines,
-        "df_valority_lines": df_valority_lines,
-        "dfA_val": dfA_val,
-        "dfB_val": dfB_val,
-    }
+# ------------------------------------------------------------
+# Préparation du rapport exportable
+# ------------------------------------------------------------
+dfA_val = dfA.reset_index().rename(columns={"index": "Date", "Valeur": "Valeur portefeuille"})
+dfB_val = dfB.reset_index().rename(columns={"index": "Date", "Valeur": "Valeur portefeuille"})
 
-    st.session_state["REPORT_DATA"] = report_data
+df_client_lines = portfolio_summary_dataframe("A_lines")
+df_valority_lines = portfolio_summary_dataframe("B_lines")
 
-)
+report_data = {
+    "as_of": TODAY.strftime("%d/%m/%Y"),
+    "client_summary": {
+        "val": valA,
+        "net": netA,
+        "brut": brutA,
+        "perf_tot_pct": (valA / netA - 1.0) * 100 if netA > 0 else 0,
+        "irr_pct": xirrA or 0,
+    },
+    "valority_summary": {
+        "val": valB,
+        "net": netB,
+        "brut": brutB,
+        "perf_tot_pct": (valB / netB - 1.0) * 100 if netB > 0 else 0,
+        "irr_pct": xirrB or 0,
+    },
+    "comparison": {
+        "delta_val": valB - valA,
+        "delta_perf_pct": ((valB / netB - 1) - (valA / netA - 1)) * 100 if netA > 0 and netB > 0 else 0,
+    },
+    "df_client_lines": df_client_lines,
+    "df_valority_lines": df_valority_lines,
+    "dfA_val": dfA_val,
+    "dfB_val": dfB_val,
+}
 
+st.session_state["REPORT_DATA"] = report_data
 
 # ------------------------------------------------------------
 # Avertissements sur les dates / 1ère VL

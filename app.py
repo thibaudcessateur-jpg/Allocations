@@ -190,7 +190,7 @@ def get_price_series(
     val = str(isin_or_name).strip()
     if not val:
         return pd.DataFrame(), "", json.dumps(debug)
-
+        
     if val.upper() == "EUROFUND":
     idx = pd.bdate_range(start=pd.Timestamp("2000-01-03"), end=TODAY, freq="B")
     df = pd.DataFrame(index=idx, columns=["Close"], dtype=float)

@@ -1045,8 +1045,6 @@ st.session_state.setdefault("ALLOC_MODE", "equal")
 st.session_state.setdefault("DATE_WARNINGS", [])
 st.session_state.setdefault("INIT_A_DATE", pd.Timestamp("2024-01-02").date())
 st.session_state.setdefault("INIT_B_DATE", pd.Timestamp("2024-01-02").date())
-
-
 # Sidebar : fonds euros, frais, versements, règle d'affectation
 with st.sidebar:
     st.header("Fonds en euros — Paramètre global")
@@ -1079,20 +1077,18 @@ with st.sidebar:
     )
     st.caption("Les frais s’appliquent sur chaque investissement (initial, mensuel, ponctuel).")
 
-st.header("Date du versement initial")
-
-st.date_input(
-    "Portefeuille 1 (Client) — date d’investissement initiale",
-    value=st.session_state.get("INIT_A_DATE", pd.Timestamp("2024-01-02").date()),
-    key="INIT_A_DATE",
-)
-
-st.date_input(
-    "Portefeuille 2 (Valority) — date d’investissement initiale",
-    value=st.session_state.get("INIT_B_DATE", pd.Timestamp("2024-01-02").date()),
-    key="INIT_B_DATE",
-)
-
+    # ✅ Date centralisée pour le versement initial (sans assigner session_state à la main)
+    st.header("Date du versement initial")
+    st.date_input(
+        "Portefeuille 1 (Client) — date d’investissement initiale",
+        value=st.session_state.get("INIT_A_DATE", pd.Timestamp("2024-01-02").date()),
+        key="INIT_A_DATE",
+    )
+    st.date_input(
+        "Portefeuille 2 (Valority) — date d’investissement initiale",
+        value=st.session_state.get("INIT_B_DATE", pd.Timestamp("2024-01-02").date()),
+        key="INIT_B_DATE",
+    )
 
     st.header("Paramètres de versement")
     with st.expander("Portefeuille 1 — Client"):
@@ -1117,6 +1113,7 @@ st.date_input(
             value=st.session_state.get("ONE_A_DATE", pd.Timestamp("2024-07-01").date()),
             key="ONE_A_DATE",
         )
+
     with st.expander("Portefeuille 2 — Valority"):
         M_B = st.number_input(
             "Mensuel brut (€)",

@@ -230,6 +230,51 @@ def get_price_series(
 
     return pd.DataFrame(), "", json.dumps(debug)
 
+@st.cache_data(show_spinner=False, ttl=3600)
+def structured_series(
+    start: pd.Timestamp,
+    end: pd.Timestamp,
+    annual_rate_pct: float,
+    redemption_years: int,
+) -> pd.DataFrame:
+    """
+    Série synthétique autocall (simplifiée) :
+    - Prix d'achat = 1.0
+    - Plat jusqu'à la date de remboursement estimée
+    - Saut à 1 + (rate * years) le jour de remboursement, puis figé
+    """
+    start_dt = pd.Timestamp(start).normalize()
+    end_dt = pd.Timestamp(end).normalize()
+    idx = pd.bdate_range(start=start_dt, end=end_dt, freq="B")
+    if len(idx) == 0:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(index=idx, columns=["Close"], dtype=float)
+    df.iloc[0, 0] = 1.0
+
+    r = float(annual_rate_pct) / 100.0
+    yrs = int(redemption_years)
+
+    redemption_dt = start_dt + pd.DateOffset(years=yrs)
+
+    # série plate + saut à partir du 1er jour ouvré >= redemption_dt
+    redeemed = False
+    for i in range(1, len(df)):
+        d = df.index[i]
+        df.iloc[i, 0] = df.iloc[i - 1, 0]
+
+        if (not redeemed) and (d >= redemption_dt):
+            df.iloc[i, 0] = 1.0 + r * yrs
+            df.iloc[i:, 0] = df.iloc[i, 0]
+            redeemed = True
+            break
+
+    # sécurité : propagation si besoin
+    for i in range(1, len(df)):
+        if pd.isna(df.iloc[i, 0]):
+            df.iloc[i, 0] = df.iloc[i - 1, 0]
+
+    return df
 
 # ------------------------------------------------------------
 # Alternatives si date < 1ère VL
@@ -398,9 +443,27 @@ def simulate_portfolio(
 
     for ln in lines:
         key_id = id(ln)
-        df_full, sym, _ = get_price_series(ln.get("isin") or ln.get("name"), None, euro_rate)
-        if df_full.empty:
-            continue
+        isin_or_name = ln.get("isin") or ln.get("name")
+
+# 🔹 CAS PRODUIT STRUCTURÉ
+if str(isin_or_name).upper() == "STRUCTURED":
+    d_buy = pd.Timestamp(ln["buy_date"])
+
+    df_full = structured_series(
+        start=d_buy,
+        end=TODAY,
+        annual_rate_pct=float(ln.get("struct_rate", 8.0)),
+        redemption_years=int(ln.get("struct_years", 6)),
+    )
+    sym = "STRUCTURED"
+
+else:
+    df_full, sym, _ = get_price_series(isin_or_name, None, euro_rate)
+
+# Sécurité
+if df_full.empty:
+    continue
+
 
         inception = df_full.index.min()
         d_buy = pd.Timestamp(ln["buy_date"])

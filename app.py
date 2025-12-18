@@ -993,17 +993,92 @@ def _corr_heatmap_chart(corr: pd.DataFrame, title: str) -> Optional[alt.Chart]:
 # ------------------------------------------------------------
 # Blocs de saisie : soit fonds recommandés, soit saisie libre
 # ------------------------------------------------------------
+# ------------------------------------------------------------
+# Blocs de saisie : soit fonds recommandés, soit saisie libre
+# ------------------------------------------------------------
 def _add_from_reco_block(port_key: str, label: str):
     st.subheader(label)
+
     cat = st.selectbox(
         "Catégorie",
         ["Core (référence)", "Défensif", "Produits structurés"],
         key=f"reco_cat_{port_key}",
     )
-    if "Core" in cat:
+
+    # ✅ Date d'achat centralisée (versement initial uniquement)
+    buy_date = (
+        st.session_state.get("INIT_A_DATE", pd.Timestamp("2024-01-02").date())
+        if port_key == "A_lines"
+        else st.session_state.get("INIT_B_DATE", pd.Timestamp("2024-01-02").date())
+    )
+
+    # ============================
+    # CAS 1 — PRODUIT STRUCTURÉ
+    # ============================
+    if cat == "Produits structurés":
+        st.markdown("### Produit structuré (Autocall)")
+
+        c1, c2 = st.columns(2)
+        with c1:
+            amount = st.text_input(
+                "Montant investi (brut) €",
+                value="",
+                key=f"struct_amt_{port_key}",
+            )
+        with c2:
+            struct_years = st.number_input(
+                "Durée estimée avant remboursement (années)",
+                min_value=1,
+                max_value=12,
+                value=6,
+                step=1,
+                key=f"struct_years_{port_key}",
+            )
+
+        struct_rate = st.number_input(
+            "Rendement annuel estimé (%)",
+            min_value=0.0,
+            max_value=25.0,
+            value=8.0,
+            step=0.10,
+            key=f"struct_rate_{port_key}",
+        )
+
+        st.caption(
+            f"Date d’investissement initiale : {pd.Timestamp(buy_date).strftime('%d/%m/%Y')}"
+        )
+
+        if st.button("➕ Ajouter le produit structuré", key=f"struct_add_{port_key}"):
+            try:
+                amt = float(str(amount).replace(" ", "").replace(",", "."))
+                assert amt > 0
+            except Exception:
+                st.warning("Montant invalide.")
+                return
+
+            ln = {
+                "name": f"Produit structuré ({struct_rate:.2f}% / {int(struct_years)} ans)",
+                "isin": "STRUCTURED",
+                "amount_gross": float(amt),
+                "buy_date": pd.Timestamp(buy_date),
+                "buy_px": 1.0,
+                "struct_rate": float(struct_rate),
+                "struct_years": int(struct_years),
+                "note": "",
+                "sym_used": "STRUCTURED",
+            }
+            st.session_state[port_key].append(ln)
+            st.success("Produit structuré ajouté.")
+        return  # ✅ IMPORTANT : on sort de la fonction pour ne pas afficher la partie fonds
+
+    # ============================
+    # CAS 2 — FONDS CLASSIQUES
+    # ============================
+    if cat == "Core (référence)":
         fonds_list = RECO_FUNDS_CORE
     else:
         fonds_list = RECO_FUNDS_DEF
+
     options = [f"{nm} ({isin})" for nm, isin in fonds_list]
     choice = st.selectbox("Fonds recommandé", options, key=f"reco_choice_{port_key}")
     idx = options.index(choice) if choice in options else 0
@@ -1013,16 +1088,9 @@ def _add_from_reco_block(port_key: str, label: str):
     with c1:
         amount = st.text_input("Montant investi (brut) €", value="", key=f"reco_amt_{port_key}")
     with c2:
-        # ✅ Date d'achat centralisée (versement initial uniquement)
-        buy_date = (
-            st.session_state.get("INIT_A_DATE", pd.Timestamp("2024-01-02").date())
-            if port_key == "A_lines"
-            else st.session_state.get("INIT_B_DATE", pd.Timestamp("2024-01-02").date())
-        )
         st.caption(f"Date d’achat (versement initial) : {pd.Timestamp(buy_date).strftime('%d/%m/%Y')}")
 
     px = st.text_input("Prix d’achat (optionnel)", value="", key=f"reco_px_{port_key}")
-
 
     if st.button("➕ Ajouter ce fonds recommandé", key=f"reco_add_{port_key}"):
         try:
@@ -1031,6 +1099,7 @@ def _add_from_reco_block(port_key: str, label: str):
         except Exception:
             st.warning("Montant invalide.")
             return
+
         ln = {
             "name": name,
             "isin": isin,
@@ -1042,7 +1111,6 @@ def _add_from_reco_block(port_key: str, label: str):
         }
         st.session_state[port_key].append(ln)
         st.success("Fonds recommandé ajouté.")
-
 
 def _add_line_form_free(port_key: str, label: str):
     st.subheader(label)

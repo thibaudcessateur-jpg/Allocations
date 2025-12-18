@@ -178,22 +178,22 @@ def _get_close_on(df: pd.DataFrame, d: pd.Timestamp) -> float:
         return float(after.iloc[0]["Close"])
     return float(df.iloc[-1]["Close"])
 
+
 @st.cache_data(show_spinner=False, ttl=3600)
 def get_price_series(
     isin_or_name: str, start: Optional[pd.Timestamp], euro_rate: float
 ) -> Tuple[pd.DataFrame, str, str]:
     """
     EUROFUND : série synthétique capitalisée à euro_rate %/an
-    (capitalisation annualisée lissée, cohérente avec Excel)
+    (cohérente avec Excel : compo sur jours calendaires)
     """
     debug = {"cands": []}
     val = str(isin_or_name).strip()
     if not val:
         return pd.DataFrame(), "", json.dumps(debug)
 
-    # ✅ Fonds en euros — capitalisation annualisée lissée
+    # ✅ Fonds en euros — capitalisation annualisée (jours calendaires)
     if val.upper() == "EUROFUND":
-        # Date de départ réelle
         start_dt = (
             pd.Timestamp(start).normalize()
             if start is not None
@@ -206,19 +206,18 @@ def get_price_series(
             return pd.DataFrame(), "", "{}"
 
         df = pd.DataFrame(index=idx, columns=["Close"], dtype=float)
-
-        # Valeur initiale
         df.iloc[0, 0] = 1.0
 
-        # Facteur journalier annualisé
-        daily_factor = (1.0 + euro_rate / 100.0) ** (1.0 / 365.0)
+        r = float(euro_rate) / 100.0
 
         for i in range(1, len(df)):
-            df.iloc[i, 0] = df.iloc[i - 1, 0] * daily_factor
+            prev_val = df.iloc[i - 1, 0]
+            delta_days = (df.index[i] - df.index[i - 1]).days  # ✅ jours calendaires
+            df.iloc[i, 0] = prev_val * ((1.0 + r) ** (delta_days / 365.0))
 
         return df, "EUROFUND", "{}"
 
-    # ✅ Instruments EODHD — recherche par candidats puis EOD daily
+    # ✅ Instruments EODHD — recherche candidates puis EOD daily
     cands = _symbol_candidates(val)
     debug["cands"] = cands
 
@@ -230,6 +229,7 @@ def get_price_series(
             return df, sym, json.dumps(debug)
 
     return pd.DataFrame(), "", json.dumps(debug)
+
 
 # ------------------------------------------------------------
 # Alternatives si date < 1ère VL

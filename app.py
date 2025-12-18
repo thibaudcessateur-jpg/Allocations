@@ -1063,7 +1063,7 @@ st.session_state.setdefault("INIT_B_DATE", pd.Timestamp("2024-01-02").date())
 
 
 
-    st.header("Fonds en euros — Taux annuel")
+st.header("Fonds en euros — Taux annuel")
 
 EURO_RATE_A = st.number_input(
     "Portefeuille 1 (Client) — taux annuel (%)",

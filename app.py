@@ -1079,18 +1079,20 @@ with st.sidebar:
     )
     st.caption("Les frais s’appliquent sur chaque investissement (initial, mensuel, ponctuel).")
 
-    # ✅ Date centralisée (versement initial uniquement)
-    st.header("Date du versement initial")
-    st.session_state["INIT_A_DATE"] = st.date_input(
-        "Portefeuille 1 (Client) — date d’investissement initiale",
-        value=st.session_state.get("INIT_A_DATE", pd.Timestamp("2024-01-02").date()),
-        key="INIT_A_DATE",
-    )
-    st.session_state["INIT_B_DATE"] = st.date_input(
-        "Portefeuille 2 (Valority) — date d’investissement initiale",
-        value=st.session_state.get("INIT_B_DATE", pd.Timestamp("2024-01-02").date()),
-        key="INIT_B_DATE",
-    )    
+st.header("Date du versement initial")
+
+st.date_input(
+    "Portefeuille 1 (Client) — date d’investissement initiale",
+    value=st.session_state.get("INIT_A_DATE", pd.Timestamp("2024-01-02").date()),
+    key="INIT_A_DATE",
+)
+
+st.date_input(
+    "Portefeuille 2 (Valority) — date d’investissement initiale",
+    value=st.session_state.get("INIT_B_DATE", pd.Timestamp("2024-01-02").date()),
+    key="INIT_B_DATE",
+)
+
 
     st.header("Paramètres de versement")
     with st.expander("Portefeuille 1 — Client"):

@@ -192,17 +192,25 @@ def get_price_series(
         return pd.DataFrame(), "", json.dumps(debug)
 
     if val.upper() == "EUROFUND":
-        idx = pd.bdate_range(start=pd.Timestamp("2000-01-03"), end=TODAY, freq="B")
-        days = (idx - idx[0]).days.values.astype(float)
-        rate = euro_rate / 100.0
-        growth = (1.0 + rate) ** (days / 365.25)
-        df = pd.DataFrame({"Close": growth}, index=idx)
-        if start is not None:
-            df = df.loc[df.index >= start]
-        return df, "EUROFUND", json.dumps(debug)
+    idx = pd.bdate_range(start=pd.Timestamp("2000-01-03"), end=TODAY, freq="B")
+    df = pd.DataFrame(index=idx, columns=["Close"], dtype=float)
 
-        # (note : ce return interrompt la suite pour EUROFUND,
-        # donc le reste ne s'applique qu'aux autres fonds)
+    # Capitalisation annuelle au 31/12
+    df.iloc[0, 0] = 1.0
+    for i in range(1, len(df)):
+        prev = df.iloc[i - 1, 0]
+        current_date = df.index[i]
+        df.iloc[i, 0] = prev
+
+        # Intérêts ajoutés au 31 décembre
+        if current_date.month == 12 and current_date.day == 31:
+            df.iloc[i, 0] = prev * (1.0 + euro_rate / 100.0)
+
+    if start is not None:
+        df = df.loc[df.index >= start]
+
+    return df, "EUROFUND", "{}"
+
 
     cands = _symbol_candidates(val)
     debug["cands"] = cands
@@ -1045,20 +1053,32 @@ st.session_state.setdefault("ALLOC_MODE", "equal")
 st.session_state.setdefault("DATE_WARNINGS", [])
 st.session_state.setdefault("INIT_A_DATE", pd.Timestamp("2024-01-02").date())
 st.session_state.setdefault("INIT_B_DATE", pd.Timestamp("2024-01-02").date())
-# Sidebar : fonds euros, frais, versements, règle d'affectation
-with st.sidebar:
-    st.header("Fonds en euros — Paramètre global")
-    EURO_RATE = st.number_input(
-        "Taux annuel du fonds en euros (%)",
-        0.0,
-        10.0,
-        st.session_state.get("EURO_RATE_PREVIEW", 2.0),
-        0.10,
-        key="EURO_RATE_PREVIEW",
-    )
-    st.caption("Utilisez le symbole EUROFUND pour ajouter le fonds en euros.")
 
-    st.header("Frais d’entrée (%)")
+
+
+    st.header("Fonds en euros — Taux annuel")
+
+EURO_RATE_A = st.number_input(
+    "Portefeuille 1 (Client) — taux annuel (%)",
+    0.0,
+    10.0,
+    st.session_state.get("EURO_RATE_A", 2.0),
+    0.10,
+    key="EURO_RATE_A",
+)
+
+EURO_RATE_B = st.number_input(
+    "Portefeuille 2 (Valority) — taux annuel (%)",
+    0.0,
+    10.0,
+    st.session_state.get("EURO_RATE_B", 2.5),
+    0.10,
+    key="EURO_RATE_B",
+)
+
+st.caption("Le taux est appliqué annuellement sur la part investie en fonds euros (EUROFUND).")
+
+st.header("Frais d’entrée (%)")
     FEE_A = st.number_input(
         "Frais d’entrée — Portefeuille 1 (Client)",
         0.0,
@@ -1326,7 +1346,7 @@ dfA, brutA, netA, valA, xirrA, startA_min, fullA = simulate_portfolio(
     custom_month_weights_A,
     custom_oneoff_weights_A,
     single_target_A,
-    st.session_state.get("EURO_RATE_PREVIEW", 2.0),
+    st.session_state.get("EURO_RATE_A", 2.0),
     st.session_state.get("FEE_A", 0.0),
     portfolio_label="Client",
 )
@@ -1340,7 +1360,7 @@ dfB, brutB, netB, valB, xirrB, startB_min, fullB = simulate_portfolio(
     custom_month_weights_B,
     custom_oneoff_weights_B,
     single_target_B,
-    st.session_state.get("EURO_RATE_PREVIEW", 2.0),
+    st.session_state.get("EURO_RATE_B", 2.5),
     st.session_state.get("FEE_B", 0.0),
     portfolio_label="Valority",
 )

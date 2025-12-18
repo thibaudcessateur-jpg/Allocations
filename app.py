@@ -445,25 +445,22 @@ def simulate_portfolio(
         key_id = id(ln)
         isin_or_name = ln.get("isin") or ln.get("name")
 
-# 🔹 CAS PRODUIT STRUCTURÉ
-if str(isin_or_name).upper() == "STRUCTURED":
-    d_buy = pd.Timestamp(ln["buy_date"])
+        # 🔹 CAS PRODUIT STRUCTURÉ (série synthétique)
+        if str(isin_or_name).strip().upper() == "STRUCTURED":
+            d_buy = pd.Timestamp(ln["buy_date"])
+            df_full = structured_series(
+                start=d_buy,
+                end=TODAY,
+                annual_rate_pct=float(ln.get("struct_rate", 8.0)),
+                redemption_years=int(ln.get("struct_years", 6)),
+            )
+            sym = "STRUCTURED"
+        else:
+            df_full, sym, _ = get_price_series(isin_or_name, None, euro_rate)
 
-    df_full = structured_series(
-        start=d_buy,
-        end=TODAY,
-        annual_rate_pct=float(ln.get("struct_rate", 8.0)),
-        redemption_years=int(ln.get("struct_years", 6)),
-    )
-    sym = "STRUCTURED"
-
-else:
-    df_full, sym, _ = get_price_series(isin_or_name, None, euro_rate)
-
-# Sécurité
-if df_full.empty:
-    continue
-
+        # Sécurité
+        if df_full.empty:
+            continue
 
         inception = df_full.index.min()
         d_buy = pd.Timestamp(ln["buy_date"])
@@ -507,8 +504,10 @@ if df_full.empty:
             else:
                 px_buy = float(after.iloc[0]["Close"])
                 eff_dt = after.index[0]
+
         px_manual = ln.get("buy_px", None)
         px_for_qty = float(px_manual) if (px_manual not in (None, "", 0, "0")) else px_buy
+
         price_map[key_id] = df["Close"].astype(float)
         eff_buy_date[key_id] = eff_dt
         buy_price_used[key_id] = px_for_qty
@@ -616,7 +615,6 @@ if df_full.empty:
     irr = xirr(cash_flows)
 
     return df_val, total_brut, total_net, final_val, (irr * 100.0 if irr is not None else None), start_min, start_full
-
 
 # ------------------------------------------------------------
 # Cartes lignes (édition / suppression)

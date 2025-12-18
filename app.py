@@ -1086,7 +1086,7 @@ EURO_RATE_B = st.number_input(
 st.caption("Le taux est appliqué annuellement sur la part investie en fonds euros (EUROFUND).")
 
 st.header("Frais d’entrée (%)")
-    FEE_A = st.number_input(
+FEE_A = st.number_input(
         "Frais d’entrée — Portefeuille 1 (Client)",
         0.0,
         10.0,
@@ -1094,7 +1094,7 @@ st.header("Frais d’entrée (%)")
         0.10,
         key="FEE_A",
     )
-    FEE_B = st.number_input(
+FEE_B = st.number_input(
         "Frais d’entrée — Portefeuille 2 (Valority)",
         0.0,
         10.0,

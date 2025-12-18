@@ -227,6 +227,8 @@ def get_price_series(
 
     return pd.DataFrame(), "", json.dumps(debug)
 
+
+
 # ------------------------------------------------------------
 # Alternatives si date < 1ère VL
 # ------------------------------------------------------------

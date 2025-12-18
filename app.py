@@ -1114,17 +1114,28 @@ def _add_from_reco_block(port_key: str, label: str):
 
 def _add_line_form_free(port_key: str, label: str):
     st.subheader(label)
+
+    # ✅ Date d'achat centralisée (versement initial)
+    buy_date_central = (
+        st.session_state.get("INIT_A_DATE", pd.Timestamp("2024-01-02").date())
+        if port_key == "A_lines"
+        else st.session_state.get("INIT_B_DATE", pd.Timestamp("2024-01-02").date())
+    )
+
     with st.form(key=f"form_add_free_{port_key}", clear_on_submit=False):
         c1, c2 = st.columns([3, 2])
+
         with c1:
             name = st.text_input("Nom du fonds (libre)", value="")
             isin = st.text_input("ISIN ou code (peut être 'EUROFUND')", value="")
+
         with c2:
             amount = st.text_input("Montant investi (brut) €", value="")
-            buy_date = st.date_input(
-                "Date d’achat",
-                value=pd.Timestamp("2024-01-02").date(),
+            st.caption(
+                f"Date d’achat (versement initial) : "
+                f"{pd.Timestamp(buy_date_central).strftime('%d/%m/%Y')}"
             )
+
         px = st.text_input("Prix d’achat (optionnel)", value="")
         note = st.text_input("Note (optionnel)", value="")
         add_btn = st.form_submit_button("➕ Ajouter cette ligne")
@@ -1135,6 +1146,7 @@ def _add_line_form_free(port_key: str, label: str):
     isin_final = isin.strip()
     name_final = name.strip()
 
+    # Si nom vide mais ISIN renseigné : tentative de récupération du nom
     if not name_final and isin_final:
         res = eodhd_search(isin_final)
         match = None
@@ -1164,11 +1176,12 @@ def _add_line_form_free(port_key: str, label: str):
         "name": name_final,
         "isin": isin_final or name_final,
         "amount_gross": float(amt),
-        "buy_date": pd.Timestamp(buy_date),
+        "buy_date": pd.Timestamp(buy_date_central),  # ✅ applique la date centrale
         "buy_px": float(str(px).replace(",", ".")) if px.strip() else "",
         "note": note.strip(),
         "sym_used": "",
     }
+
     st.session_state[port_key].append(ln)
     st.success("Ligne ajoutée.")
 

@@ -1047,7 +1047,6 @@ st.title(APP_TITLE)
 # Init state
 st.session_state.setdefault("A_lines", [])
 st.session_state.setdefault("B_lines", [])
-st.session_state.setdefault("EURO_RATE_PREVIEW", 2.0)
 st.session_state.setdefault("FEE_A", 3.0)
 st.session_state.setdefault("FEE_B", 2.0)
 st.session_state.setdefault("M_A", 0.0)
@@ -1060,232 +1059,138 @@ st.session_state.setdefault("ALLOC_MODE", "equal")
 st.session_state.setdefault("DATE_WARNINGS", [])
 st.session_state.setdefault("INIT_A_DATE", pd.Timestamp("2024-01-02").date())
 st.session_state.setdefault("INIT_B_DATE", pd.Timestamp("2024-01-02").date())
+st.session_state.setdefault("EURO_RATE_A", 2.0)
+st.session_state.setdefault("EURO_RATE_B", 2.5)
 
 # -------------------------------------------------------------------
-# Fonds en euros — Taux annuel (par portefeuille)
+# Sidebar : paramètres globaux
 # -------------------------------------------------------------------
-st.header("Fonds en euros — Taux annuel")
+with st.sidebar:
+    # Fonds en euros — Taux annuel (par portefeuille)
+    st.header("Fonds en euros — Taux annuel")
 
-EURO_RATE_A = st.number_input(
-    "Portefeuille 1 (Client) — taux annuel (%)",
-    0.0,
-    10.0,
-    st.session_state.get("EURO_RATE_A", 2.0),
-    0.10,
-    key="EURO_RATE_A",
-)
-
-EURO_RATE_B = st.number_input(
-    "Portefeuille 2 (Valority) — taux annuel (%)",
-    0.0,
-    10.0,
-    st.session_state.get("EURO_RATE_B", 2.5),
-    0.10,
-    key="EURO_RATE_B",
-)
-
-st.caption(
-    "Le taux est appliqué annuellement sur la part investie en fonds euros (EUROFUND)."
-)
-
-# -------------------------------------------------------------------
-# Frais d’entrée
-# -------------------------------------------------------------------
-st.header("Frais d’entrée (%)")
-
-FEE_A = st.number_input(
-    "Frais d’entrée — Portefeuille 1 (Client)",
-    0.0,
-    10.0,
-    st.session_state.get("FEE_A", 3.0),
-    0.10,
-    key="FEE_A",
-)
-
-FEE_B = st.number_input(
-    "Frais d’entrée — Portefeuille 2 (Valority)",
-    0.0,
-    10.0,
-    st.session_state.get("FEE_B", 2.0),
-    0.10,
-    key="FEE_B",
-)
-
-st.caption(
-    "Les frais s’appliquent sur chaque investissement (initial, mensuel, ponctuel)."
-)
-
-# -------------------------------------------------------------------
-# Date du versement initial (centralisée)
-# -------------------------------------------------------------------
-st.header("Date du versement initial")
-
-st.date_input(
-    "Portefeuille 1 (Client) — date d’investissement initiale",
-    value=st.session_state.get("INIT_A_DATE", pd.Timestamp("2024-01-02").date()),
-    key="INIT_A_DATE",
-)
-
-st.date_input(
-    "Portefeuille 2 (Valority) — date d’investissement initiale",
-    value=st.session_state.get("INIT_B_DATE", pd.Timestamp("2024-01-02").date()),
-    key="INIT_B_DATE",
-)
-
-# -------------------------------------------------------------------
-# Paramètres de versement
-# -------------------------------------------------------------------
-st.header("Paramètres de versement")
-
-with st.expander("Portefeuille 1 — Client"):
-    M_A = st.number_input(
-        "Mensuel brut (€)",
+    EURO_RATE_A = st.number_input(
+        "Portefeuille 1 (Client) — taux annuel (%)",
         0.0,
-        1_000_000.0,
-        st.session_state.get("M_A", 0.0),
-        100.0,
-        key="M_A",
+        10.0,
+        st.session_state.get("EURO_RATE_A", 2.0),
+        0.10,
+        key="EURO_RATE_A",
     )
-    ONE_A = st.number_input(
-        "Ponctuel brut (€)",
+
+    EURO_RATE_B = st.number_input(
+        "Portefeuille 2 (Valority) — taux annuel (%)",
         0.0,
-        1_000_000.0,
-        st.session_state.get("ONE_A", 0.0),
-        100.0,
-        key="ONE_A",
-    )
-    ONE_A_DATE = st.date_input(
-        "Date du ponctuel",
-        value=st.session_state.get(
-            "ONE_A_DATE", pd.Timestamp("2024-07-01").date()
-        ),
-        key="ONE_A_DATE",
+        10.0,
+        st.session_state.get("EURO_RATE_B", 2.5),
+        0.10,
+        key="EURO_RATE_B",
     )
 
-with st.expander("Portefeuille 2 — Valority"):
-    M_B = st.number_input(
-        "Mensuel brut (€)",
+    st.caption("Le taux est appliqué annuellement sur la part investie en fonds euros (EUROFUND).")
+
+    # Frais d’entrée
+    st.header("Frais d’entrée (%)")
+
+    FEE_A = st.number_input(
+        "Frais d’entrée — Portefeuille 1 (Client)",
         0.0,
-        1_000_000.0,
-        st.session_state.get("M_B", 0.0),
-        100.0,
-        key="M_B",
+        10.0,
+        st.session_state.get("FEE_A", 3.0),
+        0.10,
+        key="FEE_A",
     )
-    ONE_B = st.number_input(
-        "Ponctuel brut (€)",
+
+    FEE_B = st.number_input(
+        "Frais d’entrée — Portefeuille 2 (Valority)",
         0.0,
-        1_000_000.0,
-        st.session_state.get("ONE_B", 0.0),
-        100.0,
-        key="ONE_B",
-    )
-    ONE_B_DATE = st.date_input(
-        "Date du ponctuel",
-        value=st.session_state.get(
-            "ONE_B_DATE", pd.Timestamp("2024-07-01").date()
-        ),
-        key="ONE_B_DATE",
+        10.0,
+        st.session_state.get("FEE_B", 2.0),
+        0.10,
+        key="FEE_B",
     )
 
-# -------------------------------------------------------------------
-# Règle d’affectation des versements
-# -------------------------------------------------------------------
-st.header("Règle d’affectation des versements")
+    st.caption("Les frais s’appliquent sur chaque investissement (initial, mensuel, ponctuel).")
 
-current_code = st.session_state.get("ALLOC_MODE", "equal")
-inv_labels = {v: k for k, v in ALLOC_LABELS.items()}
-current_label = inv_labels.get(current_code, "Répartition égale")
+    # Date du versement initial (centralisée)
+    st.header("Date du versement initial")
 
-mode_label = st.selectbox(
-    "Mode",
-    list(ALLOC_LABELS.keys()),
-    index=list(ALLOC_LABELS.keys()).index(current_label),
-    help="Répartition des versements entre les lignes.",
-)
+    st.date_input(
+        "Portefeuille 1 (Client) — date d’investissement initiale",
+        value=st.session_state.get("INIT_A_DATE", pd.Timestamp("2024-01-02").date()),
+        key="INIT_A_DATE",
+    )
 
-st.session_state["ALLOC_MODE"] = ALLOC_LABELS[mode_label]
-alloc_mode_code = st.session_state["ALLOC_MODE"]
+    st.date_input(
+        "Portefeuille 2 (Valority) — date d’investissement initiale",
+        value=st.session_state.get("INIT_B_DATE", pd.Timestamp("2024-01-02").date()),
+        key="INIT_B_DATE",
+    )
 
-# -------------------------------------------------------------------
-# Mode personnalisé
-# -------------------------------------------------------------------
-if alloc_mode_code == "custom":
-    st.caption("Paramétrage détaillé des versements personnalisés.")
+    # Paramètres de versement
+    st.header("Paramètres de versement")
 
-    # -------- Portefeuille 1 — Client
-    with st.expander(
-        "Affectation des versements — Portefeuille 1 (Client)", expanded=False
-    ):
-        linesA = st.session_state.get("A_lines", [])
-        if not linesA:
-            st.info("Ajoutez au moins une ligne dans le Portefeuille Client.")
-        else:
-            custom_m_A: Dict[int, float] = {}
-            custom_o_A: Dict[int, float] = {}
+    with st.expander("Portefeuille 1 — Client"):
+        M_A = st.number_input(
+            "Mensuel brut (€)",
+            0.0,
+            1_000_000.0,
+            st.session_state.get("M_A", 0.0),
+            100.0,
+            key="M_A",
+        )
+        ONE_A = st.number_input(
+            "Ponctuel brut (€)",
+            0.0,
+            1_000_000.0,
+            st.session_state.get("ONE_A", 0.0),
+            100.0,
+            key="ONE_A",
+        )
+        ONE_A_DATE = st.date_input(
+            "Date du ponctuel",
+            value=st.session_state.get("ONE_A_DATE", pd.Timestamp("2024-07-01").date()),
+            key="ONE_A_DATE",
+        )
 
-            for i, ln in enumerate(linesA):
-                label_ligne = ln.get("name") or ln.get("isin") or f"Ligne {i+1}"
+    with st.expander("Portefeuille 2 — Valority"):
+        M_B = st.number_input(
+            "Mensuel brut (€)",
+            0.0,
+            1_000_000.0,
+            st.session_state.get("M_B", 0.0),
+            100.0,
+            key="M_B",
+        )
+        ONE_B = st.number_input(
+            "Ponctuel brut (€)",
+            0.0,
+            1_000_000.0,
+            st.session_state.get("ONE_B", 0.0),
+            100.0,
+            key="ONE_B",
+        )
+        ONE_B_DATE = st.date_input(
+            "Date du ponctuel",
+            value=st.session_state.get("ONE_B_DATE", pd.Timestamp("2024-07-01").date()),
+            key="ONE_B_DATE",
+        )
 
-                m_val = st.number_input(
-                    f"Mensuel affecté à « {label_ligne} » (€)",
-                    0.0,
-                    1_000_000.0,
-                    float(st.session_state.get(f"CUST_M_A_{i}", 0.0)),
-                    50.0,
-                    key=f"CUST_M_A_{i}",
-                )
-                o_val = st.number_input(
-                    f"Ponctuel affecté à « {label_ligne} » (€)",
-                    0.0,
-                    1_000_000.0,
-                    float(st.session_state.get(f"CUST_O_A_{i}", 0.0)),
-                    50.0,
-                    key=f"CUST_O_A_{i}",
-                )
+    # Règle d’affectation
+    st.header("Règle d’affectation des versements")
 
-                custom_m_A[id(ln)] = float(m_val)
-                custom_o_A[id(ln)] = float(o_val)
+    current_code = st.session_state.get("ALLOC_MODE", "equal")
+    inv_labels = {v: k for k, v in ALLOC_LABELS.items()}
+    current_label = inv_labels.get(current_code, "Répartition égale")
 
-            st.session_state["CUSTOM_M_A"] = custom_m_A
-            st.session_state["CUSTOM_O_A"] = custom_o_A
+    mode_label = st.selectbox(
+        "Mode",
+        list(ALLOC_LABELS.keys()),
+        index=list(ALLOC_LABELS.keys()).index(current_label),
+        help="Répartition des versements entre les lignes.",
+    )
 
-    # -------- Portefeuille 2 — Valority
-    with st.expander(
-        "Affectation des versements — Portefeuille 2 (Valority)", expanded=False
-    ):
-        linesB = st.session_state.get("B_lines", [])
-        if not linesB:
-            st.info("Ajoutez au moins une ligne dans le Portefeuille Valority.")
-        else:
-            custom_m_B: Dict[int, float] = {}
-            custom_o_B: Dict[int, float] = {}
-
-            for i, ln in enumerate(linesB):
-                label_ligne = ln.get("name") or ln.get("isin") or f"Ligne {i+1}"
-
-                m_val = st.number_input(
-                    f"Mensuel affecté à « {label_ligne} » (€)",
-                    0.0,
-                    1_000_000.0,
-                    float(st.session_state.get(f"CUST_M_B_{i}", 0.0)),
-                    50.0,
-                    key=f"CUST_M_B_{i}",
-                )
-                o_val = st.number_input(
-                    f"Ponctuel affecté à « {label_ligne} » (€)",
-                    0.0,
-                    1_000_000.0,
-                    float(st.session_state.get(f"CUST_O_B_{i}", 0.0)),
-                    50.0,
-                    key=f"CUST_O_B_{i}",
-                )
-
-                custom_m_B[id(ln)] = float(m_val)
-                custom_o_B[id(ln)] = float(o_val)
-
-            st.session_state["CUSTOM_M_B"] = custom_m_B
-            st.session_state["CUSTOM_O_B"] = custom_o_B
-
+    st.session_state["ALLOC_MODE"] = ALLOC_LABELS[mode_label]
 
 
 # Onglets principaux : Client / Valority

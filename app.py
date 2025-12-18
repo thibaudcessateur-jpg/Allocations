@@ -184,52 +184,33 @@ def get_price_series(
 ) -> Tuple[pd.DataFrame, str, str]:
     """
     EUROFUND : série capitalisée à euro_rate %/an à partir de 1.0
-    - Prix d'achat = 1.0 à la date d'investissement (start)
-    - Intérêts ajoutés au dernier jour ouvré de chaque année
     """
     debug = {"cands": []}
     val = str(isin_or_name).strip()
     if not val:
         return pd.DataFrame(), "", json.dumps(debug)
 
-    # ✅ Fonds en euros : série synthétique correcte (base 1.0 à start, capitalisation annuelle)
+    # ✅ Fonds en euros : série synthétique (capitalisation annuelle au 31/12)
     if val.upper() == "EUROFUND":
-        start_dt = pd.Timestamp(start).normalize() if start is not None else pd.Timestamp("2000-01-03")
-        start_dt = max(start_dt, pd.Timestamp("2000-01-03"))
-
-        idx = pd.bdate_range(start=start_dt, end=TODAY, freq="B")
-        if len(idx) == 0:
-            return pd.DataFrame(), "", json.dumps(debug)
-
+        idx = pd.bdate_range(start=pd.Timestamp("2000-01-03"), end=TODAY, freq="B")
         df = pd.DataFrame(index=idx, columns=["Close"], dtype=float)
+
+        # Valeur initiale
         df.iloc[0, 0] = 1.0
 
-        # Pré-remplissage "plat" (comme un fonds euros : pas de variation quotidienne)
+        # Capitalisation annuelle au 31/12
         for i in range(1, len(df)):
-            df.iloc[i, 0] = df.iloc[i - 1, 0]
+            prev = df.iloc[i - 1, 0]
+            current_date = df.index[i]
 
-        # Capitalisation au dernier jour ouvré de chaque année (évite le bug du 31/12 week-end)
-        years = sorted(set(df.index.year))
-        for y in years:
-            year_mask = df.index.year == y
-            year_dates = df.index[year_mask]
-            if len(year_dates) == 0:
-                continue
+            df.iloc[i, 0] = prev
 
-            year_end = year_dates[-1]  # dernier jour ouvré de l'année
-            if year_end == df.index[0]:
-                continue  # pas de capitalisation le jour 0
+            # Intérêts ajoutés au 31 décembre
+            if current_date.month == 12 and current_date.day == 31:
+                df.iloc[i, 0] = prev * (1.0 + euro_rate / 100.0)
 
-            pos = df.index.get_loc(year_end)
-            prev_val = df.iloc[pos - 1, 0]
-            df.iloc[pos, 0] = prev_val * (1.0 + euro_rate / 100.0)
-
-            # Propager cette nouvelle valeur jusqu'à la prochaine capitalisation
-            for j in range(pos + 1, len(df)):
-                if df.index[j].year == y:
-                    df.iloc[j, 0] = df.iloc[j - 1, 0]
-                else:
-                    break
+        if start is not None:
+            df = df.loc[df.index >= start]
 
         return df, "EUROFUND", "{}"
 
@@ -245,8 +226,6 @@ def get_price_series(
             return df, sym, json.dumps(debug)
 
     return pd.DataFrame(), "", json.dumps(debug)
-
-
 
 # ------------------------------------------------------------
 # Alternatives si date < 1ère VL

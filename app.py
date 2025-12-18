@@ -178,7 +178,6 @@ def _get_close_on(df: pd.DataFrame, d: pd.Timestamp) -> float:
         return float(after.iloc[0]["Close"])
     return float(df.iloc[-1]["Close"])
 
-
 @st.cache_data(show_spinner=False, ttl=3600)
 def get_price_series(
     isin_or_name: str, start: Optional[pd.Timestamp], euro_rate: float
@@ -190,37 +189,45 @@ def get_price_series(
     val = str(isin_or_name).strip()
     if not val:
         return pd.DataFrame(), "", json.dumps(debug)
-        
+
+    # ✅ Fonds en euros : série synthétique (capitalisation annuelle au 31/12)
     if val.upper() == "EUROFUND":
-    idx = pd.bdate_range(start=pd.Timestamp("2000-01-03"), end=TODAY, freq="B")
-    df = pd.DataFrame(index=idx, columns=["Close"], dtype=float)
+        idx = pd.bdate_range(start=pd.Timestamp("2000-01-03"), end=TODAY, freq="B")
+        df = pd.DataFrame(index=idx, columns=["Close"], dtype=float)
 
-    # Capitalisation annuelle au 31/12
-    df.iloc[0, 0] = 1.0
-    for i in range(1, len(df)):
-        prev = df.iloc[i - 1, 0]
-        current_date = df.index[i]
-        df.iloc[i, 0] = prev
+        # Valeur initiale
+        df.iloc[0, 0] = 1.0
 
-        # Intérêts ajoutés au 31 décembre
-        if current_date.month == 12 and current_date.day == 31:
-            df.iloc[i, 0] = prev * (1.0 + euro_rate / 100.0)
+        # Capitalisation annuelle au 31/12
+        for i in range(1, len(df)):
+            prev = df.iloc[i - 1, 0]
+            current_date = df.index[i]
 
-    if start is not None:
-        df = df.loc[df.index >= start]
+            df.iloc[i, 0] = prev
 
-    return df, "EUROFUND", "{}"
+            # Intérêts ajoutés au 31 décembre
+            if current_date.month == 12 and current_date.day == 31:
+                df.iloc[i, 0] = prev * (1.0 + euro_rate / 100.0)
 
+        if start is not None:
+            df = df.loc[df.index >= start]
 
+        return df, "EUROFUND", "{}"
+
+    # ✅ Instruments EODHD : recherche candidates puis EOD daily
     cands = _symbol_candidates(val)
     debug["cands"] = cands
+
     for sym in cands:
         df = eodhd_prices_daily(sym)
         if not df.empty:
             if start is not None:
                 df = df.loc[df.index >= start]
             return df, sym, json.dumps(debug)
+
     return pd.DataFrame(), "", json.dumps(debug)
+
+
 
 
 # ------------------------------------------------------------

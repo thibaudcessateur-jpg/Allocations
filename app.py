@@ -932,12 +932,16 @@ def _add_from_reco_block(port_key: str, label: str):
     with c1:
         amount = st.text_input("Montant investi (brut) €", value="", key=f"reco_amt_{port_key}")
     with c2:
-        buy_date = st.date_input(
-            "Date d’achat",
-            value=pd.Timestamp("2024-01-02").date(),
-            key=f"reco_date_{port_key}",
+        # ✅ Date d'achat centralisée (versement initial uniquement)
+        buy_date = (
+            st.session_state.get("INIT_A_DATE", pd.Timestamp("2024-01-02").date())
+            if port_key == "A_lines"
+            else st.session_state.get("INIT_B_DATE", pd.Timestamp("2024-01-02").date())
         )
+        st.caption(f"Date d’achat (versement initial) : {pd.Timestamp(buy_date).strftime('%d/%m/%Y')}")
+
     px = st.text_input("Prix d’achat (optionnel)", value="", key=f"reco_px_{port_key}")
+
 
     if st.button("➕ Ajouter ce fonds recommandé", key=f"reco_add_{port_key}"):
         try:
@@ -1025,7 +1029,6 @@ def _add_line_form_free(port_key: str, label: str):
 # ------------------------------------------------------------
 st.set_page_config(page_title=APP_TITLE, layout="wide")
 st.title(APP_TITLE)
-
 # Init state
 st.session_state.setdefault("A_lines", [])
 st.session_state.setdefault("B_lines", [])
@@ -1040,6 +1043,9 @@ st.session_state.setdefault("ONE_A_DATE", pd.Timestamp("2024-07-01").date())
 st.session_state.setdefault("ONE_B_DATE", pd.Timestamp("2024-07-01").date())
 st.session_state.setdefault("ALLOC_MODE", "equal")
 st.session_state.setdefault("DATE_WARNINGS", [])
+st.session_state.setdefault("INIT_A_DATE", pd.Timestamp("2024-01-02").date())
+st.session_state.setdefault("INIT_B_DATE", pd.Timestamp("2024-01-02").date())
+
 
 # Sidebar : fonds euros, frais, versements, règle d'affectation
 with st.sidebar:
@@ -1072,6 +1078,19 @@ with st.sidebar:
         key="FEE_B",
     )
     st.caption("Les frais s’appliquent sur chaque investissement (initial, mensuel, ponctuel).")
+
+    # ✅ Date centralisée (versement initial uniquement)
+    st.header("Date du versement initial")
+    st.session_state["INIT_A_DATE"] = st.date_input(
+        "Portefeuille 1 (Client) — date d’investissement initiale",
+        value=st.session_state.get("INIT_A_DATE", pd.Timestamp("2024-01-02").date()),
+        key="INIT_A_DATE",
+    )
+    st.session_state["INIT_B_DATE"] = st.date_input(
+        "Portefeuille 2 (Valority) — date d’investissement initiale",
+        value=st.session_state.get("INIT_B_DATE", pd.Timestamp("2024-01-02").date()),
+        key="INIT_B_DATE",
+    )    
 
     st.header("Paramètres de versement")
     with st.expander("Portefeuille 1 — Client"):

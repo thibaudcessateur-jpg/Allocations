@@ -1099,6 +1099,58 @@ def _add_line_form_free(port_key: str, label: str):
     }
     st.session_state[port_key].append(ln)
     st.success("Ligne ajoutée.")
+st.subheader("Produits structurés (Autocall)")
+
+c1, c2 = st.columns([2, 2])
+with c1:
+    struct_amount = st.text_input(
+        "Montant investi (brut) € — Structuré",
+        value="",
+        key=f"struct_amt_{port_key}",
+    )
+with c2:
+    struct_years = st.number_input(
+        "Durée estimée avant remboursement (années)",
+        min_value=1,
+        max_value=12,
+        value=int(st.session_state.get("STRUCT_YEARS_DEFAULT", 6)),
+        step=1,
+        key=f"struct_years_{port_key}",
+    )
+
+struct_rate = st.number_input(
+    "Rendement annuel estimé (%)",
+    min_value=0.0,
+    max_value=25.0,
+    value=float(st.session_state.get("STRUCT_RATE_DEFAULT", 8.0)),
+    step=0.10,
+    key=f"struct_rate_{port_key}",
+)
+
+if st.button("Ajouter ce produit structuré", key=f"add_struct_{port_key}"):
+    amt = _parse_amount(struct_amount)  # <- utilise ta fonction de parsing existante
+    if amt is None or amt <= 0:
+        st.error("Montant invalide.")
+    else:
+        # Date d'achat = date centralisée versement initial
+        buy_date = (
+            st.session_state.get("INIT_A_DATE", pd.Timestamp("2024-01-02").date())
+            if port_key == "A_lines"
+            else st.session_state.get("INIT_B_DATE", pd.Timestamp("2024-01-02").date())
+        )
+
+        ln = {
+            "name": f"Produit structuré (Autocall) — {struct_rate:.2f}% / {int(struct_years)} ans",
+            "isin": "STRUCTURED",
+            "amount_gross": float(amt),
+            "buy_date": pd.Timestamp(buy_date),
+            "buy_px": 1.0,              # prix synthétique à l'achat
+            "struct_rate": float(struct_rate),
+            "struct_years": int(struct_years),
+        }
+
+        st.session_state[port_key].append(ln)
+        st.success("Produit structuré ajouté.")
 
 
 # ------------------------------------------------------------

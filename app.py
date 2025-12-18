@@ -989,11 +989,15 @@ def _corr_heatmap_chart(corr: pd.DataFrame, title: str) -> Optional[alt.Chart]:
 # ------------------------------------------------------------
 # Blocs de saisie : soit fonds recommandés, soit saisie libre
 # ------------------------------------------------------------
+
+# ------------------------------------------------------------
+# Blocs de saisie : soit fonds recommandés, soit saisie libre
+# ------------------------------------------------------------
 def _add_from_reco_block(port_key: str, label: str):
     st.subheader(label)
     cat = st.selectbox(
         "Catégorie",
-        ["Core (référence)", "Défensif"],
+        ["Core (référence)", "Défensif", "Produits structurés"],
         key=f"reco_cat_{port_key}",
     )
     if "Core" in cat:

@@ -183,38 +183,42 @@ def get_price_series(
     isin_or_name: str, start: Optional[pd.Timestamp], euro_rate: float
 ) -> Tuple[pd.DataFrame, str, str]:
     """
-    EUROFUND : série capitalisée à euro_rate %/an à partir de 1.0
+    EUROFUND : série synthétique capitalisée à euro_rate %/an
+    (capitalisation annualisée lissée, cohérente avec Excel)
     """
     debug = {"cands": []}
     val = str(isin_or_name).strip()
     if not val:
         return pd.DataFrame(), "", json.dumps(debug)
 
-    # ✅ Fonds en euros : série synthétique (capitalisation annuelle au 31/12)
+    # ✅ Fonds en euros — capitalisation annualisée lissée
     if val.upper() == "EUROFUND":
-        idx = pd.bdate_range(start=pd.Timestamp("2000-01-03"), end=TODAY, freq="B")
+        # Date de départ réelle
+        start_dt = (
+            pd.Timestamp(start).normalize()
+            if start is not None
+            else pd.Timestamp("2000-01-03")
+        )
+        start_dt = max(start_dt, pd.Timestamp("2000-01-03"))
+
+        idx = pd.bdate_range(start=start_dt, end=TODAY, freq="B")
+        if len(idx) == 0:
+            return pd.DataFrame(), "", "{}"
+
         df = pd.DataFrame(index=idx, columns=["Close"], dtype=float)
 
         # Valeur initiale
         df.iloc[0, 0] = 1.0
 
-        # Capitalisation annuelle au 31/12
+        # Facteur journalier annualisé
+        daily_factor = (1.0 + euro_rate / 100.0) ** (1.0 / 365.0)
+
         for i in range(1, len(df)):
-            prev = df.iloc[i - 1, 0]
-            current_date = df.index[i]
-
-            df.iloc[i, 0] = prev
-
-            # Intérêts ajoutés au 31 décembre
-            if current_date.month == 12 and current_date.day == 31:
-                df.iloc[i, 0] = prev * (1.0 + euro_rate / 100.0)
-
-        if start is not None:
-            df = df.loc[df.index >= start]
+            df.iloc[i, 0] = df.iloc[i - 1, 0] * daily_factor
 
         return df, "EUROFUND", "{}"
 
-    # ✅ Instruments EODHD : recherche candidates puis EOD daily
+    # ✅ Instruments EODHD — recherche par candidats puis EOD daily
     cands = _symbol_candidates(val)
     debug["cands"] = cands
 
@@ -226,8 +230,6 @@ def get_price_series(
             return df, sym, json.dumps(debug)
 
     return pd.DataFrame(), "", json.dumps(debug)
-
-
 
 # ------------------------------------------------------------
 # Alternatives si date < 1ère VL

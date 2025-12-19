@@ -1338,6 +1338,23 @@ with st.sidebar:
 
     st.session_state["ALLOC_MODE"] = ALLOC_LABELS[mode_label]
 
+    st.divider()
+    st.header("Mode d’analyse")
+
+    mode_ui = st.radio(
+        "Choix",
+        ["Comparer Client vs Valority", "Analyser uniquement Valority", "Analyser uniquement Client"],
+        index=0,
+        key="MODE_ANALYSE_UI",
+    )
+
+    if "Comparer" in mode_ui:
+        st.session_state["MODE_ANALYSE"] = "compare"
+    elif "Valority" in mode_ui:
+        st.session_state["MODE_ANALYSE"] = "valority"
+    else:
+        st.session_state["MODE_ANALYSE"] = "client"
+        
 
 # Onglets principaux : Client / Valority
 tabs = st.tabs(["Portefeuille Client", "Portefeuille Valority"])
@@ -1362,11 +1379,14 @@ with tabs[1]:
     for i, ln in enumerate(st.session_state.get("B_lines", [])):
         _line_card(ln, i, "B_lines")
 
-# Simulation des deux portefeuilles
+# ------------------------------------------------------------
+# Simulation (selon mode)
+# ------------------------------------------------------------
+mode = st.session_state.get("MODE_ANALYSE", "compare")
+
 single_target_A = id(st.session_state["A_lines"][0]) if st.session_state["A_lines"] else None
 single_target_B = id(st.session_state["B_lines"][0]) if st.session_state["B_lines"] else None
 
-# Préparation des poids personnalisés (mensuels / ponctuels)
 alloc_mode_code = st.session_state.get("ALLOC_MODE", "equal")
 
 custom_month_weights_A: Optional[Dict[int, float]] = None
@@ -1375,7 +1395,6 @@ custom_month_weights_B: Optional[Dict[int, float]] = None
 custom_oneoff_weights_B: Optional[Dict[int, float]] = None
 
 if alloc_mode_code == "custom":
-    # Portefeuille A
     cmA = st.session_state.get("CUSTOM_M_A", {}) or {}
     coA = st.session_state.get("CUSTOM_O_A", {}) or {}
     tot_mA = sum(v for v in cmA.values() if v > 0)
@@ -1385,7 +1404,6 @@ if alloc_mode_code == "custom":
     if tot_oA > 0:
         custom_oneoff_weights_A = {k: v / tot_oA for k, v in coA.items() if v > 0}
 
-    # Portefeuille B
     cmB = st.session_state.get("CUSTOM_M_B", {}) or {}
     coB = st.session_state.get("CUSTOM_O_B", {}) or {}
     tot_mB = sum(v for v in cmB.values() if v > 0)
@@ -1398,33 +1416,39 @@ if alloc_mode_code == "custom":
 # Reset warnings avant chaque run
 st.session_state["DATE_WARNINGS"] = []
 
-dfA, brutA, netA, valA, xirrA, startA_min, fullA = simulate_portfolio(
-    st.session_state.get("A_lines", []),
-    st.session_state.get("M_A", 0.0),
-    st.session_state.get("ONE_A", 0.0),
-    st.session_state.get("ONE_A_DATE", pd.Timestamp("2024-07-01").date()),
-    alloc_mode_code,
-    custom_month_weights_A,
-    custom_oneoff_weights_A,
-    single_target_A,
-    st.session_state.get("EURO_RATE_A", 2.0),
-    st.session_state.get("FEE_A", 0.0),
-    portfolio_label="Client",
-)
+# Valeurs par défaut (si on ne simule pas un des portefeuilles)
+dfA, brutA, netA, valA, xirrA, startA_min, fullA = pd.DataFrame(), 0.0, 0.0, 0.0, None, TODAY, TODAY
+dfB, brutB, netB, valB, xirrB, startB_min, fullB = pd.DataFrame(), 0.0, 0.0, 0.0, None, TODAY, TODAY
 
-dfB, brutB, netB, valB, xirrB, startB_min, fullB = simulate_portfolio(
-    st.session_state.get("B_lines", []),
-    st.session_state.get("M_B", 0.0),
-    st.session_state.get("ONE_B", 0.0),
-    st.session_state.get("ONE_B_DATE", pd.Timestamp("2024-07-01").date()),
-    alloc_mode_code,
-    custom_month_weights_B,
-    custom_oneoff_weights_B,
-    single_target_B,
-    st.session_state.get("EURO_RATE_B", 2.5),
-    st.session_state.get("FEE_B", 0.0),
-    portfolio_label="Valority",
-)
+if mode in ("compare", "client"):
+    dfA, brutA, netA, valA, xirrA, startA_min, fullA = simulate_portfolio(
+        st.session_state.get("A_lines", []),
+        st.session_state.get("M_A", 0.0),
+        st.session_state.get("ONE_A", 0.0),
+        st.session_state.get("ONE_A_DATE", pd.Timestamp("2024-07-01").date()),
+        alloc_mode_code,
+        custom_month_weights_A,
+        custom_oneoff_weights_A,
+        single_target_A,
+        st.session_state.get("EURO_RATE_A", 2.0),
+        st.session_state.get("FEE_A", 0.0),
+        portfolio_label="Client",
+    )
+
+if mode in ("compare", "valority"):
+    dfB, brutB, netB, valB, xirrB, startB_min, fullB = simulate_portfolio(
+        st.session_state.get("B_lines", []),
+        st.session_state.get("M_B", 0.0),
+        st.session_state.get("ONE_B", 0.0),
+        st.session_state.get("ONE_B_DATE", pd.Timestamp("2024-07-01").date()),
+        alloc_mode_code,
+        custom_month_weights_B,
+        custom_oneoff_weights_B,
+        single_target_B,
+        st.session_state.get("EURO_RATE_B", 2.5),
+        st.session_state.get("FEE_B", 0.0),
+        portfolio_label="Valority",
+    )
 
 # ------------------------------------------------------------
 # Avertissements sur les dates / 1ère VL
@@ -1438,26 +1462,49 @@ if st.session_state.get("DATE_WARNINGS"):
 # Graphique (évolution des portefeuilles)
 # ------------------------------------------------------------
 st.subheader("Évolution de la valeur des portefeuilles")
-full_dates = [d for d in [fullA, fullB] if isinstance(d, pd.Timestamp)]
+
+mode = st.session_state.get("MODE_ANALYSE", "compare")
+
+# Déterminer le start_plot uniquement sur les portefeuilles affichés
+full_dates: List[pd.Timestamp] = []
+if mode in ("compare", "client") and isinstance(fullA, pd.Timestamp):
+    full_dates.append(fullA)
+if mode in ("compare", "valority") and isinstance(fullB, pd.Timestamp):
+    full_dates.append(fullB)
+
 start_plot = max(full_dates) if full_dates else TODAY
 
 idx = pd.bdate_range(start=start_plot, end=TODAY, freq="B")
 chart_df = pd.DataFrame(index=idx)
-if not dfA.empty:
-    chart_df["Client"] = dfA.reindex(idx)["Valeur"].ffill()
-if not dfB.empty:
-    chart_df["Valority"] = dfB.reindex(idx)["Valeur"].ffill()
-chart_df = chart_df.reset_index().rename(columns={"index": "Date"})
-chart_df = chart_df.melt("Date", var_name="variable", value_name="Valeur (€)")
 
-if chart_df.dropna().empty:
+if mode in ("compare", "client") and not dfA.empty:
+    chart_df["Client"] = dfA.reindex(idx)["Valeur"].ffill()
+
+if mode in ("compare", "valority") and not dfB.empty:
+    chart_df["Valority"] = dfB.reindex(idx)["Valeur"].ffill()
+
+# Passage en format long pour Altair
+chart_long = chart_df.reset_index().rename(columns={"index": "Date"})
+chart_long = chart_long.melt("Date", var_name="variable", value_name="Valeur (€)")
+
+if chart_long.dropna().empty:
     st.info("Ajoutez des lignes et/ou vérifiez vos paramètres pour afficher le graphique.")
 else:
-    base = alt.Chart(chart_df).mark_line().encode(
-        x=alt.X("Date:T", title="Date"),
-        y=alt.Y("Valeur (€):Q", title="Valeur (€)"),
-        color="variable:N",
-    ).properties(height=360, width="container")
+    base = (
+        alt.Chart(chart_long)
+        .mark_line()
+        .encode(
+            x=alt.X("Date:T", title="Date"),
+            y=alt.Y("Valeur (€):Q", title="Valeur (€)"),
+            color=alt.Color("variable:N", title="Portefeuille"),
+            tooltip=[
+                alt.Tooltip("Date:T", title="Date"),
+                alt.Tooltip("variable:N", title="Portefeuille"),
+                alt.Tooltip("Valeur (€):Q", title="Valeur", format=",.2f"),
+            ],
+        )
+        .properties(height=360, width="container")
+    )
     st.altair_chart(base, use_container_width=True)
 
 # ------------------------------------------------------------
@@ -1465,7 +1512,15 @@ else:
 # ------------------------------------------------------------
 st.subheader("Synthèse chiffrée")
 
-period_dates = [d for d in [startA_min, startB_min] if isinstance(d, pd.Timestamp)]
+mode = st.session_state.get("MODE_ANALYSE", "compare")
+
+# Période analysée (uniquement sur ce qui est affiché)
+period_dates: List[pd.Timestamp] = []
+if mode in ("compare", "client") and isinstance(startA_min, pd.Timestamp):
+    period_dates.append(startA_min)
+if mode in ("compare", "valority") and isinstance(startB_min, pd.Timestamp):
+    period_dates.append(startB_min)
+
 if period_dates:
     start_global = min(period_dates)
     st.caption(f"Période analysée : du **{fmt_date(start_global)}** au **{fmt_date(TODAY)}**")
@@ -1473,49 +1528,63 @@ if period_dates:
 perf_tot_client = (valA / netA - 1.0) * 100.0 if netA > 0 else None
 perf_tot_valority = (valB / netB - 1.0) * 100.0 if netB > 0 else None
 
-col_client, col_valority = st.columns(2)
+# ✅ 2 colonnes si compare, sinon 1 colonne (container)
+if mode == "compare":
+    col_client, col_valority = st.columns(2)
+else:
+    col_client = st.container()
+    col_valority = st.container()
 
-with col_client:
-    with st.container(border=True):
-        st.markdown("#### 🧍 Situation actuelle — Client")
-        st.metric("Valeur actuelle", to_eur(valA))
-        st.markdown(
-            f"""
+# ----- Carte Client -----
+if mode in ("compare", "client"):
+    with col_client:
+        with st.container(border=True):
+            st.markdown("#### 🧍 Situation actuelle — Client")
+            st.metric("Valeur actuelle", to_eur(valA))
+            st.markdown(
+                f"""
 - Montants réellement investis (après frais) : **{to_eur(netA)}**
 - Montants versés (brut) : {to_eur(brutA)}
-- Rendement total depuis le début : **{(perf_tot_client or 0):.2f}%**"""
-            if perf_tot_client is not None
-            else f"""
+- Rendement total depuis le début : **{perf_tot_client:.2f}%**
+"""
+                if perf_tot_client is not None
+                else f"""
 - Montants réellement investis (après frais) : **{to_eur(netA)}**
 - Montants versés (brut) : {to_eur(brutA)}
-- Rendement total depuis le début : **—**"""
-        )
-        st.markdown(
-            f"- Rendement annualisé (XIRR) : **{xirrA:.2f}%**"
-            if xirrA is not None
-            else "- Rendement annualisé (XIRR) : **—**"
-        )
+- Rendement total depuis le début : **—**
+"""
+            )
+            st.markdown(
+                f"- Rendement annualisé (XIRR) : **{xirrA:.2f}%**"
+                if xirrA is not None
+                else "- Rendement annualisé (XIRR) : **—**"
+            )
 
-with col_valority:
-    with st.container(border=True):
-        st.markdown("#### 🏢 Simulation — Allocation Valority")
-        st.metric("Valeur actuelle simulée", to_eur(valB))
-        st.markdown(
-            f"""
+# ----- Carte Valority -----
+if mode in ("compare", "valority"):
+    with col_valority:
+        with st.container(border=True):
+            st.markdown("#### 🏢 Simulation — Allocation Valority")
+            st.metric("Valeur actuelle simulée", to_eur(valB))
+            st.markdown(
+                f"""
 - Montants réellement investis (après frais) : **{to_eur(netB)}**
 - Montants versés (brut) : {to_eur(brutB)}
-- Rendement total depuis le début : **{(perf_tot_valority or 0):.2f}%**"""
-            if perf_tot_valority is not None
-            else f"""
+- Rendement total depuis le début : **{perf_tot_valority:.2f}%**
+"""
+                if perf_tot_valority is not None
+                else f"""
 - Montants réellement investis (après frais) : **{to_eur(netB)}**
 - Montants versés (brut) : {to_eur(brutB)}
-- Rendement total depuis le début : **—**"""
-        )
-        st.markdown(
-            f"- Rendement annualisé (XIRR) : **{xirrB:.2f}%**"
-            if xirrB is not None
-            else "- Rendement annualisé (XIRR) : **—**"
-        )
+- Rendement total depuis le début : **—**
+"""
+            )
+            st.markdown(
+                f"- Rendement annualisé (XIRR) : **{xirrB:.2f}%**"
+                if xirrB is not None
+                else "- Rendement annualisé (XIRR) : **—**"
+            )
+
 
 
 def build_html_report(report: Dict[str, Any]) -> str:

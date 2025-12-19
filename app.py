@@ -1808,36 +1808,121 @@ personnalisé.
         )
 
 # ------------------------------------------------------------
-# Comparaison directe : "Et si c’était avec nous ?"
+# Bloc final : Comparaison OU "Frais & valeur créée"
 # ------------------------------------------------------------
-st.subheader("📌 Comparaison : Client vs Valority")
+mode = st.session_state.get("MODE_ANALYSE", "compare")
 
-gain_vs_client = (valB - valA) if (valA and valB) else 0.0
-delta_xirr = (xirrB - xirrA) if (xirrA is not None and xirrB is not None) else None
-perf_diff_tot = (
-    (perf_tot_valority - perf_tot_client) if (perf_tot_client is not None and perf_tot_valority is not None) else None
-)
+def _years_between(d0: pd.Timestamp, d1: pd.Timestamp) -> float:
+    return max(0.0, (d1 - d0).days / 365.25)
 
-with st.container(border=True):
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        st.metric("Gain en valeur", to_eur(gain_vs_client))
-    with c2:
-        st.metric(
-            "Surperformance totale",
-            f"{perf_diff_tot:+.2f}%" if perf_diff_tot is not None else "—",
-        )
-    with c3:
-        st.metric(
-            "Surperformance annualisée (Δ XIRR)",
-            f"{delta_xirr:+.2f}%" if delta_xirr is not None else "—",
-        )
+# ============================
+# CAS 1 — MODE COMPARAISON
+# ============================
+if mode == "compare":
+    st.subheader("📌 Comparaison : Client vs Valority")
 
-    st.markdown(
-        f"""
-Aujourd’hui, avec votre allocation actuelle, votre portefeuille vaut **{to_eur(valA)}**.  
-Avec l’allocation Valority, il serait autour de **{to_eur(valB)}**, soit environ **{to_eur(gain_vs_client)}** de plus."""
+    gain_vs_client = (valB - valA) if (valA is not None and valB is not None) else 0.0
+    delta_xirr = (xirrB - xirrA) if (xirrA is not None and xirrB is not None) else None
+    perf_diff_tot = (
+        (perf_tot_valority - perf_tot_client)
+        if (perf_tot_client is not None and perf_tot_valority is not None)
+        else None
     )
+
+    with st.container(border=True):
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            st.metric("Gain en valeur", to_eur(gain_vs_client))
+        with c2:
+            st.metric(
+                "Surperformance totale",
+                f"{perf_diff_tot:+.2f}%" if perf_diff_tot is not None else "—",
+            )
+        with c3:
+            st.metric(
+                "Surperformance annualisée (Δ XIRR)",
+                f"{delta_xirr:+.2f}%" if delta_xirr is not None else "—",
+            )
+
+        st.markdown(
+            f"""
+Aujourd’hui, avec votre allocation actuelle, votre portefeuille vaut **{to_eur(valA)}**.  
+Avec l’allocation Valority, il serait autour de **{to_eur(valB)}**, soit environ **{to_eur(gain_vs_client)}** de plus.
+"""
+        )
+
+# ============================
+# CAS 2 — MODE ANALYSE SIMPLE
+# ============================
+else:
+    # Sélection des variables selon le mode
+    if mode == "valority":
+        brut = brutB
+        net = netB
+        val = valB
+        start_min = startB_min
+        irr = xirrB
+        fee_pct = st.session_state.get("FEE_B", 0.0)
+        title = "🏢 Allocation Valority — Frais & valeur créée"
+    else:  # mode == "client"
+        brut = brutA
+        net = netA
+        val = valA
+        start_min = startA_min
+        irr = xirrA
+        fee_pct = st.session_state.get("FEE_A", 0.0)
+        title = "🧍 Portefeuille — Frais & valeur créée"
+
+    st.subheader("📌 Analyse : frais & valeur créée")
+
+    if brut > 0 and net >= 0 and val >= 0 and isinstance(start_min, pd.Timestamp):
+        fees_paid = max(0.0, brut - net)     # frais d'entrée réellement payés
+        value_created = val - net            # valeur créée vs capital réellement investi
+        years = _years_between(start_min, TODAY)
+        value_per_year = (value_created / years) if years > 0 else None
+
+        with st.container(border=True):
+            st.markdown(f"#### {title}")
+            st.caption(
+                f"Période : **{fmt_date(start_min)} → {fmt_date(TODAY)}** "
+                f"• Frais d’entrée : **{fee_pct:.2f}%**"
+            )
+
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                st.metric("Frais d’entrée payés", to_eur(fees_paid))
+            with c2:
+                st.metric("Valeur créée (net)", to_eur(value_created))
+            with c3:
+                st.metric(
+                    "Valeur créée / an (moyenne)",
+                    to_eur(value_per_year) if value_per_year is not None else "—",
+                )
+
+            st.markdown(
+                f"""
+- Montants versés (brut) : **{to_eur(brut)}**
+- Montants réellement investis (après frais) : **{to_eur(net)}**
+- Valeur actuelle : **{to_eur(val)}**
+"""
+            )
+
+            if irr is not None:
+                st.markdown(f"- Rendement annualisé (XIRR) : **{irr:.2f}%**")
+            else:
+                st.markdown("- Rendement annualisé (XIRR) : **—**")
+
+            # Message "vendeur" mais strictement factuel
+            if fees_paid > 0:
+                ratio = (value_created / fees_paid) if fees_paid > 0 else None
+                if ratio is not None:
+                    st.markdown(
+                        f"**Lecture :** {to_eur(fees_paid)} de frais d’entrée ont été compensés par "
+                        f"**{to_eur(value_created)}** de valeur nette créée à date "
+                        f"(**×{ratio:.1f}**)."
+                    )
+    else:
+        st.info("Ajoutez des lignes (et/ou des versements) pour afficher l’analyse frais & valeur créée.")
 
 
 # ------------------------------------------------------------

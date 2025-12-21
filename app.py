@@ -743,23 +743,34 @@ def positions_table(title: str, port_key: str):
     Affiche un seul tableau synthétique par portefeuille :
     Nom, ISIN, Date d'achat, Net investi, Valeur actuelle, Perf € et Perf %.
     """
-    fee_pct = st.session_state.get("FEE_A", 0.0) if port_key == "A_lines" else st.session_state.get("FEE_B", 0.0)
-    euro_rate = st.session_state.get("EURO_RATE_PREVIEW", 2.0)
-    lines = st.session_state.get(port_key, [])
+    fee_pct = (
+        st.session_state.get("FEE_A", 0.0)
+        if port_key == "A_lines"
+        else st.session_state.get("FEE_B", 0.0)
+    )
 
+    # ✅ Taux fonds euros par portefeuille (au lieu de EURO_RATE_PREVIEW)
+    euro_rate = (
+        st.session_state.get("EURO_RATE_A", 2.0)
+        if port_key == "A_lines"
+        else st.session_state.get("EURO_RATE_B", 2.5)
+    )
+
+    lines = st.session_state.get(port_key, [])
     rows: List[Dict[str, Any]] = []
 
     for ln in lines:
+        buy_ts = pd.Timestamp(ln.get("buy_date"))
+
         # Montant net investi, VL d'achat et quantité
         net_amt, buy_px, qty = compute_line_metrics(ln, fee_pct, euro_rate)
 
-        # Série de prix pour la valeur actuelle
-        dfl, _, _ = get_price_series(ln.get("isin") or ln.get("name"), None, euro_rate)
+        # ✅ IMPORTANT : on récupère la série "depuis buy_ts" pour éviter le mismatch EUROFUND
+        dfl, _, _ = get_price_series(ln.get("isin") or ln.get("name"), buy_ts, euro_rate)
+
         if not dfl.empty:
-            last_date = dfl.index[-1]
             last_px = float(dfl["Close"].iloc[-1])
         else:
-            last_date = None
             last_px = np.nan
 
         # Valeur actuelle et performance
@@ -796,6 +807,7 @@ def positions_table(title: str, port_key: str):
             hide_index=True,
             use_container_width=True,
         )
+
 
 # ------------------------------------------------------------
 # Analytics internes : retours, corrélation, volatilité

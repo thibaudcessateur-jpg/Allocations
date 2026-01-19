@@ -1,6 +1,13 @@
-from __future__ import annotations
+diff --git a/app.py b/app.py
+index a5772824f245811d5a6952335deefbc439d49029..db43cdb9d0950802c394ef9b53803ed793de87e9 100644
+--- a/app.py
++++ b/app.py
+@@ -1,86 +1,167 @@
+ from __future__ import annotations
  
 +import base64
++import importlib
++import importlib.util
  import json
 +from io import BytesIO
  from datetime import date
@@ -11,9 +18,13 @@ from __future__ import annotations
  import requests
  import streamlit as st
  import altair as alt
-+import matplotlib.pyplot as plt
-+from weasyprint import HTML
  
++PLT_AVAILABLE = importlib.util.find_spec("matplotlib.pyplot") is not None
++plt = importlib.import_module("matplotlib.pyplot") if PLT_AVAILABLE else None
++
++WEASYPRINT_AVAILABLE = importlib.util.find_spec("weasyprint") is not None
++HTML = importlib.import_module("weasyprint").HTML if WEASYPRINT_AVAILABLE else None
++
  # ------------------------------------------------------------
  # Constantes & univers de fonds recommandés
  # ------------------------------------------------------------
@@ -84,7 +95,9 @@ from __future__ import annotations
 +    return df_adj
 +
 +
-+def _fig_to_base64_png(fig: plt.Figure) -> str:
++def _fig_to_base64_png(fig: "plt.Figure") -> str:
++    if not PLT_AVAILABLE or plt is None:
++        return ""
 +    buf = BytesIO()
 +    fig.savefig(buf, format="png", bbox_inches="tight", dpi=150)
 +    plt.close(fig)
@@ -92,6 +105,8 @@ from __future__ import annotations
 +
 +
 +def _portfolio_pie_chart_b64(df_lines: pd.DataFrame, title: str) -> str:
++    if not PLT_AVAILABLE or plt is None:
++        return ""
 +    if df_lines is None or df_lines.empty:
 +        return ""
 +    if "Nom" not in df_lines.columns or "Valeur actuelle €" not in df_lines.columns:
@@ -113,6 +128,8 @@ from __future__ import annotations
 +
 +
 +def _portfolio_value_chart_b64(df_client: pd.DataFrame, df_valority: pd.DataFrame) -> str:
++    if not PLT_AVAILABLE or plt is None:
++        return ""
 +    if (df_client is None or df_client.empty) and (df_valority is None or df_valority.empty):
 +        return ""
 +    fig, ax = plt.subplots(figsize=(7, 3))
@@ -153,7 +170,7 @@ from __future__ import annotations
              if abs(r2 - r) < 1e-9:
                  r = r2
                  break
-@@ -297,51 +366,52 @@ def suggest_alternative_funds(buy_date: pd.Timestamp, euro_rate: float) -> List[
+@@ -297,51 +378,52 @@ def suggest_alternative_funds(buy_date: pd.Timestamp, euro_rate: float) -> List[
              alternatives.append((name, isin, inception))
  
      return alternatives
@@ -207,7 +224,7 @@ from __future__ import annotations
      return corr
  
  
-@@ -469,60 +539,61 @@ def simulate_portfolio(
+@@ -469,60 +551,61 @@ def simulate_portfolio(
              invalid_found = True
              ln["invalid_date"] = True
              ln["inception_date"] = inception
@@ -274,7 +291,7 @@ from __future__ import annotations
          prices[key_id] = s.reindex(bidx).ffill()
  
      qty_events = pd.DataFrame(0.0, index=bidx, columns=prices.columns)
-@@ -690,51 +761,52 @@ def _line_card(line: Dict[str, Any], idx: int, port_key: str):
+@@ -690,51 +773,52 @@ def _line_card(line: Dict[str, Any], idx: int, port_key: str):
                              line["buy_px"] = float(str(new_px).replace(",", "."))
                          except Exception:
                              line["buy_px"] = ""
@@ -328,7 +345,7 @@ from __future__ import annotations
  # ------------------------------------------------------------
  # Tableau synthétique par ligne (un seul tableau par portefeuille)
  # ------------------------------------------------------------
-@@ -744,51 +816,52 @@ def positions_table(title: str, port_key: str):
+@@ -744,51 +828,52 @@ def positions_table(title: str, port_key: str):
      Nom, ISIN, Date d'achat, Net investi, Valeur actuelle, Perf € et Perf %.
      """
      fee_pct = (
@@ -382,7 +399,7 @@ from __future__ import annotations
  
      st.markdown(f"### {title}")
      df = pd.DataFrame(rows)
-@@ -810,51 +883,52 @@ def positions_table(title: str, port_key: str):
+@@ -810,51 +895,52 @@ def positions_table(title: str, port_key: str):
  
  
  # ------------------------------------------------------------
@@ -436,7 +453,7 @@ from __future__ import annotations
      lines: List[Dict[str, Any]],
      euro_rate: float,
      years: int = 3,
-@@ -1592,50 +1666,53 @@ if mode in ("compare", "valority"):
+@@ -1592,50 +1678,53 @@ if mode in ("compare", "valority"):
  - Rendement total depuis le début : **—**
  """
              )
@@ -490,7 +507,7 @@ from __future__ import annotations
  <!DOCTYPE html>
  <html lang="fr">
  <head>
-@@ -1653,125 +1730,198 @@ h1, h2, h3 {{
+@@ -1653,124 +1742,203 @@ h1, h2, h3 {{
  table {{
    border-collapse: collapse;
    width: 100%;
@@ -601,12 +618,6 @@ from __future__ import annotations
 -    report_data = st.session_state.get("REPORT_DATA")
 -    if report_data is not None:
 -        html_report = build_html_report(report_data)
--        st.download_button(
--            "📄 Télécharger le rapport complet (HTML)",
--            data=html_report.encode("utf-8"),
--            file_name="rapport_portefeuille_valority.html",
--            mime="text/html",
--        )
 +
 +st.markdown("---")
 +st.subheader("📄 Rapport client")
@@ -662,19 +673,29 @@ from __future__ import annotations
 +    mime="text/html",
 +)
 +
-+try:
-+    pdf_report = HTML(string=html_report).write_pdf()
-+    st.download_button(
-+        "📕 Télécharger le rapport complet (PDF)",
-+        data=pdf_report,
-+        file_name="rapport_portefeuille_valority.pdf",
-+        mime="application/pdf",
-+    )
-+except Exception:
++if HTML is None:
 +    st.warning(
 +        "La génération PDF est indisponible dans cet environnement. "
-+        "Vérifiez les dépendances système de WeasyPrint.",
++        "Installez WeasyPrint pour activer l'export PDF.",
 +    )
++else:
++    try:
++        pdf_report = HTML(string=html_report).write_pdf()
+         st.download_button(
+-            "📄 Télécharger le rapport complet (HTML)",
+-            data=html_report.encode("utf-8"),
+-            file_name="rapport_portefeuille_valority.html",
+-            mime="text/html",
++            "📕 Télécharger le rapport complet (PDF)",
++            data=pdf_report,
++            file_name="rapport_portefeuille_valority.pdf",
++            mime="application/pdf",
++        )
++    except Exception:
++        st.warning(
++            "La génération PDF est indisponible dans cet environnement. "
++            "Vérifiez les dépendances système de WeasyPrint.",
+         )
  
  # ------------------------------------------------------------
  # Bloc final : Comparaison OU "Frais & valeur créée"
@@ -699,7 +720,3 @@ from __future__ import annotations
      )
  
      with st.container(border=True):
-         c1, c2, c3 = st.columns(3)
- 
-EOF
-)

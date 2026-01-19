@@ -1,10 +1,6 @@
 from __future__ import annotations
 
-import base64
-import importlib
-import importlib.util
 import json
-from io import BytesIO
 from datetime import date
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -13,12 +9,6 @@ import pandas as pd
 import requests
 import streamlit as st
 import altair as alt
-
-PLT_AVAILABLE = importlib.util.find_spec("matplotlib.pyplot") is not None
-plt = importlib.import_module("matplotlib.pyplot") if PLT_AVAILABLE else None
-
-WEASYPRINT_AVAILABLE = importlib.util.find_spec("weasyprint") is not None
-HTML = importlib.import_module("weasyprint").HTML if WEASYPRINT_AVAILABLE else None
 
 # ------------------------------------------------------------
 # Constantes & univers de fonds recommandés
@@ -41,10 +31,6 @@ RECO_FUNDS_DEF = [
     ("R-Co Target 2029 HY", "FR0014002XJ3"),
     ("Euro Bond 1-3 Years", "LU0321462953"),
 ]
-
-# Frais de gestion du contrat
-MGMT_FEE_EURO_PCT = 0.9
-MGMT_FEE_UC_PCT = 1.2
 
 # Libellés FR -> codes internes pour l'affectation des versements
 ALLOC_LABELS = {
@@ -71,73 +57,6 @@ def fmt_date(x: Any) -> str:
         return pd.Timestamp(x).strftime("%d/%m/%Y")
     except Exception:
         return "—"
-
-
-def contract_mgmt_fee_pct(isin_or_name: str) -> float:
-    code = str(isin_or_name or "").strip().upper()
-    if code == "EUROFUND":
-        return MGMT_FEE_EURO_PCT
-    return MGMT_FEE_UC_PCT
-
-
-def apply_management_fee(df: pd.DataFrame, fee_pct: float) -> pd.DataFrame:
-    if df.empty or fee_pct <= 0:
-        return df
-    df_adj = df.copy()
-    days = (df_adj.index - df_adj.index[0]).days.astype(float)
-    factor = np.power(1.0 - fee_pct / 100.0, days / 365.0)
-    df_adj["Close"] = df_adj["Close"].astype(float) * factor
-    return df_adj
-
-
-def _fig_to_base64_png(fig: "plt.Figure") -> str:
-    if not PLT_AVAILABLE or plt is None:
-        return ""
-    buf = BytesIO()
-    fig.savefig(buf, format="png", bbox_inches="tight", dpi=150)
-    plt.close(fig)
-    return base64.b64encode(buf.getvalue()).decode("utf-8")
-
-
-def _portfolio_pie_chart_b64(df_lines: pd.DataFrame, title: str) -> str:
-    if not PLT_AVAILABLE or plt is None:
-        return ""
-    if df_lines is None or df_lines.empty:
-        return ""
-    if "Nom" not in df_lines.columns or "Valeur actuelle €" not in df_lines.columns:
-        return ""
-    values = df_lines[["Nom", "Valeur actuelle €"]].copy()
-    values = values[values["Valeur actuelle €"] > 0]
-    if values.empty:
-        return ""
-    fig, ax = plt.subplots(figsize=(5, 4))
-    ax.pie(
-        values["Valeur actuelle €"],
-        labels=values["Nom"],
-        autopct="%1.1f%%",
-        startangle=90,
-    )
-    ax.set_title(title)
-    ax.axis("equal")
-    return _fig_to_base64_png(fig)
-
-
-def _portfolio_value_chart_b64(df_client: pd.DataFrame, df_valority: pd.DataFrame) -> str:
-    if not PLT_AVAILABLE or plt is None:
-        return ""
-    if (df_client is None or df_client.empty) and (df_valority is None or df_valority.empty):
-        return ""
-    fig, ax = plt.subplots(figsize=(7, 3))
-    if df_client is not None and not df_client.empty:
-        ax.plot(df_client.index, df_client["Valeur"], label="Client")
-    if df_valority is not None and not df_valority.empty:
-        ax.plot(df_valority.index, df_valority["Valeur"], label="Valority")
-    ax.set_title("Évolution de la valeur des portefeuilles")
-    ax.set_xlabel("Date")
-    ax.set_ylabel("Valeur (€)")
-    ax.legend()
-    fig.autofmt_xdate()
-    return _fig_to_base64_png(fig)
 
 
 # ------------------------------------------------------------
@@ -400,8 +319,7 @@ def correlation_matrix_from_lines(
         label = ln.get("name") or ln.get("isin") or "Ligne"
         key = f"{label} ({ln.get('isin','')})"
 
-        df_raw, sym, _ = get_price_series(ln.get("isin") or ln.get("name"), None, euro_rate)
-        df = apply_management_fee(df_raw, contract_mgmt_fee_pct(sym or ln.get("isin") or ln.get("name")))
+        df, _, _ = get_price_series(ln.get("isin") or ln.get("name"), None, euro_rate)
         if df.empty:
             continue
 
@@ -573,17 +491,16 @@ def simulate_portfolio(
             continue
 
         ln["sym_used"] = sym
-        mgmt_fee = contract_mgmt_fee_pct(sym or isin_or_name)
-        df = apply_management_fee(df_full, mgmt_fee)
+        df = df_full
 
         if d_buy in df.index:
-            px_buy = float(df_full.loc[d_buy, "Close"])
+            px_buy = float(df.loc[d_buy, "Close"])
             eff_dt = d_buy
         else:
-            after = df_full.loc[df_full.index >= d_buy]
+            after = df.loc[df.index >= d_buy]
             if after.empty:
-                px_buy = float(df_full.iloc[-1]["Close"])
-                eff_dt = df_full.index[-1]
+                px_buy = float(df.iloc[-1]["Close"])
+                eff_dt = df.index[-1]
             else:
                 px_buy = float(after.iloc[0]["Close"])
                 eff_dt = after.index[0]
@@ -795,8 +712,7 @@ def portfolio_summary_dataframe(port_key: str) -> pd.DataFrame:
     for ln in lines:
         net_amt, buy_px, qty = compute_line_metrics(ln, fee_pct, euro_rate)
 
-        dfl_raw, sym, _ = get_price_series(ln.get("isin") or ln.get("name"), None, euro_rate)
-        dfl = apply_management_fee(dfl_raw, contract_mgmt_fee_pct(sym or ln.get("isin") or ln.get("name")))
+        dfl, _, _ = get_price_series(ln.get("isin") or ln.get("name"), None, euro_rate)
         if not dfl.empty:
             last_px = float(dfl["Close"].iloc[-1])
         else:
@@ -850,8 +766,7 @@ def positions_table(title: str, port_key: str):
         net_amt, buy_px, qty = compute_line_metrics(ln, fee_pct, euro_rate)
 
         # ✅ IMPORTANT : on récupère la série "depuis buy_ts" pour éviter le mismatch EUROFUND
-        dfl_raw, sym, _ = get_price_series(ln.get("isin") or ln.get("name"), buy_ts, euro_rate)
-        dfl = apply_management_fee(dfl_raw, contract_mgmt_fee_pct(sym or ln.get("isin") or ln.get("name")))
+        dfl, _, _ = get_price_series(ln.get("isin") or ln.get("name"), buy_ts, euro_rate)
 
         if not dfl.empty:
             last_px = float(dfl["Close"].iloc[-1])
@@ -917,8 +832,7 @@ def _build_returns_df(
         isin = (ln.get("isin") or "").strip()
         key = f"{label} ({isin})" if isin else label
 
-        df_raw, sym, _ = get_price_series(ln.get("isin") or ln.get("name"), None, euro_rate)
-        df = apply_management_fee(df_raw, contract_mgmt_fee_pct(sym or ln.get("isin") or ln.get("name")))
+        df, _, _ = get_price_series(ln.get("isin") or ln.get("name"), None, euro_rate)
         if df.empty:
             continue
 
@@ -1700,9 +1614,6 @@ def build_html_report(report: Dict[str, Any]) -> str:
     dfB_lines = report.get("df_valority_lines")
     dfA_val = report.get("dfA_val")
     dfB_val = report.get("dfB_val")
-    chart_value_b64 = report.get("chart_value_b64", "")
-    pie_client_b64 = report.get("pie_client_b64", "")
-    pie_valority_b64 = report.get("pie_valority_b64", "")
 
     def _fmt_eur(x):
         try:
@@ -1764,10 +1675,6 @@ th {{
   margin-bottom: 16px;
   background-color: #fafafa;
 }}
-img {{
-  max-width: 100%;
-  height: auto;
-}}
 </style>
 </head>
 <body>
@@ -1808,15 +1715,7 @@ img {{
   </ul>
 </div>
 
-<h2>2. Composition du portefeuille</h2>
-
-<h3>Client</h3>
-{"<img src='data:image/png;base64," + pie_client_b64 + "' alt='Composition Client' />" if pie_client_b64 else "<p class='small'>Composition indisponible.</p>"}
-
-<h3>Valority</h3>
-{"<img src='data:image/png;base64," + pie_valority_b64 + "' alt='Composition Valority' />" if pie_valority_b64 else "<p class='small'>Composition indisponible.</p>"}
-
-<h2>3. Détail des lignes</h2>
+<h2>2. Détail des lignes</h2>
 
 <h3>Portefeuille Client</h3>
 {html_client_lines}
@@ -1824,9 +1723,7 @@ img {{
 <h3>Portefeuille Valority</h3>
 {html_valority_lines}
 
-<h2>4. Historique de la valeur des portefeuilles</h2>
-
-{"<img src='data:image/png;base64," + chart_value_b64 + "' alt='Évolution de la valeur' />" if chart_value_b64 else "<p class='small'>Graphique indisponible.</p>"}
+<h2>3. Historique de la valeur des portefeuilles</h2>
 
 <h3>Client – Valeur du portefeuille par date</h3>
 {html_A_val}
@@ -1844,79 +1741,14 @@ personnalisé.
 """
     return html
 
-
-st.markdown("---")
-st.subheader("📄 Rapport client")
-
-df_client_lines = portfolio_summary_dataframe("A_lines")
-df_valority_lines = portfolio_summary_dataframe("B_lines")
-
-dfA_val = dfA.reset_index().rename(columns={"index": "Date"}) if not dfA.empty else None
-dfB_val = dfB.reset_index().rename(columns={"index": "Date"}) if not dfB.empty else None
-
-chart_value_b64 = _portfolio_value_chart_b64(dfA, dfB)
-pie_client_b64 = _portfolio_pie_chart_b64(df_client_lines, "Composition — Client")
-pie_valority_b64 = _portfolio_pie_chart_b64(df_valority_lines, "Composition — Valority")
-
-report_data = {
-    "as_of": fmt_date(TODAY),
-    "client_summary": {
-        "val": valA,
-        "net": netA,
-        "brut": brutA,
-        "perf_tot_pct": perf_tot_client or 0.0,
-        "irr_pct": xirrA or 0.0,
-    },
-    "valority_summary": {
-        "val": valB,
-        "net": netB,
-        "brut": brutB,
-        "perf_tot_pct": perf_tot_valority or 0.0,
-        "irr_pct": xirrB or 0.0,
-    },
-    "comparison": {
-        "delta_val": (valB - valA) if (valA is not None and valB is not None) else 0.0,
-        "delta_perf_pct": (
-            (perf_tot_valority - perf_tot_client)
-            if (perf_tot_client is not None and perf_tot_valority is not None)
-            else 0.0
-        ),
-    },
-    "df_client_lines": df_client_lines,
-    "df_valority_lines": df_valority_lines,
-    "dfA_val": dfA_val,
-    "dfB_val": dfB_val,
-    "chart_value_b64": chart_value_b64,
-    "pie_client_b64": pie_client_b64,
-    "pie_valority_b64": pie_valority_b64,
-}
-
-html_report = build_html_report(report_data)
-st.download_button(
-    "📄 Télécharger le rapport complet (HTML)",
-    data=html_report.encode("utf-8"),
-    file_name="rapport_portefeuille_valority.html",
-    mime="text/html",
-)
-
-if HTML is None:
-    st.warning(
-        "La génération PDF est indisponible dans cet environnement. "
-        "Installez WeasyPrint pour activer l'export PDF.",
-    )
-else:
-    try:
-        pdf_report = HTML(string=html_report).write_pdf()
+    report_data = st.session_state.get("REPORT_DATA")
+    if report_data is not None:
+        html_report = build_html_report(report_data)
         st.download_button(
-            "📕 Télécharger le rapport complet (PDF)",
-            data=pdf_report,
-            file_name="rapport_portefeuille_valority.pdf",
-            mime="application/pdf",
-        )
-    except Exception:
-        st.warning(
-            "La génération PDF est indisponible dans cet environnement. "
-            "Vérifiez les dépendances système de WeasyPrint.",
+            "📄 Télécharger le rapport complet (HTML)",
+            data=html_report.encode("utf-8"),
+            file_name="rapport_portefeuille_valority.html",
+            mime="text/html",
         )
 
 # ------------------------------------------------------------

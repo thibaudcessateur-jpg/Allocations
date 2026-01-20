@@ -15,6 +15,8 @@ import altair as alt
 # ------------------------------------------------------------
 TODAY = pd.Timestamp.today().normalize()
 APP_TITLE = "Comparateur de portefeuilles"
+ANNUAL_FEE_EURO_PCT = 0.9
+ANNUAL_FEE_UC_PCT = 1.2
 
 RECO_FUNDS_CORE = [
     ("R-co Valor C EUR", "FR0011253624"),
@@ -179,6 +181,18 @@ def _get_close_on(df: pd.DataFrame, d: pd.Timestamp) -> float:
     return float(df.iloc[-1]["Close"])
 
 
+def apply_annual_fee(df: pd.DataFrame, annual_fee_pct: float) -> pd.DataFrame:
+    if df.empty or annual_fee_pct == 0:
+        return df
+    df = df.copy()
+    fee_rate = float(annual_fee_pct) / 100.0
+    base_date = df.index[0]
+    day_offsets = (df.index - base_date).days.astype(float)
+    fee_factors = (1.0 - fee_rate) ** (day_offsets / 365.0)
+    df["Close"] = df["Close"].astype(float).to_numpy() * fee_factors
+    return df
+
+
 @st.cache_data(show_spinner=False, ttl=3600)
 def get_price_series(
     isin_or_name: str, start: Optional[pd.Timestamp], euro_rate: float
@@ -215,6 +229,7 @@ def get_price_series(
             delta_days = (df.index[i] - df.index[i - 1]).days  # ✅ jours calendaires
             df.iloc[i, 0] = prev_val * ((1.0 + r) ** (delta_days / 365.0))
 
+        df = apply_annual_fee(df, ANNUAL_FEE_EURO_PCT)
         return df, "EUROFUND", "{}"
 
     # ✅ Instruments EODHD — recherche candidates puis EOD daily
@@ -226,6 +241,7 @@ def get_price_series(
         if not df.empty:
             if start is not None:
                 df = df.loc[df.index >= start]
+            df = apply_annual_fee(df, ANNUAL_FEE_UC_PCT)
             return df, sym, json.dumps(debug)
 
     return pd.DataFrame(), "", json.dumps(debug)
@@ -1245,7 +1261,11 @@ with st.sidebar:
         key="EURO_RATE_B",
     )
 
-    st.caption("Le taux est appliqué annuellement sur la part investie en fonds euros (EUROFUND).")
+    st.caption(
+        "Le taux est appliqué annuellement sur la part investie en fonds euros (EUROFUND), "
+        f"net des frais UC : {ANNUAL_FEE_EURO_PCT:.1f}%/an pour le fonds euros "
+        f"et {ANNUAL_FEE_UC_PCT:.1f}%/an pour les unités de compte."
+    )
 
     # Frais d’entrée
     st.header("Frais d’entrée (%)")

@@ -2,19 +2,27 @@ from __future__ import annotations
 
 import json
 from datetime import date
+from io import BytesIO
 from typing import Any, Dict, List, Optional, Tuple
 
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
 import altair as alt
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image, Table, TableStyle
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.lib import colors
 
 # ------------------------------------------------------------
 # Constantes & univers de fonds recommandés
 # ------------------------------------------------------------
 TODAY = pd.Timestamp.today().normalize()
 APP_TITLE = "Comparateur de portefeuilles"
+ANNUAL_FEE_EURO_PCT = 0.9
+ANNUAL_FEE_UC_PCT = 1.2
 
 RECO_FUNDS_CORE = [
     ("R-co Valor C EUR", "FR0011253624"),
@@ -179,6 +187,18 @@ def _get_close_on(df: pd.DataFrame, d: pd.Timestamp) -> float:
     return float(df.iloc[-1]["Close"])
 
 
+def apply_annual_fee(df: pd.DataFrame, annual_fee_pct: float) -> pd.DataFrame:
+    if df.empty or annual_fee_pct == 0:
+        return df
+    df = df.copy()
+    fee_rate = float(annual_fee_pct) / 100.0
+    base_date = df.index[0]
+    day_offsets = (df.index - base_date).days.astype(float)
+    fee_factors = (1.0 - fee_rate) ** (day_offsets / 365.0)
+    df["Close"] = df["Close"].astype(float).to_numpy() * fee_factors
+    return df
+
+
 @st.cache_data(show_spinner=False, ttl=3600)
 def get_price_series(
     isin_or_name: str, start: Optional[pd.Timestamp], euro_rate: float
@@ -215,6 +235,7 @@ def get_price_series(
             delta_days = (df.index[i] - df.index[i - 1]).days  # ✅ jours calendaires
             df.iloc[i, 0] = prev_val * ((1.0 + r) ** (delta_days / 365.0))
 
+        df = apply_annual_fee(df, ANNUAL_FEE_EURO_PCT)
         return df, "EUROFUND", "{}"
 
     # ✅ Instruments EODHD — recherche candidates puis EOD daily
@@ -226,6 +247,7 @@ def get_price_series(
         if not df.empty:
             if start is not None:
                 df = df.loc[df.index >= start]
+            df = apply_annual_fee(df, ANNUAL_FEE_UC_PCT)
             return df, sym, json.dumps(debug)
 
     return pd.DataFrame(), "", json.dumps(debug)
@@ -735,6 +757,55 @@ def portfolio_summary_dataframe(port_key: str) -> pd.DataFrame:
 
     df = pd.DataFrame(rows)
     return df
+
+
+def build_positions_dataframe(port_key: str) -> pd.DataFrame:
+    """
+    Construit un DataFrame par ligne :
+    Nom, ISIN, Date d'achat, Net investi, Valeur actuelle, Perf € et Perf %.
+    """
+    fee_pct = (
+        st.session_state.get("FEE_A", 0.0)
+        if port_key == "A_lines"
+        else st.session_state.get("FEE_B", 0.0)
+    )
+
+    euro_rate = (
+        st.session_state.get("EURO_RATE_A", 2.0)
+        if port_key == "A_lines"
+        else st.session_state.get("EURO_RATE_B", 2.5)
+    )
+
+    lines = st.session_state.get(port_key, [])
+    rows: List[Dict[str, Any]] = []
+
+    for ln in lines:
+        buy_ts = pd.Timestamp(ln.get("buy_date"))
+        net_amt, buy_px, qty = compute_line_metrics(ln, fee_pct, euro_rate)
+        dfl, _, _ = get_price_series(ln.get("isin") or ln.get("name"), buy_ts, euro_rate)
+
+        if not dfl.empty:
+            last_px = float(dfl["Close"].iloc[-1])
+        else:
+            last_px = np.nan
+
+        val_now = qty * last_px if last_px == last_px else 0.0
+        perf_abs = val_now - net_amt
+        perf_pct = (val_now / net_amt - 1.0) * 100.0 if net_amt > 0 else np.nan
+
+        rows.append(
+            {
+                "Nom": ln.get("name", ""),
+                "ISIN / Code": ln.get("isin", ""),
+                "Date d'achat": fmt_date(ln.get("buy_date")),
+                "Net investi €": net_amt,
+                "Valeur actuelle €": val_now,
+                "Perf €": perf_abs,
+                "Perf %": perf_pct,
+            }
+        )
+
+    return pd.DataFrame(rows)
 # ------------------------------------------------------------
 # Tableau synthétique par ligne (un seul tableau par portefeuille)
 # ------------------------------------------------------------
@@ -1245,7 +1316,11 @@ with st.sidebar:
         key="EURO_RATE_B",
     )
 
-    st.caption("Le taux est appliqué annuellement sur la part investie en fonds euros (EUROFUND).")
+    st.caption(
+        "Le taux est appliqué annuellement sur la part investie en fonds euros (EUROFUND), "
+        f"net des frais UC : {ANNUAL_FEE_EURO_PCT:.1f}%/an pour le fonds euros "
+        f"et {ANNUAL_FEE_UC_PCT:.1f}%/an pour les unités de compte."
+    )
 
     # Frais d’entrée
     st.header("Frais d’entrée (%)")
@@ -1737,27 +1812,361 @@ personnalisé.
 </p>
 
 </body>
-</html>
+    </html>
 """
     return html
 
-    report_data = st.session_state.get("REPORT_DATA")
-    if report_data is not None:
-        html_report = build_html_report(report_data)
-        st.download_button(
-            "📄 Télécharger le rapport complet (HTML)",
-            data=html_report.encode("utf-8"),
-            file_name="rapport_portefeuille_valority.html",
-            mime="text/html",
+
+def _add_table_to_story(story: List[Any], df: pd.DataFrame):
+    if df.empty:
+        story.append(Paragraph("Données indisponibles.", getSampleStyleSheet()["Normal"]))
+        return
+    headers = list(df.columns)
+    data = [headers] + df.values.tolist()
+    table = Table(data, repeatRows=1)
+    table.setStyle(
+        TableStyle(
+            [
+                ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
+                ("GRID", (0, 0), (-1, -1), 0.25, colors.grey),
+                ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                ("FONTSIZE", (0, 0), (-1, -1), 8),
+                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+            ]
         )
+    )
+    story.append(table)
+
+
+def _fig_to_rl_image(fig: plt.Figure, width: float = 480, height: float = 270) -> Image:
+    buf = BytesIO()
+    fig.savefig(buf, format="png", dpi=150, bbox_inches="tight")
+    buf.seek(0)
+    plt.close(fig)
+    return Image(buf, width=width, height=height)
+
+
+def _build_value_chart(df_map: Dict[str, pd.DataFrame]) -> Optional[Image]:
+    if not df_map:
+        return None
+    fig, ax = plt.subplots(figsize=(6, 3))
+    has_data = False
+    for label, df in df_map.items():
+        if df is None or df.empty or "Valeur" not in df.columns:
+            continue
+        ax.plot(df.index, df["Valeur"], label=label)
+        has_data = True
+    if not has_data:
+        plt.close(fig)
+        return None
+    ax.set_title("Évolution de la valeur du portefeuille")
+    ax.set_xlabel("Date")
+    ax.set_ylabel("Valeur (€)")
+    ax.legend(loc="best")
+    fig.autofmt_xdate()
+    return _fig_to_rl_image(fig)
+
+
+def _build_pie_chart(df_positions: pd.DataFrame, title: str) -> Optional[Image]:
+    if df_positions.empty:
+        return None
+    df = df_positions.copy()
+    if "Valeur actuelle €" not in df.columns:
+        return None
+    df = df[df["Valeur actuelle €"] > 0]
+    if df.empty:
+        return None
+    total = df["Valeur actuelle €"].sum()
+    df["Part"] = df["Valeur actuelle €"] / total
+    small = df[df["Part"] < 0.03]
+    df_main = df[df["Part"] >= 0.03]
+    if not small.empty:
+        df_main = pd.concat(
+            [
+                df_main,
+                pd.DataFrame(
+                    {
+                        "Nom": ["Autres"],
+                        "Valeur actuelle €": [small["Valeur actuelle €"].sum()],
+                        "Part": [small["Part"].sum()],
+                    }
+                ),
+            ],
+            ignore_index=True,
+        )
+    fig, ax = plt.subplots(figsize=(5, 3))
+    ax.pie(df_main["Valeur actuelle €"], labels=df_main["Nom"], autopct="%1.1f%%")
+    ax.set_title(title)
+    return _fig_to_rl_image(fig, width=420, height=280)
+
+
+def _build_allocation_pie(lines: List[Dict[str, Any]], title: str) -> Optional[Image]:
+    if not lines:
+        return None
+    categories = {"EUROFUND": 0.0, "UC": 0.0, "STRUCTURED": 0.0}
+    for ln in lines:
+        isin = str(ln.get("isin", "")).upper()
+        val = float(ln.get("value", 0.0))
+        if isin == "EUROFUND":
+            categories["EUROFUND"] += val
+        elif isin == "STRUCTURED":
+            categories["STRUCTURED"] += val
+        else:
+            categories["UC"] += val
+    if sum(categories.values()) <= 0:
+        return None
+    fig, ax = plt.subplots(figsize=(5, 3))
+    ax.pie(list(categories.values()), labels=list(categories.keys()), autopct="%1.1f%%")
+    ax.set_title(title)
+    return _fig_to_rl_image(fig, width=420, height=280)
+
+
+def _build_contribution_bar(df_positions: pd.DataFrame) -> Optional[Image]:
+    if df_positions.empty:
+        return None
+    df = df_positions.copy()
+    if not {"Nom", "Valeur actuelle €", "Net investi €"}.issubset(df.columns):
+        return None
+    df["Contribution €"] = df["Valeur actuelle €"] - df["Net investi €"]
+    positives = df[df["Contribution €"] > 0].nlargest(5, "Contribution €")
+    negatives = df[df["Contribution €"] < 0].nsmallest(5, "Contribution €")
+    df_show = pd.concat([positives, negatives]).drop_duplicates(subset=["Nom"])
+    if df_show.empty:
+        return None
+    fig, ax = plt.subplots(figsize=(6, 3))
+    ax.bar(df_show["Nom"], df_show["Contribution €"])
+    ax.set_title("Contribution par ligne (€)")
+    ax.set_ylabel("Contribution €")
+    ax.axhline(0, color="black", linewidth=0.5)
+    ax.tick_params(axis="x", rotation=45, labelsize=8)
+    fig.tight_layout()
+    return _fig_to_rl_image(fig)
+
+
+def generate_pdf_report(report: Dict[str, Any]) -> bytes:
+    buffer = BytesIO()
+    doc = SimpleDocTemplate(buffer, pagesize=A4)
+    styles = getSampleStyleSheet()
+    story: List[Any] = []
+
+    story.append(Paragraph("Rapport client", styles["Title"]))
+    story.append(Paragraph(f"Date de génération : {report.get('as_of', '')}", styles["Normal"]))
+    story.append(Spacer(1, 12))
+
+    mode = report.get("mode", "compare")
+    synthA = report.get("client_summary", {})
+    synthB = report.get("valority_summary", {})
+    comp = report.get("comparison", {})
+
+    story.append(Paragraph("Synthèse", styles["Heading2"]))
+    if mode == "compare":
+        story.append(Paragraph("Client", styles["Heading3"]))
+        story.append(
+            Paragraph(
+                f"Valeur : {to_eur(synthA.get('val', 0))} | "
+                f"Net : {to_eur(synthA.get('net', 0))} | "
+                f"Brut : {to_eur(synthA.get('brut', 0))} | "
+                f"Perf : {synthA.get('perf_tot_pct', 0):.2f}% | "
+                f"XIRR : {synthA.get('irr_pct', 0):.2f}%",
+                styles["Normal"],
+            )
+        )
+        story.append(Spacer(1, 6))
+        story.append(Paragraph("Valority", styles["Heading3"]))
+        story.append(
+            Paragraph(
+                f"Valeur : {to_eur(synthB.get('val', 0))} | "
+                f"Net : {to_eur(synthB.get('net', 0))} | "
+                f"Brut : {to_eur(synthB.get('brut', 0))} | "
+                f"Perf : {synthB.get('perf_tot_pct', 0):.2f}% | "
+                f"XIRR : {synthB.get('irr_pct', 0):.2f}%",
+                styles["Normal"],
+            )
+        )
+        story.append(Spacer(1, 6))
+        story.append(
+            Paragraph(
+                f"Comparaison : Δ valeur {to_eur(comp.get('delta_val', 0))} | "
+                f"Δ perf {comp.get('delta_perf_pct', 0):.2f}%",
+                styles["Normal"],
+            )
+        )
+    else:
+        title = "Valority" if mode == "valority" else "Client"
+        synth = synthB if mode == "valority" else synthA
+        story.append(Paragraph(title, styles["Heading3"]))
+        story.append(
+            Paragraph(
+                f"Valeur : {to_eur(synth.get('val', 0))} | "
+                f"Net : {to_eur(synth.get('net', 0))} | "
+                f"Brut : {to_eur(synth.get('brut', 0))} | "
+                f"Perf : {synth.get('perf_tot_pct', 0):.2f}% | "
+                f"XIRR : {synth.get('irr_pct', 0):.2f}%",
+                styles["Normal"],
+            )
+        )
+        fees = report.get("fees_analysis", {})
+        if fees:
+            story.append(Spacer(1, 6))
+            story.append(
+                Paragraph(
+                    f"Frais d’entrée payés : {to_eur(fees.get('fees_paid', 0))} | "
+                    f"Valeur créée : {to_eur(fees.get('value_created', 0))} | "
+                    f"Valeur/an : {to_eur(fees.get('value_per_year', 0))}",
+                    styles["Normal"],
+                )
+            )
+    story.append(Spacer(1, 12))
+
+    story.append(Paragraph("Graphiques", styles["Heading2"]))
+    value_chart = _build_value_chart(report.get("df_map", {}))
+    if value_chart is not None:
+        story.append(value_chart)
+        story.append(Spacer(1, 6))
+    else:
+        story.append(Paragraph("Données indisponibles pour le graphique de valeur.", styles["Normal"]))
+        story.append(Spacer(1, 6))
+
+    positions_df = report.get("positions_df")
+    if isinstance(positions_df, pd.DataFrame):
+        pie_chart = _build_pie_chart(positions_df, "Composition du portefeuille")
+        if pie_chart is not None:
+            story.append(pie_chart)
+            story.append(Spacer(1, 6))
+
+        allocation_pie = _build_allocation_pie(report.get("lines", []), "EUROFUND vs UC vs STRUCTURED")
+        if allocation_pie is not None:
+            story.append(allocation_pie)
+            story.append(Spacer(1, 6))
+
+        contrib_chart = _build_contribution_bar(positions_df)
+        if contrib_chart is not None:
+            story.append(contrib_chart)
+            story.append(Spacer(1, 12))
+    else:
+        story.append(Paragraph("Données indisponibles pour les graphiques de composition.", styles["Normal"]))
+        story.append(Spacer(1, 12))
+
+    story.append(Paragraph("Positions", styles["Heading2"]))
+    if isinstance(positions_df, pd.DataFrame):
+        _add_table_to_story(story, positions_df)
+    else:
+        story.append(Paragraph("Données indisponibles.", styles["Normal"]))
+
+    doc.build(story)
+    buffer.seek(0)
+    return buffer.read()
+
+
+def _years_between(d0: pd.Timestamp, d1: pd.Timestamp) -> float:
+    return max(0.0, (d1 - d0).days / 365.25)
+
+
+report_data = {
+    "as_of": fmt_date(TODAY),
+    "mode": st.session_state.get("MODE_ANALYSE", "compare"),
+}
+
+mode_report = report_data["mode"]
+df_client_lines = build_positions_dataframe("A_lines")
+df_valority_lines = build_positions_dataframe("B_lines")
+
+report_data["df_client_lines"] = df_client_lines
+report_data["df_valority_lines"] = df_valority_lines
+report_data["dfA_val"] = dfA.reset_index().rename(columns={"index": "Date"}) if not dfA.empty else pd.DataFrame()
+report_data["dfB_val"] = dfB.reset_index().rename(columns={"index": "Date"}) if not dfB.empty else pd.DataFrame()
+report_data["client_summary"] = {
+    "val": valA,
+    "net": netA,
+    "brut": brutA,
+    "perf_tot_pct": perf_tot_client or 0.0,
+    "irr_pct": xirrA or 0.0,
+}
+report_data["valority_summary"] = {
+    "val": valB,
+    "net": netB,
+    "brut": brutB,
+    "perf_tot_pct": perf_tot_valority or 0.0,
+    "irr_pct": xirrB or 0.0,
+}
+report_data["comparison"] = {
+    "delta_val": (valB - valA) if (valA is not None and valB is not None) else 0.0,
+    "delta_perf_pct": (perf_tot_valority - perf_tot_client)
+    if (perf_tot_client is not None and perf_tot_valority is not None)
+    else 0.0,
+}
+
+df_map: Dict[str, pd.DataFrame] = {}
+if mode_report in ("compare", "client") and not dfA.empty:
+    df_map["Client"] = dfA
+if mode_report in ("compare", "valority") and not dfB.empty:
+    df_map["Valority"] = dfB
+report_data["df_map"] = df_map
+
+if mode_report == "compare":
+    positions_df = df_valority_lines if not df_valority_lines.empty else df_client_lines
+    lines = st.session_state.get("B_lines", []) or st.session_state.get("A_lines", [])
+else:
+    if mode_report == "valority":
+        positions_df = df_valority_lines
+        lines = st.session_state.get("B_lines", [])
+        start_min = startB_min
+        brut = brutB
+        net = netB
+        val = valB
+    else:
+        positions_df = df_client_lines
+        lines = st.session_state.get("A_lines", [])
+        start_min = startA_min
+        brut = brutA
+        net = netA
+        val = valA
+
+    years = _years_between(start_min, TODAY) if isinstance(start_min, pd.Timestamp) else 0.0
+    fees_paid = max(0.0, brut - net) if brut is not None and net is not None else 0.0
+    value_created = (val - net) if val is not None and net is not None else 0.0
+    value_per_year = (value_created / years) if years > 0 else 0.0
+    report_data["fees_analysis"] = {
+        "fees_paid": fees_paid,
+        "value_created": value_created,
+        "value_per_year": value_per_year,
+    }
+
+report_data["positions_df"] = positions_df
+lines_with_values: List[Dict[str, Any]] = []
+if isinstance(positions_df, pd.DataFrame) and not positions_df.empty:
+    for ln in lines:
+        isin = ln.get("isin", "")
+        name = ln.get("name", "")
+        match = positions_df[
+            (positions_df["Nom"] == name) & (positions_df["ISIN / Code"] == isin)
+        ]
+        val = float(match["Valeur actuelle €"].iloc[0]) if not match.empty else 0.0
+        lines_with_values.append({"isin": isin, "value": val})
+report_data["lines"] = lines_with_values
+
+st.session_state["REPORT_DATA"] = report_data
+
+if report_data is not None:
+    html_report = build_html_report(report_data)
+    st.download_button(
+        "📄 Télécharger le rapport complet (HTML)",
+        data=html_report.encode("utf-8"),
+        file_name="rapport_portefeuille_valority.html",
+        mime="text/html",
+    )
+    pdf_bytes = generate_pdf_report(report_data)
+    st.download_button(
+        "📄 Télécharger le rapport (PDF)",
+        data=pdf_bytes,
+        file_name="rapport_portefeuille.pdf",
+        mime="application/pdf",
+    )
 
 # ------------------------------------------------------------
 # Bloc final : Comparaison OU "Frais & valeur créée"
 # ------------------------------------------------------------
 mode = st.session_state.get("MODE_ANALYSE", "compare")
-
-def _years_between(d0: pd.Timestamp, d1: pd.Timestamp) -> float:
-    return max(0.0, (d1 - d0).days / 365.25)
 
 # ============================
 # CAS 1 — MODE COMPARAISON
@@ -1982,4 +2391,3 @@ with st.expander("🔒 Analyse interne — Corrélation, volatilité et profil d
             chartB = _corr_heatmap_chart(corrB, "Corrélation des lignes — Portefeuille Valority")
             if chartB is not None:
                 st.altair_chart(chartB, use_container_width=True)
-            

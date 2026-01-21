@@ -16,3 +16,4 @@ beautifulsoup4
 matplotlib>=3.9
 weasyprint>=62.0
 reportlab>=4.0
+Pillow>=10.0

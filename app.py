@@ -1,14 +1,20 @@
-from __future__ import annotations
-
-import json
+ (cd "$(git rev-parse --show-toplevel)" && git apply --3way <<'EOF' 
+diff --git a/app.py b/app.py
+index a5772824f245811d5a6952335deefbc439d49029..0828b8c5080b7940b8edaaee6f5290034c159c9b 100644
+--- a/app.py
+ b/app.py
+@@ -1,132 1,189 @@
+ from __future__ import annotations
+ 
+ import json
 import sys
 import textwrap
 import importlib.util
 import itertools
-from datetime import date
+ from datetime import date
 from io import BytesIO
-from typing import Any, Dict, List, Optional, Tuple
-
+ from typing import Any, Dict, List, Optional, Tuple
+ 
 if importlib.util.find_spec("matplotlib") is not None:
     import matplotlib.pyplot as plt
     MATPLOTLIB_AVAILABLE = True
@@ -17,11 +23,11 @@ else:
     plt = None
     MATPLOTLIB_AVAILABLE = False
     MATPLOTLIB_ERROR = "matplotlib non installé"
-import numpy as np
-import pandas as pd
-import requests
-import streamlit as st
-import altair as alt
+ import numpy as np
+ import pandas as pd
+ import requests
+ import streamlit as st
+ import altair as alt
 if importlib.util.find_spec("reportlab") is not None:
     from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image, Table, TableStyle, PageBreak
     from reportlab.lib.pagesizes import A4
@@ -40,59 +46,61 @@ else:
     canvas = None
     REPORTLAB_AVAILABLE = False
     REPORTLAB_ERROR = "reportlab non installé"
-
-# ------------------------------------------------------------
-# Constantes & univers de fonds recommandés
-# ------------------------------------------------------------
-TODAY = pd.Timestamp.today().normalize()
-APP_TITLE = "Comparateur de portefeuilles"
+ 
+ # ------------------------------------------------------------
+ # Constantes & univers de fonds recommandés
+ # ------------------------------------------------------------
+ TODAY = pd.Timestamp.today().normalize()
+ APP_TITLE = "Comparateur de portefeuilles"
 ANNUAL_FEE_EURO_PCT = 0.9
 ANNUAL_FEE_UC_PCT = 1.2
+ 
+ RECO_FUNDS_CORE = [
+     ("R-co Valor C EUR", "FR0011253624"),
+     ("Vivalor International", "FR0014001LS1"),
+     ("CARMIGNAC Investissement A EUR", "FR0010148981"),
+     ("FIDELITY FUNDS - WORLD FUND", "LU0069449576"),
+     ("CLARTAN VALEURS", "LU1100076550"),
+     ("CARMIGNAC PATRIMOINE", "FR0010135103"),
+ ]
+ 
+ RECO_FUNDS_DEF = [
+     ("Fonds en euros (EUROFUND)", "EUROFUND"),
+     ("SYCOYIELD 2030 RC", "FR001400MCQ6"),
+     ("R-Co Target 2029 HY", "FR0014002XJ3"),
+     ("Euro Bond 1-3 Years", "LU0321462953"),
+ ]
+ 
+FUND_NAME_MAP = {isin: name for name, isin in RECO_FUNDS_CORE  RECO_FUNDS_DEF}
 
-RECO_FUNDS_CORE = [
-    ("R-co Valor C EUR", "FR0011253624"),
-    ("Vivalor International", "FR0014001LS1"),
-    ("CARMIGNAC Investissement A EUR", "FR0010148981"),
-    ("FIDELITY FUNDS - WORLD FUND", "LU0069449576"),
-    ("CLARTAN VALEURS", "LU1100076550"),
-    ("CARMIGNAC PATRIMOINE", "FR0010135103"),
-]
+ # Libellés FR -> codes internes pour l'affectation des versements
+ ALLOC_LABELS = {
+     "Répartition égale": "equal",
+     "Personnalisé": "custom",
+     "Tout sur une ligne": "single",
+ }
+ 
+ 
+ # ------------------------------------------------------------
+ # Utils format
+ # ------------------------------------------------------------
 
-RECO_FUNDS_DEF = [
-    ("Fonds en euros (EUROFUND)", "EUROFUND"),
-    ("SYCOYIELD 2030 RC", "FR001400MCQ6"),
-    ("R-Co Target 2029 HY", "FR0014002XJ3"),
-    ("Euro Bond 1-3 Years", "LU0321462953"),
-]
-
-# Libellés FR -> codes internes pour l'affectation des versements
-ALLOC_LABELS = {
-    "Répartition égale": "equal",
-    "Personnalisé": "custom",
-    "Tout sur une ligne": "single",
-}
-
-
-# ------------------------------------------------------------
-# Utils format
-# ------------------------------------------------------------
-
-def to_eur(x: Any) -> str:
-    try:
-        v = float(x)
-    except Exception:
-        return "—"
-    s = f"{v:,.2f}".replace(",", "X").replace(".", ",").replace("X", " ")
-    return s + " €"
-
-
-def fmt_date(x: Any) -> str:
-    try:
-        return pd.Timestamp(x).strftime("%d/%m/%Y")
-    except Exception:
-        return "—"
-
-
+ def to_eur(x: Any) -> str:
+     try:
+         v = float(x)
+     except Exception:
+         return "—"
+     s = f"{v:,.2f}".replace(",", "X").replace(".", ",").replace("X", " ")
+     return s  " €"
+ 
+ 
+ def fmt_date(x: Any) -> str:
+     try:
+         return pd.Timestamp(x).strftime("%d/%m/%Y")
+     except Exception:
+         return "—"
+ 
+ 
 def fmt_eur_fr(x: Any) -> str:
     try:
         v = float(x)
@@ -111,129 +119,107 @@ def fmt_pct_fr(x: Any) -> str:
     return f"{s} %"
 
 
-# ------------------------------------------------------------
-# XIRR
-# ------------------------------------------------------------
+ # ------------------------------------------------------------
+ # XIRR
+ # ------------------------------------------------------------
 
-def _npv(rate: float, cfs: List[Tuple[pd.Timestamp, float]]) -> float:
-    t0 = cfs[0][0]
-    return sum(cf / ((1 + rate) ** ((t - t0).days / 365.25)) for t, cf in cfs)
+ def _npv(rate: float, cfs: List[Tuple[pd.Timestamp, float]]) -> float:
+     t0 = cfs[0][0]
+     return sum(cf / ((1  rate) ** ((t - t0).days / 365.25)) for t, cf in cfs)
+ 
+ 
+ def xirr(cash_flows: List[Tuple[pd.Timestamp, float]], guess: float = 0.1) -> Optional[float]:
+     if not cash_flows:
+         return None
+     cfs = sorted(cash_flows, key=lambda x: x[0])
+     try:
+         r = guess
+         for _ in range(100):
+             f = _npv(r, cfs)
+             h = 1e-6
+             f1 = _npv(r  h, cfs)
+             d = (f1 - f) / h
+             if abs(d) < 1e-12:
+                 break
+             r2 = r - f / d
+             if abs(r2 - r) < 1e-9:
+                 r = r2
+                 break
+             r = r2
+         return r
+     except Exception:
+         return None
+ 
+ 
+ # ------------------------------------------------------------
+ # API EODHD
+ # ------------------------------------------------------------
 
-
-def xirr(cash_flows: List[Tuple[pd.Timestamp, float]], guess: float = 0.1) -> Optional[float]:
-    if not cash_flows:
-        return None
-    cfs = sorted(cash_flows, key=lambda x: x[0])
-    try:
-        r = guess
-        for _ in range(100):
-            f = _npv(r, cfs)
-            h = 1e-6
-            f1 = _npv(r + h, cfs)
-            d = (f1 - f) / h
-            if abs(d) < 1e-12:
-                break
-            r2 = r - f / d
-            if abs(r2 - r) < 1e-9:
-                r = r2
-                break
-            r = r2
-        return r
-    except Exception:
-        return None
-
-
-# ------------------------------------------------------------
-# API EODHD
-# ------------------------------------------------------------
-
-def _get_api_key() -> str:
-    return st.secrets.get("EODHD_API_KEY", "")
-
-
-@st.cache_data(show_spinner=False, ttl=3600)
-def eodhd_get(path: str, params: Dict[str, Any] | None = None) -> Any:
-    base = "https://eodhd.com/api"
-    token = _get_api_key()
-    p = {"api_token": token, "fmt": "json"}
-    if params:
-        p.update(params)
+ def _get_api_key() -> str:
+     return st.secrets.get("EODHD_API_KEY", "")
+ 
+ 
+ @st.cache_data(show_spinner=False, ttl=3600)
+ def eodhd_get(path: str, params: Dict[str, Any] | None = None) -> Any:
+     base = "https://eodhd.com/api"
+     token = _get_api_key()
+     p = {"api_token": token, "fmt": "json"}
+     if params:
+         p.update(params)
+-    r = requests.get(f"{base}{path}", params=p, timeout=20)
     with st.spinner("Chargement EODHD..."):
         r = requests.get(f"{base}{path}", params=p, timeout=20)
-    r.raise_for_status()
-    try:
-        return r.json()
-    except Exception:
-        return None
-
-
-@st.cache_data(show_spinner=False, ttl=3600)
-def eodhd_search(q: str) -> List[Dict[str, Any]]:
-    try:
-        js = eodhd_get(f"/search/{q}")
-        if isinstance(js, list):
-            return js
-    except Exception:
-        pass
-    return []
-
-
-@st.cache_data(show_spinner=False, ttl=3600)
-def eodhd_prices_daily(symbol: str) -> pd.DataFrame:
-    try:
-        js = eodhd_get(f"/eod/{symbol}", params={"period": "d"})
-        if not isinstance(js, list) or len(js) == 0:
-            return pd.DataFrame()
-        df = pd.DataFrame(js)
-        df["date"] = pd.to_datetime(df["date"])
-        df.set_index("date", inplace=True)
-        if "adjusted_close" in df.columns and pd.notnull(df["adjusted_close"]).any():
-            df["Close"] = df["adjusted_close"].astype(float)
-        elif "close" in df.columns:
-            df["Close"] = df["close"].astype(float)
-        else:
-            return pd.DataFrame()
-        return df[["Close"]].sort_index()
-    except Exception:
-        return pd.DataFrame()
-
-
-def _symbol_candidates(isin_or_name: str) -> List[str]:
-    val = str(isin_or_name).strip()
-    if not val:
-        return []
-    if val.upper() == "EUROFUND":
-        return ["EUROFUND"]
-    candidates = [f"{val}.EUFUND", f"{val}.FUND", val]
-    try:
-        res = eodhd_search(val)
-        for it in res:
-            code = it.get("Code")
-            exch = it.get("Exchange")
-            if code and exch:
-                candidates.append(f"{code}.{exch}")
-    except Exception:
-        pass
-    seen = set()
-    uniq = []
-    for c in candidates:
-        if c not in seen:
-            seen.add(c)
-            uniq.append(c)
-    return uniq
-
-
-def _get_close_on(df: pd.DataFrame, d: pd.Timestamp) -> float:
-    if df.empty:
-        return np.nan
-    if d in df.index:
-        return float(df.loc[d, "Close"])
-    after = df.loc[df.index >= d]
-    if not after.empty:
-        return float(after.iloc[0]["Close"])
-    return float(df.iloc[-1]["Close"])
-
-
+     r.raise_for_status()
+     try:
+         return r.json()
+     except Exception:
+         return None
+ 
+ 
+ @st.cache_data(show_spinner=False, ttl=3600)
+ def eodhd_search(q: str) -> List[Dict[str, Any]]:
+     try:
+         js = eodhd_get(f"/search/{q}")
+         if isinstance(js, list):
+             return js
+     except Exception:
+         pass
+     return []
+ 
+ 
+ @st.cache_data(show_spinner=False, ttl=3600)
+ def eodhd_prices_daily(symbol: str) -> pd.DataFrame:
+     try:
+         js = eodhd_get(f"/eod/{symbol}", params={"period": "d"})
+         if not isinstance(js, list) or len(js) == 0:
+             return pd.DataFrame()
+         df = pd.DataFrame(js)
+@@ -157,168 214,186 @@ def _symbol_candidates(isin_or_name: str) -> List[str]:
+             exch = it.get("Exchange")
+             if code and exch:
+                 candidates.append(f"{code}.{exch}")
+     except Exception:
+         pass
+     seen = set()
+     uniq = []
+     for c in candidates:
+         if c not in seen:
+             seen.add(c)
+             uniq.append(c)
+     return uniq
+ 
+ 
+ def _get_close_on(df: pd.DataFrame, d: pd.Timestamp) -> float:
+     if df.empty:
+         return np.nan
+     if d in df.index:
+         return float(df.loc[d, "Close"])
+     after = df.loc[df.index >= d]
+     if not after.empty:
+         return float(after.iloc[0]["Close"])
+     return float(df.iloc[-1]["Close"])
+ 
+ 
 def apply_annual_fee(df: pd.DataFrame, annual_fee_pct: float) -> pd.DataFrame:
     if df.empty or annual_fee_pct == 0:
         return df
@@ -246,573 +232,396 @@ def apply_annual_fee(df: pd.DataFrame, annual_fee_pct: float) -> pd.DataFrame:
     return df
 
 
-@st.cache_data(show_spinner=False, ttl=3600)
-def get_price_series(
-    isin_or_name: str, start: Optional[pd.Timestamp], euro_rate: float
-) -> Tuple[pd.DataFrame, str, str]:
-    """
-    EUROFUND : série synthétique capitalisée à euro_rate %/an
-    (cohérente avec Excel : compo sur jours calendaires)
-    """
-    debug = {"cands": []}
-    val = str(isin_or_name).strip()
-    if not val:
-        return pd.DataFrame(), "", json.dumps(debug)
-
-    # ✅ Fonds en euros — capitalisation annualisée (jours calendaires)
-    if val.upper() == "EUROFUND":
-        start_dt = (
-            pd.Timestamp(start).normalize()
-            if start is not None
-            else pd.Timestamp("2000-01-03")
-        )
-        start_dt = max(start_dt, pd.Timestamp("2000-01-03"))
-
-        idx = pd.bdate_range(start=start_dt, end=TODAY, freq="B")
-        if len(idx) == 0:
-            return pd.DataFrame(), "", "{}"
-
-        df = pd.DataFrame(index=idx, columns=["Close"], dtype=float)
-        df.iloc[0, 0] = 1.0
-
-        r = float(euro_rate) / 100.0
-
-        for i in range(1, len(df)):
-            prev_val = df.iloc[i - 1, 0]
-            delta_days = (df.index[i] - df.index[i - 1]).days  # ✅ jours calendaires
-            df.iloc[i, 0] = prev_val * ((1.0 + r) ** (delta_days / 365.0))
-
+ @st.cache_data(show_spinner=False, ttl=3600)
+ def get_price_series(
+     isin_or_name: str, start: Optional[pd.Timestamp], euro_rate: float
+ ) -> Tuple[pd.DataFrame, str, str]:
+     """
+     EUROFUND : série synthétique capitalisée à euro_rate %/an
+     (cohérente avec Excel : compo sur jours calendaires)
+     """
+     debug = {"cands": []}
+     val = str(isin_or_name).strip()
+     if not val:
+         return pd.DataFrame(), "", json.dumps(debug)
+ 
+     # ✅ Fonds en euros — capitalisation annualisée (jours calendaires)
+     if val.upper() == "EUROFUND":
+         start_dt = (
+             pd.Timestamp(start).normalize()
+             if start is not None
+             else pd.Timestamp("2000-01-03")
+         )
+         start_dt = max(start_dt, pd.Timestamp("2000-01-03"))
+ 
+         idx = pd.bdate_range(start=start_dt, end=TODAY, freq="B")
+         if len(idx) == 0:
+             return pd.DataFrame(), "", "{}"
+ 
+         df = pd.DataFrame(index=idx, columns=["Close"], dtype=float)
+         df.iloc[0, 0] = 1.0
+ 
+         r = float(euro_rate) / 100.0
+ 
+         for i in range(1, len(df)):
+             prev_val = df.iloc[i - 1, 0]
+             delta_days = (df.index[i] - df.index[i - 1]).days  # ✅ jours calendaires
+             df.iloc[i, 0] = prev_val * ((1.0  r) ** (delta_days / 365.0))
+ 
         df = apply_annual_fee(df, ANNUAL_FEE_EURO_PCT)
-        return df, "EUROFUND", "{}"
-
-    # ✅ Instruments EODHD — recherche candidates puis EOD daily
-    cands = _symbol_candidates(val)
-    debug["cands"] = cands
-
-    for sym in cands:
-        df = eodhd_prices_daily(sym)
-        if not df.empty:
-            if start is not None:
-                df = df.loc[df.index >= start]
+         return df, "EUROFUND", "{}"
+ 
+     # ✅ Instruments EODHD — recherche candidates puis EOD daily
+     cands = _symbol_candidates(val)
+     debug["cands"] = cands
+ 
+     for sym in cands:
+         df = eodhd_prices_daily(sym)
+         if not df.empty:
+             if start is not None:
+                 df = df.loc[df.index >= start]
             df = apply_annual_fee(df, ANNUAL_FEE_UC_PCT)
-            return df, sym, json.dumps(debug)
+             return df, sym, json.dumps(debug)
+ 
+     return pd.DataFrame(), "", json.dumps(debug)
+ 
+
+ @st.cache_data(show_spinner=False, ttl=3600)
+ def structured_series(
+     start: pd.Timestamp,
+     end: pd.Timestamp,
+     annual_rate_pct: float,
+     redemption_years: int,
+ ) -> pd.DataFrame:
+     """
+     Série synthétique autocall (simplifiée) :
+     - Prix d'achat = 1.0
+     - Plat jusqu'à la date de remboursement estimée
+     - Saut à 1  (rate * years) le jour de remboursement, puis figé
+     """
+     start_dt = pd.Timestamp(start).normalize()
+     end_dt = pd.Timestamp(end).normalize()
+     idx = pd.bdate_range(start=start_dt, end=end_dt, freq="B")
+     if len(idx) == 0:
+         return pd.DataFrame()
+ 
+     df = pd.DataFrame(index=idx, columns=["Close"], dtype=float)
+     df.iloc[0, 0] = 1.0
+ 
+     r = float(annual_rate_pct) / 100.0
+     yrs = int(redemption_years)
+ 
+     redemption_dt = start_dt  pd.DateOffset(years=yrs)
+ 
+     # série plate  saut à partir du 1er jour ouvré >= redemption_dt
+     redeemed = False
+     for i in range(1, len(df)):
+         d = df.index[i]
+         df.iloc[i, 0] = df.iloc[i - 1, 0]
+ 
+         if (not redeemed) and (d >= redemption_dt):
+             df.iloc[i, 0] = 1.0  r * yrs
+             df.iloc[i:, 0] = df.iloc[i, 0]
+             redeemed = True
+             break
+ 
+     # sécurité : propagation si besoin
+     for i in range(1, len(df)):
+         if pd.isna(df.iloc[i, 0]):
+             df.iloc[i, 0] = df.iloc[i - 1, 0]
+ 
+     return df
+ 
+ # ------------------------------------------------------------
+ # Alternatives si date < 1ère VL
+ # ------------------------------------------------------------
+
+ def suggest_alternative_funds(buy_date: pd.Timestamp, euro_rate: float) -> List[Tuple[str, str, pd.Timestamp]]:
+     """
+     Propose des fonds recommandés (core  défensifs) dont la première VL
+     est antérieure ou égale à la date d'achat donnée.
+     Retourne (nom, isin, date_inception).
+     """
+     alternatives: List[Tuple[str, str, pd.Timestamp]] = []
+     universe = RECO_FUNDS_CORE  RECO_FUNDS_DEF
+ 
+     for name, isin in universe:
+         df, _, _ = get_price_series(isin, None, euro_rate)
+         if df.empty:
+             continue
+         inception = df.index.min()
+         if inception <= buy_date:
+             alternatives.append((name, isin, inception))
+ 
+     return alternatives
+
+
+ def correlation_matrix_from_lines(
+     lines: List[Dict[str, Any]],
+     euro_rate: float,
+     years: int = 3,
+     min_points: int = 30,
+ ) -> pd.DataFrame:
+     """
+     Construit une matrice de corrélation des rendements quotidiens
+     pour les lignes d'un portefeuille donné.
+ 
+     - On récupère les VL quotidiennes via get_price_series
+     - On restreint à 'years' années de données (fenêtre glissante)
+     - On calcule les rendements journaliers (pct_change)
+     - On renvoie corrélation de ces rendements.
+     """
+     series_map: Dict[str, pd.Series] = {}
+     cutoff = TODAY - pd.Timedelta(days=365 * years)
+ 
+     for ln in lines:
+         label = ln.get("name") or ln.get("isin") or "Ligne"
+         key = f"{label} ({ln.get('isin','')})"
+ 
+         df, _, _ = get_price_series(ln.get("isin") or ln.get("name"), None, euro_rate)
+         if df.empty:
+             continue
+@@ -326,120 401,123 @@ def correlation_matrix_from_lines(
+         s = df["Close"].astype(float)
+         s = s[s.index >= cutoff]
+         if s.size < min_points:
+             continue
+ 
+         series_map[key] = s
+ 
+     if len(series_map) < 2:
+         return pd.DataFrame()
+ 
+     df_prices = pd.DataFrame(series_map).dropna(how="all")
+     if df_prices.shape[0] < min_points:
+         return pd.DataFrame()
+ 
+     returns = df_prices.pct_change().dropna(how="any")
+     if returns.empty:
+         return pd.DataFrame()
+ 
+     corr = returns.corr()
+     return corr
+ 
+ 
+ # ------------------------------------------------------------
+ # Calendrier versements & poids
+ # ------------------------------------------------------------
+
+ def _month_schedule(d0: pd.Timestamp, d1: pd.Timestamp) -> List[pd.Timestamp]:
+     if d0 > d1:
+         return []
+     out = []
+     cur = pd.Timestamp(d0.year, d0.month, 1)
+     stop = pd.Timestamp(d1.year, d1.month, 1)
+     while cur <= stop:
+         bdays = pd.bdate_range(start=cur, end=cur  pd.offsets.MonthEnd(0))
+         if len(bdays) > 0:
+             out.append(bdays[0])
+         cur = cur  pd.offsets.MonthBegin(1)
+     return out
+ 
+ 
+ def _weights_for(
+     lines: List[Dict[str, Any]],
+     alloc_mode: str,
+     custom_weights: Dict[int, float],
+     single_target: Optional[int],
+ ) -> Dict[int, float]:
+     keys = [id(ln) for ln in lines]
+     if len(keys) == 0:
+         return {}
+     if alloc_mode == "equal":
+         w = 1.0 / len(keys)
+         return {k: w for k in keys}
+     if alloc_mode == "custom":
+         tot = sum(max(0.0, float(custom_weights.get(id(ln), 0.0))) for ln in lines)
+         if tot <= 0:
+             w = 1.0 / len(keys)
+             return {k: w for k in keys}
+         return {id(ln): max(0.0, float(custom_weights.get(id(ln), 0.0))) / tot for ln in lines}
+     if alloc_mode == "single":
+         target = single_target
+         return {id(ln): (1.0 if id(ln) == target else 0.0) for ln in lines}
+     w = 1.0 / len(keys)
+     return {k: w for k in keys}
+ 
+ 
+ # ------------------------------------------------------------
+ # Calcul par ligne (avec frais)
+ # ------------------------------------------------------------
+
+ def compute_line_metrics(
+     line: Dict[str, Any], fee_pct: float, euro_rate: float
+ ) -> Tuple[float, float, float]:
+     amt_brut = float(line.get("amount_gross", 0.0))
+     net_amt = amt_brut * (1.0 - fee_pct / 100.0)
+     buy_ts = pd.Timestamp(line.get("buy_date"))
+     px_manual = line.get("buy_px", None)
+ 
+     dfp, _, _ = get_price_series(line.get("isin") or line.get("name"), buy_ts, euro_rate)
+     if str(line.get("sym_used", "")).upper() == "EUROFUND" or str(line.get("isin", "")).upper() == "EUROFUND":
+         px = _get_close_on(dfp, buy_ts)
+     else:
+         if px_manual not in (None, "", 0, "0"):
+             try:
+                 px = float(px_manual)
+             except Exception:
+                 px = _get_close_on(dfp, buy_ts)
+         else:
+             px = _get_close_on(dfp, buy_ts)
+ 
+     qty = (net_amt / px) if px and px > 0 else 0.0
+     return float(net_amt), float(px), float(qty)
+ 
+ 
+ # ------------------------------------------------------------
+ # Simulation d'un portefeuille (avec contrôle 1ère VL)
+ #  distinction poids mensuels / ponctuels
+ # ------------------------------------------------------------
+
+ def simulate_portfolio(
+     lines: List[Dict[str, Any]],
+     monthly_amt_gross: float,
+     one_amt_gross: float,
+     one_date: date,
+     alloc_mode: str,
+     custom_weights_monthly: Optional[Dict[int, float]],
+     custom_weights_oneoff: Optional[Dict[int, float]],
+     single_target: Optional[int],
+     euro_rate: float,
+     fee_pct: float,
+     portfolio_label: str = "",
+ ) -> Tuple[pd.DataFrame, float, float, float, Optional[float], pd.Timestamp, pd.Timestamp]:
+     if not lines:
+         return pd.DataFrame(), 0.0, 0.0, 0.0, None, TODAY, TODAY
+ 
+     price_map: Dict[int, pd.Series] = {}
+     eff_buy_date: Dict[int, pd.Timestamp] = {}
+     buy_price_used: Dict[int, float] = {}
+ 
+     invalid_found = False
+     date_warnings = st.session_state.setdefault("DATE_WARNINGS", [])
+ 
+     for ln in lines:
+         key_id = id(ln)
+@@ -597,50 675,51 @@ def simulate_portfolio(
+             for ln in lines:
+                 key_id = id(ln)
+                 w = weights_monthly.get(key_id, 0.0)
+                 if w <= 0 or key_id not in prices.columns:
+                     continue
+                 px = float(prices.loc[dt, key_id])
+                 if px > 0:
+                     qty_events.loc[dt, key_id] = (net_m * w) / px
+             total_brut = float(monthly_amt_gross)
+             total_net = float(net_m)
+             cash_flows.append((dt, -float(monthly_amt_gross)))
+ 
+     qty_cum = qty_events.cumsum()
+     values = (qty_cum * prices).sum(axis=1)
+     df_val = pd.DataFrame({"Valeur": values})
+     final_val = float(df_val["Valeur"].iloc[-1]) if not df_val.empty else 0.0
+ 
+     cash_flows.append((TODAY, final_val))
+     irr = xirr(cash_flows)
+ 
+     return df_val, total_brut, total_net, final_val, (irr * 100.0 if irr is not None else None), start_min, start_full
+ 
+ # ------------------------------------------------------------
+ # Cartes lignes (édition / suppression)
+ # ------------------------------------------------------------
+
+ def _line_card(line: Dict[str, Any], idx: int, port_key: str):
+     state_key = f"edit_mode_{port_key}_{idx}"
+     if state_key not in st.session_state:
+         st.session_state[state_key] = False
+ 
+     fee_pct = st.session_state.get("FEE_A", 0.0) if port_key == "A_lines" else st.session_state.get("FEE_B", 0.0)
+     euro_rate = st.session_state.get("EURO_RATE_PREVIEW", 2.0)
+     net_amt, buy_px, qty_disp = compute_line_metrics(line, fee_pct, euro_rate)
+ 
+     with st.container(border=True):
+         cols = st.columns([3, 2, 2, 2, 1])
+         with cols[0]:
+             st.markdown(f"**{line.get('name','—')}**")
+             st.caption(f"ISIN / Code : `{line.get('isin','—')}`")
+             st.caption(f"Symbole EODHD : `{line.get('sym_used','—')}`")
+             if line.get("invalid_date"):
+                 st.markdown(
+                     f"⚠️ Date d'achat antérieure à la 1ère VL ({fmt_date(line.get('inception_date'))}).",
+                 )
+         with cols[1]:
+             st.markdown(f"Investi (brut)\n\n**{to_eur(line.get('amount_gross', 0.0))}**")
+             st.caption(f"Net après frais {fee_pct:.1f}% : **{to_eur(net_amt)}**")
+             st.caption(f"Date d'achat : {fmt_date(line.get('buy_date'))}")
+         with cols[2]:
+             st.markdown(f"VL d'achat\n\n**{to_eur(buy_px)}**")
+@@ -676,90 755,143 @@ def _line_card(line: Dict[str, Any], idx: int, port_key: str):
+                     st.caption(" ")
+                     submitted = st.form_submit_button("💾 Enregistrer")
+                 if submitted:
+                     try:
+                         amt_gross = float(str(new_amount).replace(" ", "").replace(",", "."))
+                         assert amt_gross > 0
+                     except Exception:
+                         st.warning("Montant brut invalide.")
+                         st.stop()
+                     buy_ts = pd.Timestamp(new_date)
+                     line["amount_gross"] = float(amt_gross)
+                     line["buy_date"] = buy_ts
+                     if new_px.strip():
+                         try:
+                             line["buy_px"] = float(str(new_px).replace(",", "."))
+                         except Exception:
+                             line["buy_px"] = ""
+                     else:
+                         line["buy_px"] = ""
+                     line.pop("invalid_date", None)
+                     line.pop("inception_date", None)
+                     st.session_state[state_key] = False
+                     st.success("Ligne mise à jour.")
+                     st.experimental_rerun()
+ 
+
+ def portfolio_summary_dataframe(port_key: str) -> pd.DataFrame:
+     """
+     Construit un DataFrame synthétique par ligne :
+     Nom, ISIN, Net investi, Valeur actuelle, Perf € et Perf %.
+     """
+     fee_pct = st.session_state.get("FEE_A", 0.0) if port_key == "A_lines" else st.session_state.get("FEE_B", 0.0)
+     euro_rate = st.session_state.get("EURO_RATE_PREVIEW", 2.0)
+     lines = st.session_state.get(port_key, [])
+ 
+     rows: List[Dict[str, Any]] = []
+ 
+     for ln in lines:
+         net_amt, buy_px, qty = compute_line_metrics(ln, fee_pct, euro_rate)
+ 
+         dfl, _, _ = get_price_series(ln.get("isin") or ln.get("name"), None, euro_rate)
+         if not dfl.empty:
+             last_px = float(dfl["Close"].iloc[-1])
+         else:
+             last_px = np.nan
+ 
+         val_now = qty * last_px if last_px == last_px else 0.0
+         perf_abs = val_now - net_amt
+         perf_pct = (val_now / net_amt - 1.0) * 100.0 if net_amt > 0 else np.nan
+ 
+         rows.append(
+             {
+                 "Nom": ln.get("name", ""),
+                 "ISIN / Code": ln.get("isin", ""),
+                 "Net investi €": net_amt,
+                 "Valeur actuelle €": val_now,
+                 "Perf €": perf_abs,
+                 "Perf %": perf_pct,
+             }
+         )
+ 
+     df = pd.DataFrame(rows)
+     return df
 
-    return pd.DataFrame(), "", json.dumps(debug)
-
-
-@st.cache_data(show_spinner=False, ttl=3600)
-def structured_series(
-    start: pd.Timestamp,
-    end: pd.Timestamp,
-    annual_rate_pct: float,
-    redemption_years: int,
-) -> pd.DataFrame:
-    """
-    Série synthétique autocall (simplifiée) :
-    - Prix d'achat = 1.0
-    - Plat jusqu'à la date de remboursement estimée
-    - Saut à 1 + (rate * years) le jour de remboursement, puis figé
-    """
-    start_dt = pd.Timestamp(start).normalize()
-    end_dt = pd.Timestamp(end).normalize()
-    idx = pd.bdate_range(start=start_dt, end=end_dt, freq="B")
-    if len(idx) == 0:
-        return pd.DataFrame()
-
-    df = pd.DataFrame(index=idx, columns=["Close"], dtype=float)
-    df.iloc[0, 0] = 1.0
-
-    r = float(annual_rate_pct) / 100.0
-    yrs = int(redemption_years)
-
-    redemption_dt = start_dt + pd.DateOffset(years=yrs)
-
-    # série plate + saut à partir du 1er jour ouvré >= redemption_dt
-    redeemed = False
-    for i in range(1, len(df)):
-        d = df.index[i]
-        df.iloc[i, 0] = df.iloc[i - 1, 0]
-
-        if (not redeemed) and (d >= redemption_dt):
-            df.iloc[i, 0] = 1.0 + r * yrs
-            df.iloc[i:, 0] = df.iloc[i, 0]
-            redeemed = True
-            break
-
-    # sécurité : propagation si besoin
-    for i in range(1, len(df)):
-        if pd.isna(df.iloc[i, 0]):
-            df.iloc[i, 0] = df.iloc[i - 1, 0]
-
-    return df
-
-# ------------------------------------------------------------
-# Alternatives si date < 1ère VL
-# ------------------------------------------------------------
-
-def suggest_alternative_funds(buy_date: pd.Timestamp, euro_rate: float) -> List[Tuple[str, str, pd.Timestamp]]:
-    """
-    Propose des fonds recommandés (core + défensifs) dont la première VL
-    est antérieure ou égale à la date d'achat donnée.
-    Retourne (nom, isin, date_inception).
-    """
-    alternatives: List[Tuple[str, str, pd.Timestamp]] = []
-    universe = RECO_FUNDS_CORE + RECO_FUNDS_DEF
-
-    for name, isin in universe:
-        df, _, _ = get_price_series(isin, None, euro_rate)
-        if df.empty:
-            continue
-        inception = df.index.min()
-        if inception <= buy_date:
-            alternatives.append((name, isin, inception))
-
-    return alternatives
-
-
-def correlation_matrix_from_lines(
-    lines: List[Dict[str, Any]],
-    euro_rate: float,
-    years: int = 3,
-    min_points: int = 30,
-) -> pd.DataFrame:
-    """
-    Construit une matrice de corrélation des rendements quotidiens
-    pour les lignes d'un portefeuille donné.
-
-    - On récupère les VL quotidiennes via get_price_series
-    - On restreint à 'years' années de données (fenêtre glissante)
-    - On calcule les rendements journaliers (pct_change)
-    - On renvoie corrélation de ces rendements.
-    """
-    series_map: Dict[str, pd.Series] = {}
-    cutoff = TODAY - pd.Timedelta(days=365 * years)
-
-    for ln in lines:
-        label = ln.get("name") or ln.get("isin") or "Ligne"
-        key = f"{label} ({ln.get('isin','')})"
-
-        df, _, _ = get_price_series(ln.get("isin") or ln.get("name"), None, euro_rate)
-        if df.empty:
-            continue
-
-        s = df["Close"].astype(float)
-        s = s[s.index >= cutoff]
-        if s.size < min_points:
-            continue
-
-        series_map[key] = s
-
-    if len(series_map) < 2:
-        return pd.DataFrame()
-
-    df_prices = pd.DataFrame(series_map).dropna(how="all")
-    if df_prices.shape[0] < min_points:
-        return pd.DataFrame()
-
-    returns = df_prices.pct_change().dropna(how="any")
-    if returns.empty:
-        return pd.DataFrame()
-
-    corr = returns.corr()
-    return corr
-
-
-# ------------------------------------------------------------
-# Calendrier versements & poids
-# ------------------------------------------------------------
-
-def _month_schedule(d0: pd.Timestamp, d1: pd.Timestamp) -> List[pd.Timestamp]:
-    if d0 > d1:
-        return []
-    out = []
-    cur = pd.Timestamp(d0.year, d0.month, 1)
-    stop = pd.Timestamp(d1.year, d1.month, 1)
-    while cur <= stop:
-        bdays = pd.bdate_range(start=cur, end=cur + pd.offsets.MonthEnd(0))
-        if len(bdays) > 0:
-            out.append(bdays[0])
-        cur = cur + pd.offsets.MonthBegin(1)
-    return out
-
-
-def _weights_for(
-    lines: List[Dict[str, Any]],
-    alloc_mode: str,
-    custom_weights: Dict[int, float],
-    single_target: Optional[int],
-) -> Dict[int, float]:
-    keys = [id(ln) for ln in lines]
-    if len(keys) == 0:
-        return {}
-    if alloc_mode == "equal":
-        w = 1.0 / len(keys)
-        return {k: w for k in keys}
-    if alloc_mode == "custom":
-        tot = sum(max(0.0, float(custom_weights.get(id(ln), 0.0))) for ln in lines)
-        if tot <= 0:
-            w = 1.0 / len(keys)
-            return {k: w for k in keys}
-        return {id(ln): max(0.0, float(custom_weights.get(id(ln), 0.0))) / tot for ln in lines}
-    if alloc_mode == "single":
-        target = single_target
-        return {id(ln): (1.0 if id(ln) == target else 0.0) for ln in lines}
-    w = 1.0 / len(keys)
-    return {k: w for k in keys}
-
-
-# ------------------------------------------------------------
-# Calcul par ligne (avec frais)
-# ------------------------------------------------------------
-
-def compute_line_metrics(
-    line: Dict[str, Any], fee_pct: float, euro_rate: float
-) -> Tuple[float, float, float]:
-    amt_brut = float(line.get("amount_gross", 0.0))
-    net_amt = amt_brut * (1.0 - fee_pct / 100.0)
-    buy_ts = pd.Timestamp(line.get("buy_date"))
-    px_manual = line.get("buy_px", None)
-
-    dfp, _, _ = get_price_series(line.get("isin") or line.get("name"), buy_ts, euro_rate)
-    if str(line.get("sym_used", "")).upper() == "EUROFUND" or str(line.get("isin", "")).upper() == "EUROFUND":
-        px = _get_close_on(dfp, buy_ts)
-    else:
-        if px_manual not in (None, "", 0, "0"):
-            try:
-                px = float(px_manual)
-            except Exception:
-                px = _get_close_on(dfp, buy_ts)
-        else:
-            px = _get_close_on(dfp, buy_ts)
-
-    qty = (net_amt / px) if px and px > 0 else 0.0
-    return float(net_amt), float(px), float(qty)
-
-
-# ------------------------------------------------------------
-# Simulation d'un portefeuille (avec contrôle 1ère VL)
-# + distinction poids mensuels / ponctuels
-# ------------------------------------------------------------
-
-def simulate_portfolio(
-    lines: List[Dict[str, Any]],
-    monthly_amt_gross: float,
-    one_amt_gross: float,
-    one_date: date,
-    alloc_mode: str,
-    custom_weights_monthly: Optional[Dict[int, float]],
-    custom_weights_oneoff: Optional[Dict[int, float]],
-    single_target: Optional[int],
-    euro_rate: float,
-    fee_pct: float,
-    portfolio_label: str = "",
-) -> Tuple[pd.DataFrame, float, float, float, Optional[float], pd.Timestamp, pd.Timestamp]:
-    if not lines:
-        return pd.DataFrame(), 0.0, 0.0, 0.0, None, TODAY, TODAY
-
-    price_map: Dict[int, pd.Series] = {}
-    eff_buy_date: Dict[int, pd.Timestamp] = {}
-    buy_price_used: Dict[int, float] = {}
-
-    invalid_found = False
-    date_warnings = st.session_state.setdefault("DATE_WARNINGS", [])
-
-    for ln in lines:
-        key_id = id(ln)
-        isin_or_name = ln.get("isin") or ln.get("name")
-
-        # 🔹 CAS PRODUIT STRUCTURÉ (série synthétique)
-        if str(isin_or_name).strip().upper() == "STRUCTURED":
-            d_buy = pd.Timestamp(ln["buy_date"])
-            df_full = structured_series(
-                start=d_buy,
-                end=TODAY,
-                annual_rate_pct=float(ln.get("struct_rate", 8.0)),
-                redemption_years=int(ln.get("struct_years", 6)),
-            )
-            sym = "STRUCTURED"
-        else:
-            df_full, sym, _ = get_price_series(isin_or_name, None, euro_rate)
-
-        # Sécurité
-        if df_full.empty:
-            continue
-
-        inception = df_full.index.min()
-        d_buy = pd.Timestamp(ln["buy_date"])
-
-        if d_buy < inception:
-            invalid_found = True
-            ln["invalid_date"] = True
-            ln["inception_date"] = inception
-
-            alts = suggest_alternative_funds(d_buy, euro_rate)
-            if alts:
-                alt_lines = [
-                    f"- {name} ({isin}), historique depuis le {fmt_date(incep)}"
-                    for name, isin, incep in alts
-                ]
-                alt_msg = "\n".join(alt_lines)
-            else:
-                alt_msg = "Aucun fonds recommandé ne dispose d'un historique suffisant pour cette date."
-
-            date_warnings.append(
-                f"[{portfolio_label}] {ln.get('name','(sans nom)')} "
-                f"({ln.get('isin','—')}) :\n"
-                f"- Date d'achat saisie : {fmt_date(d_buy)}\n"
-                f"- 1ère VL disponible : {fmt_date(inception)}\n\n"
-                f"Impossible de simuler ce fonds sur toute la période demandée.\n"
-                f"Propositions d'alternatives pour l'analyse historique :\n{alt_msg}"
-            )
-            continue
-
-        ln["sym_used"] = sym
-        df = df_full
-
-        if d_buy in df.index:
-            px_buy = float(df.loc[d_buy, "Close"])
-            eff_dt = d_buy
-        else:
-            after = df.loc[df.index >= d_buy]
-            if after.empty:
-                px_buy = float(df.iloc[-1]["Close"])
-                eff_dt = df.index[-1]
-            else:
-                px_buy = float(after.iloc[0]["Close"])
-                eff_dt = after.index[0]
-
-        px_manual = ln.get("buy_px", None)
-        px_for_qty = float(px_manual) if (px_manual not in (None, "", 0, "0")) else px_buy
-
-        price_map[key_id] = df["Close"].astype(float)
-        eff_buy_date[key_id] = eff_dt
-        buy_price_used[key_id] = px_for_qty
-
-    if invalid_found and not price_map:
-        return pd.DataFrame(), 0.0, 0.0, 0.0, None, TODAY, TODAY
-    if not price_map:
-        return pd.DataFrame(), 0.0, 0.0, 0.0, None, TODAY, TODAY
-
-    start_min = min(eff_buy_date.values())
-    start_full = max(eff_buy_date.values())
-
-    bidx = pd.bdate_range(start=start_min, end=TODAY, freq="B")
-    prices = pd.DataFrame(index=bidx)
-    for key_id, s in price_map.items():
-        prices[key_id] = s.reindex(bidx).ffill()
-
-    qty_events = pd.DataFrame(0.0, index=bidx, columns=prices.columns)
-    total_brut = 0.0
-    total_net = 0.0
-    cash_flows: List[Tuple[pd.Timestamp, float]] = []
-
-    # Achats initiaux
-    for ln in lines:
-        key_id = id(ln)
-        if key_id not in prices.columns:
-            continue
-        brut = float(ln.get("amount_gross", 0.0))
-        net = brut * (1.0 - fee_pct / 100.0)
-        px = float(buy_price_used[key_id])
-        dt = eff_buy_date[key_id]
-        if brut > 0 and px > 0:
-            q = net / px
-            tgt = dt if dt in qty_events.index else qty_events.index[qty_events.index >= dt][0]
-            qty_events.loc[tgt, key_id] += q
-            total_brut += brut
-            total_net += net
-            cash_flows.append((tgt, -brut))
-
-    # Poids pour versements mensuels / ponctuels
-    weights_monthly = _weights_for(
-        lines,
-        alloc_mode,
-        custom_weights_monthly or {},
-        single_target,
-    )
-    weights_oneoff = _weights_for(
-        lines,
-        alloc_mode,
-        custom_weights_oneoff or {},
-        single_target,
-    )
-
-    # Versement ponctuel
-    if one_amt_gross > 0:
-        dt = pd.Timestamp(one_date)
-        if dt not in qty_events.index:
-            after = qty_events.index[qty_events.index >= dt]
-            if len(after) > 0:
-                dt = after[0]
-            else:
-                dt = None
-        if dt is not None:
-            net_amt = one_amt_gross * (1.0 - fee_pct / 100.0)
-            for ln in lines:
-                key_id = id(ln)
-                w = weights_oneoff.get(key_id, 0.0)
-                if w <= 0 or key_id not in prices.columns:
-                    continue
-                px = float(prices.loc[dt, key_id])
-                if px > 0:
-                    qty_events.loc[dt, key_id] += (net_amt * w) / px
-            total_brut += float(one_amt_gross)
-            total_net += float(net_amt)
-            cash_flows.append((dt, -float(one_amt_gross)))
-
-    # Mensuels
-    if monthly_amt_gross > 0:
-        sched = _month_schedule(start_min, TODAY)
-        for dt in sched:
-            if dt not in qty_events.index:
-                after = qty_events.index[qty_events.index >= dt]
-                if len(after) == 0:
-                    continue
-                dt = after[0]
-            net_m = monthly_amt_gross * (1.0 - fee_pct / 100.0)
-            for ln in lines:
-                key_id = id(ln)
-                w = weights_monthly.get(key_id, 0.0)
-                if w <= 0 or key_id not in prices.columns:
-                    continue
-                px = float(prices.loc[dt, key_id])
-                if px > 0:
-                    qty_events.loc[dt, key_id] += (net_m * w) / px
-            total_brut += float(monthly_amt_gross)
-            total_net += float(net_m)
-            cash_flows.append((dt, -float(monthly_amt_gross)))
-
-    qty_cum = qty_events.cumsum()
-    values = (qty_cum * prices).sum(axis=1)
-    df_val = pd.DataFrame({"Valeur": values})
-    final_val = float(df_val["Valeur"].iloc[-1]) if not df_val.empty else 0.0
-
-    cash_flows.append((TODAY, final_val))
-    irr = xirr(cash_flows)
-
-    return df_val, total_brut, total_net, final_val, (irr * 100.0 if irr is not None else None), start_min, start_full
-
-# ------------------------------------------------------------
-# Cartes lignes (édition / suppression)
-# ------------------------------------------------------------
-
-def _line_card(line: Dict[str, Any], idx: int, port_key: str):
-    state_key = f"edit_mode_{port_key}_{idx}"
-    if state_key not in st.session_state:
-        st.session_state[state_key] = False
-
-    fee_pct = st.session_state.get("FEE_A", 0.0) if port_key == "A_lines" else st.session_state.get("FEE_B", 0.0)
-    euro_rate = st.session_state.get("EURO_RATE_PREVIEW", 2.0)
-    net_amt, buy_px, qty_disp = compute_line_metrics(line, fee_pct, euro_rate)
-
-    with st.container(border=True):
-        cols = st.columns([3, 2, 2, 2, 1])
-        with cols[0]:
-            st.markdown(f"**{line.get('name','—')}**")
-            st.caption(f"ISIN / Code : `{line.get('isin','—')}`")
-            st.caption(f"Symbole EODHD : `{line.get('sym_used','—')}`")
-            if line.get("invalid_date"):
-                st.markdown(
-                    f"⚠️ Date d'achat antérieure à la 1ère VL ({fmt_date(line.get('inception_date'))}).",
-                )
-        with cols[1]:
-            st.markdown(f"Investi (brut)\n\n**{to_eur(line.get('amount_gross', 0.0))}**")
-            st.caption(f"Net après frais {fee_pct:.1f}% : **{to_eur(net_amt)}**")
-            st.caption(f"Date d'achat : {fmt_date(line.get('buy_date'))}")
-        with cols[2]:
-            st.markdown(f"VL d'achat\n\n**{to_eur(buy_px)}**")
-            st.caption(f"Quantité : {qty_disp:.6f}")
-            if line.get("note"):
-                st.caption(line["note"])
-        with cols[3]:
-            try:
-                dfl, _, _ = get_price_series(line.get("isin") or line.get("name"), None, euro_rate)
-                last = float(dfl["Close"].iloc[-1]) if not dfl.empty else np.nan
-                st.markdown(f"VL actuelle : **{to_eur(last)}**")
-            except Exception:
-                st.markdown("VL actuelle : —")
-        with cols[4]:
-            if not st.session_state[state_key]:
-                if st.button("✏️", key=f"edit_{port_key}_{idx}", help="Modifier"):
-                    st.session_state[state_key] = True
-                    st.experimental_rerun()
-            if st.button("🗑️", key=f"del_{port_key}_{idx}", help="Supprimer"):
-                st.session_state[port_key].pop(idx)
-                st.experimental_rerun()
-
-        if st.session_state[state_key]:
-            with st.form(key=f"form_edit_{port_key}_{idx}", clear_on_submit=False):
-                c1, c2, c3, c4 = st.columns([2, 2, 2, 1])
-                with c1:
-                    new_amount = st.text_input("Montant investi (brut) €", value=str(line.get("amount_gross", "")))
-                with c2:
-                    new_date = st.date_input("Date d’achat", value=pd.Timestamp(line.get("buy_date")).date())
-                with c3:
-                    new_px = st.text_input("Prix d’achat (optionnel)", value=str(line.get("buy_px", "")))
-                with c4:
-                    st.caption(" ")
-                    submitted = st.form_submit_button("💾 Enregistrer")
-                if submitted:
-                    try:
-                        amt_gross = float(str(new_amount).replace(" ", "").replace(",", "."))
-                        assert amt_gross > 0
-                    except Exception:
-                        st.warning("Montant brut invalide.")
-                        st.stop()
-                    buy_ts = pd.Timestamp(new_date)
-                    line["amount_gross"] = float(amt_gross)
-                    line["buy_date"] = buy_ts
-                    if new_px.strip():
-                        try:
-                            line["buy_px"] = float(str(new_px).replace(",", "."))
-                        except Exception:
-                            line["buy_px"] = ""
-                    else:
-                        line["buy_px"] = ""
-                    line.pop("invalid_date", None)
-                    line.pop("inception_date", None)
-                    st.session_state[state_key] = False
-                    st.success("Ligne mise à jour.")
-                    st.experimental_rerun()
-
-
-def portfolio_summary_dataframe(port_key: str) -> pd.DataFrame:
-    """
-    Construit un DataFrame synthétique par ligne :
-    Nom, ISIN, Net investi, Valeur actuelle, Perf € et Perf %.
-    """
-    fee_pct = st.session_state.get("FEE_A", 0.0) if port_key == "A_lines" else st.session_state.get("FEE_B", 0.0)
-    euro_rate = st.session_state.get("EURO_RATE_PREVIEW", 2.0)
-    lines = st.session_state.get(port_key, [])
-
-    rows: List[Dict[str, Any]] = []
-
-    for ln in lines:
-        net_amt, buy_px, qty = compute_line_metrics(ln, fee_pct, euro_rate)
-
-        dfl, _, _ = get_price_series(ln.get("isin") or ln.get("name"), None, euro_rate)
-        if not dfl.empty:
-            last_px = float(dfl["Close"].iloc[-1])
-        else:
-            last_px = np.nan
-
-        val_now = qty * last_px if last_px == last_px else 0.0
-        perf_abs = val_now - net_amt
-        perf_pct = (val_now / net_amt - 1.0) * 100.0 if net_amt > 0 else np.nan
-
-        rows.append(
-            {
-                "Nom": ln.get("name", ""),
-                "ISIN / Code": ln.get("isin", ""),
-                "Net investi €": net_amt,
-                "Valeur actuelle €": val_now,
-                "Perf €": perf_abs,
-                "Perf %": perf_pct,
-            }
-        )
-
-    df = pd.DataFrame(rows)
-    return df
 
 
 def build_positions_dataframe(port_key: str) -> pd.DataFrame:
@@ -863,81 +672,61 @@ def build_positions_dataframe(port_key: str) -> pd.DataFrame:
 
     return pd.DataFrame(rows)
 
-# ------------------------------------------------------------
-# Tableau synthétique par ligne (un seul tableau par portefeuille)
-# ------------------------------------------------------------
+ # ------------------------------------------------------------
+ # Tableau synthétique par ligne (un seul tableau par portefeuille)
+ # ------------------------------------------------------------
 
-def positions_table(title: str, port_key: str):
-    """
-    Affiche un seul tableau synthétique par portefeuille :
-    Nom, ISIN, Date d'achat, Net investi, Valeur actuelle, Perf € et Perf %.
-    """
-    fee_pct = (
-        st.session_state.get("FEE_A", 0.0)
-        if port_key == "A_lines"
-        else st.session_state.get("FEE_B", 0.0)
-    )
-
-    # ✅ Taux fonds euros par portefeuille (au lieu de EURO_RATE_PREVIEW)
-    euro_rate = (
-        st.session_state.get("EURO_RATE_A", 2.0)
-        if port_key == "A_lines"
-        else st.session_state.get("EURO_RATE_B", 2.5)
-    )
-
-    lines = st.session_state.get(port_key, [])
-    rows: List[Dict[str, Any]] = []
-
-    for ln in lines:
-        buy_ts = pd.Timestamp(ln.get("buy_date"))
-
-        # Montant net investi, VL d'achat et quantité
-        net_amt, buy_px, qty = compute_line_metrics(ln, fee_pct, euro_rate)
-
-        # ✅ IMPORTANT : on récupère la série "depuis buy_ts" pour éviter le mismatch EUROFUND
-        dfl, _, _ = get_price_series(ln.get("isin") or ln.get("name"), buy_ts, euro_rate)
-
-        if not dfl.empty:
-            last_px = float(dfl["Close"].iloc[-1])
-        else:
-            last_px = np.nan
-
-        # Valeur actuelle et performance
-        val_now = qty * last_px if last_px == last_px else 0.0
-        perf_abs = val_now - net_amt
-        perf_pct = (val_now / net_amt - 1.0) * 100.0 if net_amt > 0 else np.nan
-
-        rows.append(
-            {
-                "Nom": ln.get("name", ""),
-                "ISIN / Code": ln.get("isin", ""),
-                "Date d'achat": fmt_date(ln.get("buy_date")),
-                "Net investi €": net_amt,
-                "Valeur actuelle €": val_now,
-                "Perf €": perf_abs,
-                "Perf %": perf_pct,
-            }
-        )
-
-    st.markdown(f"### {title}")
-    df = pd.DataFrame(rows)
-    if df.empty:
-        st.info("Aucune ligne.")
-    else:
-        st.dataframe(
-            df.style.format(
-                {
-                    "Net investi €": to_eur,
-                    "Valeur actuelle €": to_eur,
-                    "Perf €": to_eur,
-                    "Perf %": "{:,.2f}%".format,
-                }
-            ),
-            hide_index=True,
-            use_container_width=True,
-        )
-
-
+ def positions_table(title: str, port_key: str):
+     """
+     Affiche un seul tableau synthétique par portefeuille :
+     Nom, ISIN, Date d'achat, Net investi, Valeur actuelle, Perf € et Perf %.
+     """
+     fee_pct = (
+         st.session_state.get("FEE_A", 0.0)
+         if port_key == "A_lines"
+         else st.session_state.get("FEE_B", 0.0)
+     )
+ 
+     # ✅ Taux fonds euros par portefeuille (au lieu de EURO_RATE_PREVIEW)
+     euro_rate = (
+         st.session_state.get("EURO_RATE_A", 2.0)
+         if port_key == "A_lines"
+         else st.session_state.get("EURO_RATE_B", 2.5)
+     )
+ 
+     lines = st.session_state.get(port_key, [])
+     rows: List[Dict[str, Any]] = []
+ 
+     for ln in lines:
+         buy_ts = pd.Timestamp(ln.get("buy_date"))
+ 
+         # Montant net investi, VL d'achat et quantité
+@@ -787,95 919,140 @@ def positions_table(title: str, port_key: str):
+                 "Valeur actuelle €": val_now,
+                 "Perf €": perf_abs,
+                 "Perf %": perf_pct,
+             }
+         )
+ 
+     st.markdown(f"### {title}")
+     df = pd.DataFrame(rows)
+     if df.empty:
+         st.info("Aucune ligne.")
+     else:
+         st.dataframe(
+             df.style.format(
+                 {
+                     "Net investi €": to_eur,
+                     "Valeur actuelle €": to_eur,
+                     "Perf €": to_eur,
+                     "Perf %": "{:,.2f}%".format,
+                 }
+             ),
+             hide_index=True,
+             use_container_width=True,
+         )
+ 
+ 
 def _prepare_pie_df(df_positions: pd.DataFrame, max_items: int = 8, min_pct: float = 0.03) -> pd.DataFrame:
     if df_positions.empty:
         return df_positions
@@ -981,397 +770,255 @@ def _prepare_pie_df(df_positions: pd.DataFrame, max_items: int = 8, min_pct: flo
     return df
 
 
-# ------------------------------------------------------------
-# Analytics internes : retours, corrélation, volatilité
-# ------------------------------------------------------------
-
-def _build_returns_df(
-    lines: List[Dict[str, Any]],
-    euro_rate: float,
-    years: int = 3,
-    min_points: int = 60,
-) -> pd.DataFrame:
-    """
-    Construit un DataFrame de rendements journaliers (pct_change)
-    pour toutes les lignes du portefeuille avec un historique suffisant.
-    Index = dates, colonnes = "Nom (ISIN)".
-    """
-    cutoff = TODAY - pd.Timedelta(days=365 * years)
-    series_map: Dict[str, pd.Series] = {}
-
-    for ln in lines:
-        label = (ln.get("name") or ln.get("isin") or "Ligne").strip()
-        isin = (ln.get("isin") or "").strip()
-        key = f"{label} ({isin})" if isin else label
-
-        df, _, _ = get_price_series(ln.get("isin") or ln.get("name"), None, euro_rate)
-        if df.empty:
-            continue
-
-        s = df["Close"].astype(float)
-        s = s[s.index >= cutoff]
-        if s.size < min_points:
-            continue
-
-        series_map[key] = s
-
-    if not series_map:
-        return pd.DataFrame()
-
-    df_prices = pd.DataFrame(series_map).dropna(how="any")
-    if df_prices.shape[0] < min_points:
-        return pd.DataFrame()
-
-    returns = df_prices.pct_change().dropna(how="any")
-    return returns
-
-
-def correlation_matrix_from_lines(
-    lines: List[Dict[str, Any]],
-    euro_rate: float,
-    years: int = 3,
-    min_points: int = 60,
-) -> pd.DataFrame:
-    """
-    Matrice de corrélation entre les lignes du portefeuille,
-    basée sur les rendements journaliers.
-    """
-    rets = _build_returns_df(lines, euro_rate, years=years, min_points=min_points)
-    if rets.empty:
-        return pd.DataFrame()
-    return rets.corr()
-
-
-def volatility_table_from_lines(
-    lines: List[Dict[str, Any]],
-    euro_rate: float,
-    years: int = 3,
-    min_points: int = 60,
-) -> pd.DataFrame:
-    """
-    Volatilité annuelle par ligne (et écart-type quotidien).
-    """
-    rets = _build_returns_df(lines, euro_rate, years=years, min_points=min_points)
-    if rets.empty:
-        return pd.DataFrame()
-
-    rows = []
-    for col in rets.columns:
-        r = rets[col]
-        daily_std = float(r.std())
-        ann_std = daily_std * np.sqrt(252.0)
-        rows.append(
-            {
-                "Ligne": col,
-                "Écart-type quotidien %": daily_std * 100.0,
-                "Volatilité annuelle %": ann_std * 100.0,
-                "Nombre de points": int(r.count()),
-            }
-        )
-    df = pd.DataFrame(rows)
-    return df.sort_values("Volatilité annuelle %", ascending=False)
-
-
-def portfolio_risk_stats(
-    lines: List[Dict[str, Any]],
-    euro_rate: float,
-    years: int = 3,
-    min_points: int = 60,
-) -> Optional[Dict[str, float]]:
-    """
-    Calcule quelques stats globales de risque pour le portefeuille :
-    - volatilité annuelle
-    - max drawdown sur la période.
-    Pondération par montant net investi (approximatif).
-    """
-    rets = _build_returns_df(lines, euro_rate, years=years, min_points=min_points)
-    if rets.empty:
-        return None
-
-    # Pondération par net investi (approche simple)
-    net_by_col: Dict[str, float] = {}
-    fee_A = st.session_state.get("FEE_A", 0.0)
-    fee_B = st.session_state.get("FEE_B", 0.0)
-
-    # on détecte si c'est A ou B via présence dans session_state
-    # (on ne connait pas port_key ici, donc approximation : on regarde les deux)
-    for ln in lines:
-        label = (ln.get("name") or ln.get("isin") or "Ligne").strip()
-        isin = (ln.get("isin") or "").strip()
-        key = f"{label} ({isin})" if isin else label
-
-        # On essaie d'utiliser les deux grilles de frais, c'est approximatif
-        net_A, _, _ = compute_line_metrics(ln, fee_A, euro_rate)
-        net_B, _, _ = compute_line_metrics(ln, fee_B, euro_rate)
-        net = max(net_A, net_B)  # on prend le plus élevé comme proxy
-        if net > 0:
-            net_by_col[key] = net
-
-    # normalisation des poids
-    weights = {}
-    tot = sum(net_by_col.get(c, 0.0) for c in rets.columns)
-    if tot <= 0:
-        return None
-    for c in rets.columns:
-        w = net_by_col.get(c, 0.0) / tot
-        weights[c] = w
-
-    # série de rendement du portefeuille
-    w_vec = np.array([weights[c] for c in rets.columns])
-    rp = rets.to_numpy().dot(w_vec)
-    rp = pd.Series(rp, index=rets.index)
-
-    daily_std = float(rp.std())
-    vol_ann = daily_std * np.sqrt(252.0)
-
-    # max drawdown
-    cum = (1.0 + rp).cumprod()
-    running_max = cum.cummax()
-    dd = cum / running_max - 1.0
-    max_dd = float(dd.min())  # négatif
-
-    return {
-        "vol_ann_pct": vol_ann * 100.0,
-        "max_dd_pct": max_dd * 100.0,
-    }
-
-
-def _corr_heatmap_chart(corr: pd.DataFrame, title: str) -> Optional[alt.Chart]:
-    """
-    Construit une heatmap Altair pour visualiser la matrice de corrélation.
-    """
-    if corr.empty or corr.shape[0] < 2:
-        return None
-
-    df_corr = corr.copy()
-    df_corr["Ligne1"] = df_corr.index
-    df_melt = df_corr.melt(id_vars="Ligne1", var_name="Ligne2", value_name="corr")
-
-    base = (
-        alt.Chart(df_melt)
-        .encode(
-            x=alt.X("Ligne1:O", sort=None, title=""),
-            y=alt.Y("Ligne2:O", sort=None, title=""),
-        )
-    )
-
-    heat = base.mark_rect().encode(
-        color=alt.Color("corr:Q", scale=alt.Scale(domain=[-1, 1])),
-        tooltip=[
-            alt.Tooltip("Ligne1:N", title="Ligne 1"),
-            alt.Tooltip("Ligne2:N", title="Ligne 2"),
-            alt.Tooltip("corr:Q", title="Corrélation", format=".2f"),
-        ],
-    )
-
-    text = base.mark_text(baseline="middle").encode(
-        text=alt.Text("corr:Q", format=".2f"),
-    )
-
-    return (heat + text).properties(title=title, height=300)
-
-# ------------------------------------------------------------
-# Blocs de saisie : soit fonds recommandés, soit saisie libre
-# ------------------------------------------------------------
-
-# ------------------------------------------------------------
-# Blocs de saisie : soit fonds recommandés, soit saisie libre
-# ------------------------------------------------------------
-# ------------------------------------------------------------
-# Blocs de saisie : soit fonds recommandés, soit saisie libre
-# ------------------------------------------------------------
-
-def _add_from_reco_block(port_key: str, label: str):
-    st.subheader(label)
-
-    cat = st.selectbox(
-        "Catégorie",
-        ["Core (référence)", "Défensif", "Produits structurés"],
-        key=f"reco_cat_{port_key}",
-    )
-
-    # ✅ Date d'achat centralisée (versement initial uniquement)
-    buy_date = (
-        st.session_state.get("INIT_A_DATE", pd.Timestamp("2024-01-02").date())
-        if port_key == "A_lines"
-        else st.session_state.get("INIT_B_DATE", pd.Timestamp("2024-01-02").date())
-    )
-
-    # ============================
-    # CAS 1 — PRODUIT STRUCTURÉ
-    # ============================
-    if cat == "Produits structurés":
-        st.markdown("### Produit structuré (Autocall)")
-
-        c1, c2 = st.columns(2)
-        with c1:
-            amount = st.text_input(
-                "Montant investi (brut) €",
-                value="",
-                key=f"struct_amt_{port_key}",
-            )
-        with c2:
-            struct_years = st.number_input(
-                "Durée estimée avant remboursement (années)",
-                min_value=1,
-                max_value=12,
-                value=6,
-                step=1,
-                key=f"struct_years_{port_key}",
-            )
-
-        struct_rate = st.number_input(
-            "Rendement annuel estimé (%)",
-            min_value=0.0,
-            max_value=25.0,
-            value=8.0,
-            step=0.10,
-            key=f"struct_rate_{port_key}",
-        )
-
-        st.caption(
-            f"Date d’investissement initiale : {pd.Timestamp(buy_date).strftime('%d/%m/%Y')}"
-        )
-
-        if st.button("➕ Ajouter le produit structuré", key=f"struct_add_{port_key}"):
-            try:
-                amt = float(str(amount).replace(" ", "").replace(",", "."))
-                assert amt > 0
-            except Exception:
-                st.warning("Montant invalide.")
-                return
-
-            ln = {
-                "name": f"Produit structuré ({struct_rate:.2f}% / {int(struct_years)} ans)",
-                "isin": "STRUCTURED",
-                "amount_gross": float(amt),
-                "buy_date": pd.Timestamp(buy_date),
-                "buy_px": 1.0,
-                "struct_rate": float(struct_rate),
-                "struct_years": int(struct_years),
-                "note": "",
-                "sym_used": "STRUCTURED",
-            }
-            st.session_state[port_key].append(ln)
-            st.success("Produit structuré ajouté.")
-        return  # ✅ IMPORTANT : on sort de la fonction pour ne pas afficher la partie fonds
-
-    # ============================
-    # CAS 2 — FONDS CLASSIQUES
-    # ============================
-    if cat == "Core (référence)":
-        fonds_list = RECO_FUNDS_CORE
-    else:
-        fonds_list = RECO_FUNDS_DEF
-
-    options = [f"{nm} ({isin})" for nm, isin in fonds_list]
-    choice = st.selectbox("Fonds recommandé", options, key=f"reco_choice_{port_key}")
-    idx = options.index(choice) if choice in options else 0
-    name, isin = fonds_list[idx]
-
-    c1, c2 = st.columns([2, 2])
-    with c1:
-        amount = st.text_input("Montant investi (brut) €", value="", key=f"reco_amt_{port_key}")
-    with c2:
-        st.caption(f"Date d’achat (versement initial) : {pd.Timestamp(buy_date).strftime('%d/%m/%Y')}")
-
-    px = st.text_input("Prix d’achat (optionnel)", value="", key=f"reco_px_{port_key}")
-
-    if st.button("➕ Ajouter ce fonds recommandé", key=f"reco_add_{port_key}"):
-        try:
-            amt = float(str(amount).replace(" ", "").replace(",", "."))
-            assert amt > 0
-        except Exception:
-            st.warning("Montant invalide.")
-            return
-
-        ln = {
-            "name": name,
-            "isin": isin,
-            "amount_gross": float(amt),
-            "buy_date": pd.Timestamp(buy_date),
-            "buy_px": float(str(px).replace(",", ".")) if px.strip() else "",
-            "note": "",
-            "sym_used": "",
-        }
-        st.session_state[port_key].append(ln)
-        st.success("Fonds recommandé ajouté.")
-
-
-def _add_line_form_free(port_key: str, label: str):
-    st.subheader(label)
-
-    # ✅ Date d'achat centralisée (versement initial)
-    buy_date_central = (
-        st.session_state.get("INIT_A_DATE", pd.Timestamp("2024-01-02").date())
-        if port_key == "A_lines"
-        else st.session_state.get("INIT_B_DATE", pd.Timestamp("2024-01-02").date())
-    )
-
-    with st.form(key=f"form_add_free_{port_key}", clear_on_submit=False):
-        c1, c2 = st.columns([3, 2])
-
-        with c1:
-            name = st.text_input("Nom du fonds (libre)", value="")
-            isin = st.text_input("ISIN ou code (peut être 'EUROFUND')", value="")
-
-        with c2:
-            amount = st.text_input("Montant investi (brut) €", value="")
-            st.caption(
-                f"Date d’achat (versement initial) : "
-                f"{pd.Timestamp(buy_date_central).strftime('%d/%m/%Y')}"
-            )
-
-        px = st.text_input("Prix d’achat (optionnel)", value="")
-        note = st.text_input("Note (optionnel)", value="")
-        add_btn = st.form_submit_button("➕ Ajouter cette ligne")
-
-    if not add_btn:
-        return
-
-    isin_final = isin.strip()
-    name_final = name.strip()
-
-    # Si nom vide mais ISIN renseigné : tentative de récupération du nom
-    if not name_final and isin_final:
-        res = eodhd_search(isin_final)
-        match = None
-        for it in res:
-            if it.get("ISIN") == isin_final:
-                match = it
-                break
-        if match is None and res:
-            match = res[0]
-        if match:
-            name_final = match.get("Name", isin_final)
-
-    if not name_final and isin_final.upper() == "EUROFUND":
-        name_final = "Fonds en euros (EUROFUND)"
-
-    if not name_final:
-        name_final = isin_final or "—"
-
-    try:
-        amt = float(str(amount).replace(" ", "").replace(",", "."))
-        assert amt > 0
-    except Exception:
-        st.warning("Montant invalide.")
-        return
-
-    ln = {
-        "name": name_final,
-        "isin": isin_final or name_final,
-        "amount_gross": float(amt),
-        "buy_date": pd.Timestamp(buy_date_central),  # ✅ applique la date centrale
-        "buy_px": float(str(px).replace(",", ".")) if px.strip() else "",
-        "note": note.strip(),
-        "sym_used": "",
-    }
-
-    st.session_state[port_key].append(ln)
-    st.success("Ligne ajoutée.")
-
-
+ # ------------------------------------------------------------
+ # Analytics internes : retours, corrélation, volatilité
+ # ------------------------------------------------------------
+ 
+
+ def _build_returns_df(
+     lines: List[Dict[str, Any]],
+     euro_rate: float,
+     years: int = 3,
+     min_points: int = 60,
+ ) -> pd.DataFrame:
+     """
+     Construit un DataFrame de rendements journaliers (pct_change)
+     pour toutes les lignes du portefeuille avec un historique suffisant.
+     Index = dates, colonnes = "Nom (ISIN)".
+     """
+     cutoff = TODAY - pd.Timedelta(days=365 * years)
+     series_map: Dict[str, pd.Series] = {}
+ 
+     for ln in lines:
+         label = (ln.get("name") or ln.get("isin") or "Ligne").strip()
+         isin = (ln.get("isin") or "").strip()
+         key = f"{label} ({isin})" if isin else label
+ 
+         df, _, _ = get_price_series(ln.get("isin") or ln.get("name"), None, euro_rate)
+         if df.empty:
+             continue
+ 
+         s = df["Close"].astype(float)
+         s = s[s.index >= cutoff]
+         if s.size < min_points:
+             continue
+ 
+         series_map[key] = s
+ 
+     if not series_map:
+         return pd.DataFrame()
+ 
+     df_prices = pd.DataFrame(series_map).dropna(how="any")
+     if df_prices.shape[0] < min_points:
+         return pd.DataFrame()
+ 
+     returns = df_prices.pct_change().dropna(how="any")
+     return returns
+ 
+ 
+
+ def correlation_matrix_from_lines(
+     lines: List[Dict[str, Any]],
+     euro_rate: float,
+     years: int = 3,
+     min_points: int = 60,
+ ) -> pd.DataFrame:
+     """
+     Matrice de corrélation entre les lignes du portefeuille,
+     basée sur les rendements journaliers.
+     """
+     rets = _build_returns_df(lines, euro_rate, years=years, min_points=min_points)
+     if rets.empty:
+         return pd.DataFrame()
+     return rets.corr()
+ 
+ 
+ def volatility_table_from_lines(
+     lines: List[Dict[str, Any]],
+     euro_rate: float,
+     years: int = 3,
+     min_points: int = 60,
+ ) -> pd.DataFrame:
+     """
+     Volatilité annuelle par ligne (et écart-type quotidien).
+     """
+@@ -986,50 1163,51 @@ def _corr_heatmap_chart(corr: pd.DataFrame, title: str) -> Optional[alt.Chart]:
+     heat = base.mark_rect().encode(
+         color=alt.Color("corr:Q", scale=alt.Scale(domain=[-1, 1])),
+         tooltip=[
+             alt.Tooltip("Ligne1:N", title="Ligne 1"),
+             alt.Tooltip("Ligne2:N", title="Ligne 2"),
+             alt.Tooltip("corr:Q", title="Corrélation", format=".2f"),
+         ],
+     )
+ 
+     text = base.mark_text(baseline="middle").encode(
+         text=alt.Text("corr:Q", format=".2f"),
+     )
+ 
+     return (heat  text).properties(title=title, height=300)
+ 
+ # ------------------------------------------------------------
+ # Blocs de saisie : soit fonds recommandés, soit saisie libre
+ # ------------------------------------------------------------
+ 
+ # ------------------------------------------------------------
+ # Blocs de saisie : soit fonds recommandés, soit saisie libre
+ # ------------------------------------------------------------
+ # ------------------------------------------------------------
+ # Blocs de saisie : soit fonds recommandés, soit saisie libre
+ # ------------------------------------------------------------
+
+ def _add_from_reco_block(port_key: str, label: str):
+     st.subheader(label)
+ 
+     cat = st.selectbox(
+         "Catégorie",
+         ["Core (référence)", "Défensif", "Produits structurés"],
+         key=f"reco_cat_{port_key}",
+     )
+ 
+     # ✅ Date d'achat centralisée (versement initial uniquement)
+     buy_date = (
+         st.session_state.get("INIT_A_DATE", pd.Timestamp("2024-01-02").date())
+         if port_key == "A_lines"
+         else st.session_state.get("INIT_B_DATE", pd.Timestamp("2024-01-02").date())
+     )
+ 
+     # ============================
+     # CAS 1 — PRODUIT STRUCTURÉ
+     # ============================
+     if cat == "Produits structurés":
+         st.markdown("### Produit structuré (Autocall)")
+ 
+         c1, c2 = st.columns(2)
+         with c1:
+             amount = st.text_input(
+@@ -1102,50 1280,51 @@ def _add_from_reco_block(port_key: str, label: str):
+     with c2:
+         st.caption(f"Date d’achat (versement initial) : {pd.Timestamp(buy_date).strftime('%d/%m/%Y')}")
+ 
+     px = st.text_input("Prix d’achat (optionnel)", value="", key=f"reco_px_{port_key}")
+ 
+     if st.button("➕ Ajouter ce fonds recommandé", key=f"reco_add_{port_key}"):
+         try:
+             amt = float(str(amount).replace(" ", "").replace(",", "."))
+             assert amt > 0
+         except Exception:
+             st.warning("Montant invalide.")
+             return
+ 
+         ln = {
+             "name": name,
+             "isin": isin,
+             "amount_gross": float(amt),
+             "buy_date": pd.Timestamp(buy_date),
+             "buy_px": float(str(px).replace(",", ".")) if px.strip() else "",
+             "note": "",
+             "sym_used": "",
+         }
+         st.session_state[port_key].append(ln)
+         st.success("Fonds recommandé ajouté.")
+ 
+
+ def _add_line_form_free(port_key: str, label: str):
+     st.subheader(label)
+ 
+     # ✅ Date d'achat centralisée (versement initial)
+     buy_date_central = (
+         st.session_state.get("INIT_A_DATE", pd.Timestamp("2024-01-02").date())
+         if port_key == "A_lines"
+         else st.session_state.get("INIT_B_DATE", pd.Timestamp("2024-01-02").date())
+     )
+ 
+     with st.form(key=f"form_add_free_{port_key}", clear_on_submit=False):
+         c1, c2 = st.columns([3, 2])
+ 
+         with c1:
+             name = st.text_input("Nom du fonds (libre)", value="")
+             isin = st.text_input("ISIN ou code (peut être 'EUROFUND')", value="")
+ 
+         with c2:
+             amount = st.text_input("Montant investi (brut) €", value="")
+             st.caption(
+                 f"Date d’achat (versement initial) : "
+                 f"{pd.Timestamp(buy_date_central).strftime('%d/%m/%Y')}"
+             )
+ 
+         px = st.text_input("Prix d’achat (optionnel)", value="")
+@@ -1175,489 1354,1384 @@ def _add_line_form_free(port_key: str, label: str):
+         name_final = "Fonds en euros (EUROFUND)"
+ 
+     if not name_final:
+         name_final = isin_final or "—"
+ 
+     try:
+         amt = float(str(amount).replace(" ", "").replace(",", "."))
+         assert amt > 0
+     except Exception:
+         st.warning("Montant invalide.")
+         return
+ 
+     ln = {
+         "name": name_final,
+         "isin": isin_final or name_final,
+         "amount_gross": float(amt),
+         "buy_date": pd.Timestamp(buy_date_central),  # ✅ applique la date centrale
+         "buy_px": float(str(px).replace(",", ".")) if px.strip() else "",
+         "note": note.strip(),
+         "sym_used": "",
+     }
+ 
+     st.session_state[port_key].append(ln)
+     st.success("Ligne ajoutée.")
+ 
+-# ------------------------------------------------------------
+-# Layout principal
+-# ------------------------------------------------------------
+-st.set_page_config(page_title=APP_TITLE, layout="wide")
+-st.title(APP_TITLE)
+-# Init state
+-st.session_state.setdefault("A_lines", [])
+-st.session_state.setdefault("B_lines", [])
+-st.session_state.setdefault("FEE_A", 3.0)
+-st.session_state.setdefault("FEE_B", 2.0)
+-st.session_state.setdefault("M_A", 0.0)
+-st.session_state.setdefault("M_B", 0.0)
+-st.session_state.setdefault("ONE_A", 0.0)
+-st.session_state.setdefault("ONE_B", 0.0)
+-st.session_state.setdefault("ONE_A_DATE", pd.Timestamp("2024-07-01").date())
+-st.session_state.setdefault("ONE_B_DATE", pd.Timestamp("2024-07-01").date())
+-st.session_state.setdefault("ALLOC_MODE", "equal")
+-st.session_state.setdefault("DATE_WARNINGS", [])
+-st.session_state.setdefault("INIT_A_DATE", pd.Timestamp("2024-01-02").date())
+-st.session_state.setdefault("INIT_B_DATE", pd.Timestamp("2024-01-02").date())
+-st.session_state.setdefault("EURO_RATE_A", 2.0)
+-st.session_state.setdefault("EURO_RATE_B", 2.5)
+-
+-# -------------------------------------------------------------------
+-# Sidebar : paramètres globaux
+-# -------------------------------------------------------------------
+-with st.sidebar:
+-    # Fonds en euros — Taux annuel (par portefeuille)
+-    st.header("Fonds en euros — Taux annuel")
+-
+-    EURO_RATE_A = st.number_input(
+-        "Portefeuille 1 (Client) — taux annuel (%)",
+-        0.0,
+-        10.0,
+-        st.session_state.get("EURO_RATE_A", 2.0),
+-        0.10,
+-        key="EURO_RATE_A",
+-    )
+ 
+-    EURO_RATE_B = st.number_input(
+-        "Portefeuille 2 (Valority) — taux annuel (%)",
+-        0.0,
+-        10.0,
+-        st.session_state.get("EURO_RATE_B", 2.5),
+-        0.10,
+-        key="EURO_RATE_B",
+-    )
 @st.cache_data(show_spinner=False, ttl=3600)
 def _build_returns_matrix(
     isins: Tuple[str, ...],
@@ -1379,13 +1026,16 @@ def _build_returns_matrix(
     start: pd.Timestamp,
     end: pd.Timestamp,
     min_points: int = 60,
-) -> Tuple[pd.DataFrame, List[str], Dict[str, str]]:
+) -> Tuple[pd.DataFrame, List[str], Dict[str, str], Dict[str, str]]:
     series_map: Dict[str, pd.Series] = {}
     warnings: List[str] = []
     status: Dict[str, str] = {}
+    sym_used_map: Dict[str, str] = {}
 
     for isin in isins:
-        df, _, _ = get_price_series(isin, None, euro_rate)
+        df, sym_used, _ = get_price_series(isin, None, euro_rate)
+        if sym_used:
+            sym_used_map[isin] = sym_used
         if df.empty or df["Close"].dropna().shape[0] < min_points:
             warnings.append(f"{isin} : historique insuffisant")
             status[isin] = "insufficient"
@@ -1400,15 +1050,25 @@ def _build_returns_matrix(
         status[isin] = "ok"
 
     if not series_map:
-        return pd.DataFrame(), warnings, status
-
+        return pd.DataFrame(), warnings, status, sym_used_map
+ 
+-    st.caption("Le taux est appliqué annuellement sur la part investie en fonds euros (EUROFUND).")
     prices = pd.DataFrame(series_map).ffill().dropna(how="any")
     if prices.shape[0] < min_points:
-        return pd.DataFrame(), warnings, status
+        return pd.DataFrame(), warnings, status, sym_used_map
     returns = prices.pct_change().dropna(how="any")
-    return returns, warnings, status
-
-
+    return returns, warnings, status, sym_used_map
+ 
+-    # Frais d’entrée
+-    st.header("Frais d’entrée (%)")
+ 
+-    FEE_A = st.number_input(
+-        "Frais d’entrée — Portefeuille 1 (Client)",
+-        0.0,
+-        10.0,
+-        st.session_state.get("FEE_A", 3.0),
+-        0.10,
+-        key="FEE_A",
 def _suggest_weights(
     returns: pd.DataFrame,
     max_weight: float,
@@ -1439,7 +1099,7 @@ def _suggest_weights(
                 break
             total_remaining = sum(remaining.values())
             for k in remaining:
-                weights[k] += excess * (remaining[k] / total_remaining)
+                weights[k] = excess * (remaining[k] / total_remaining)
 
     total = sum(weights.values())
     if total > 0:
@@ -1456,10 +1116,10 @@ def _round_allocations(amounts: Dict[str, float]) -> Dict[str, int]:
         ((k, amounts[k] - floors[k]) for k in amounts),
         key=lambda x: x[1],
         reverse=True,
-    )
+     )
     for i in range(min(remainder, len(fractions))):
         k, _ = fractions[i]
-        floors[k] += 1
+        floors[k] = 1
     return floors
 
 
@@ -1479,7 +1139,7 @@ def _apply_weight_caps(weights: Dict[str, float], max_weight: float) -> Dict[str
             break
         total_remaining = sum(remaining.values())
         for k in remaining:
-            weights[k] += excess * (remaining[k] / total_remaining)
+            weights[k] = excess * (remaining[k] / total_remaining)
     total = sum(weights.values())
     if total > 0:
         weights = {k: v / total for k, v in weights.items()}
@@ -1522,17 +1182,114 @@ def _select_min_corr_combo(
                 best_score = score
                 best_combo = list(combo)
     return best_combo
-
-
+ 
+-    FEE_B = st.number_input(
+-        "Frais d’entrée — Portefeuille 2 (Valority)",
+-        0.0,
+-        10.0,
+-        st.session_state.get("FEE_B", 2.0),
+-        0.10,
+-        key="FEE_B",
+-    )
+ 
+-    st.caption("Les frais s’appliquent sur chaque investissement (initial, mensuel, ponctuel).")
 def _compute_drawdown(returns: pd.Series) -> Optional[float]:
     if returns.empty:
         return None
-    cum = (1.0 + returns).cumprod()
+    cum = (1.0  returns).cumprod()
     running_max = cum.cummax()
     dd = cum / running_max - 1.0
     return float(dd.min())
 
+ 
+-    # Date du versement initial (centralisée)
+-    st.header("Date du versement initial")
+def _fund_name(isin: str) -> str:
+    return FUND_NAME_MAP.get(isin, isin)
+ 
+-    st.date_input(
+-        "Portefeuille 1 (Client) — date d’investissement initiale",
+-        value=st.session_state.get("INIT_A_DATE", pd.Timestamp("2024-01-02").date()),
+-        key="INIT_A_DATE",
+-    )
+ 
+-    st.date_input(
+-        "Portefeuille 2 (Valority) — date d’investissement initiale",
+-        value=st.session_state.get("INIT_B_DATE", pd.Timestamp("2024-01-02").date()),
+-        key="INIT_B_DATE",
+-    )
+def _get_fundamentals_by_isin(isin: str, sym_hint: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    if not isin or isin.upper() == "EUROFUND":
+        return None
+    candidates: List[str] = []
+    if sym_hint:
+        candidates.append(sym_hint)
+    candidates.extend(_symbol_candidates(isin))
+    seen = set()
+    for sym in candidates:
+        if sym in seen:
+            continue
+        seen.add(sym)
+        if "." not in sym:
+            continue
+        try:
+            data = eodhd_get(f"/fundamentals/{sym}")
+        except Exception:
+            data = None
+        if isinstance(data, dict) and data:
+            return data
+    return None
 
+
+def _safe_fund_label(name: str, isin: str) -> str:
+    cleaned = str(name or "").strip()
+    if cleaned:
+        return f"{cleaned} ({isin})"
+    if isin:
+        res = eodhd_search(isin)
+        if res:
+            maybe = res[0].get("Name") or res[0].get("name")
+            if maybe:
+                return f"{maybe} ({isin})"
+    return f"{isin} ({isin})"
+
+
+def _extract_weights(data: Any) -> Dict[str, float]:
+    if isinstance(data, dict):
+        out = {}
+        for k, v in data.items():
+            try:
+                out[k] = float(v)
+            except Exception:
+                continue
+        return out
+    if isinstance(data, list):
+        out = {}
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+            name = item.get("Name") or item.get("name") or item.get("Asset") or item.get("Asset_Name")
+            weight = item.get("Weight") or item.get("weight") or item.get("Allocation") or item.get("Percent")
+            if name is None or weight is None:
+                continue
+            try:
+                out[str(name)] = float(weight)
+            except Exception:
+                continue
+        return out
+    return {}
+ 
+-    # Paramètres de versement
+-    st.header("Paramètres de versement")
+ 
+-    with st.expander("Portefeuille 1 — Client"):
+-        M_A = st.number_input(
+-            "Mensuel brut (€)",
+-            0.0,
+-            1_000_000.0,
+-            st.session_state.get("M_A", 0.0),
+-            100.0,
+-            key="M_A",
 def render_portfolio_builder():
     st.title("Créer le portefeuille parfait")
     try:
@@ -1549,7 +1306,14 @@ def render_portfolio_builder():
         st.caption(
             f"Recommandation : {euro_default}% fonds euros / {secure_default}% sécuritaire / "
             f"{100 - euro_default - secure_default}% croissance (ajustable)."
-        )
+         )
+-        ONE_A = st.number_input(
+-            "Ponctuel brut (€)",
+-            0.0,
+-            1_000_000.0,
+-            st.session_state.get("ONE_A", 0.0),
+-            100.0,
+-            key="ONE_A",
 
         euro_pct = st.slider("Fonds en euros (%)", 0, 100, euro_default, 1)
         secure_max = max(0, 100 - euro_pct)
@@ -1564,14 +1328,18 @@ def render_portfolio_builder():
             max_value=10_000_000,
             value=100_000,
             step=1_000,
-        )
+         )
+-        ONE_A_DATE = st.date_input(
+-            "Date du ponctuel",
+-            value=st.session_state.get("ONE_A_DATE", pd.Timestamp("2024-07-01").date()),
+-            key="ONE_A_DATE",
 
         st.markdown("### 3) Fenêtre d’analyse")
         window_mode = st.radio(
             "Mode",
             ["1 an", "3 ans", "5 ans", "10 ans", "MAX", "Dates personnalisées"],
             horizontal=True,
-        )
+         )
         if window_mode == "Dates personnalisées":
             date_cols = st.columns(2)
             with date_cols[0]:
@@ -1596,7 +1364,15 @@ def render_portfolio_builder():
             else:
                 start = TODAY - pd.DateOffset(years=yrs)
             end = TODAY
-
+ 
+-    with st.expander("Portefeuille 2 — Valority"):
+-        M_B = st.number_input(
+-            "Mensuel brut (€)",
+-            0.0,
+-            1_000_000.0,
+-            st.session_state.get("M_B", 0.0),
+-            100.0,
+-            key="M_B",
         if start > end:
             st.warning("La date de début doit être antérieure à la date de fin.")
             return
@@ -1607,7 +1383,14 @@ def render_portfolio_builder():
             "Fonds défensifs / obligataires",
             secure_options,
             default=secure_options[:2],
-        )
+         )
+-        ONE_B = st.number_input(
+-            "Ponctuel brut (€)",
+-            0.0,
+-            1_000_000.0,
+-            st.session_state.get("ONE_B", 0.0),
+-            100.0,
+-            key="ONE_B",
         secure_isins = [opt.split("(")[-1].replace(")", "").strip() for opt in secure_sel]
 
         free_secure = st.text_input("Ajouter un ISIN défensif (optionnel)", value="")
@@ -1622,28 +1405,57 @@ def render_portfolio_builder():
                 "Auto — avec fonds imposé (anchor)",
             ],
             horizontal=True,
-        )
+         )
+-        ONE_B_DATE = st.date_input(
+-            "Date du ponctuel",
+-            value=st.session_state.get("ONE_B_DATE", pd.Timestamp("2024-07-01").date()),
+-            key="ONE_B_DATE",
         k = st.number_input("Nombre de fonds croissance (k)", min_value=2, max_value=6, value=3, step=1)
         max_weight_pct = st.number_input("Poids max par fonds (%)", min_value=5, max_value=100, value=40, step=5)
         weight_method = st.selectbox("Méthode de pondération", ["Égalitaire", "Inverse-volatilité"])
         anchor_isin = None
         if growth_mode == "Auto — avec fonds imposé (anchor)":
-            anchor_options = [f"{name} ({isin})" for name, isin in RECO_FUNDS_CORE]
+            anchor_options = [_safe_fund_label(name, isin) for name, isin in RECO_FUNDS_CORE]
+            anchor_lookup = {label: isin for label, (_, isin) in zip(anchor_options, RECO_FUNDS_CORE)}
             anchor_choice = st.selectbox("Fonds croissance imposé", anchor_options)
-            anchor_isin = anchor_choice.split("(")[-1].replace(")", "").strip()
+            anchor_isin = anchor_lookup.get(anchor_choice)
 
-        euro_rate = st.number_input("Taux fonds euros (%)", 0.0, 10.0, 2.0, 0.10)
-
+        euro_rate = 2.0
         growth_candidates = [isin for _, isin in RECO_FUNDS_CORE]
-        returns, warnings, status = _build_returns_matrix(tuple(growth_candidates), euro_rate, start, end)
-        for msg in warnings:
-            st.info(msg)
-
+        returns, warnings, status, sym_used_map = _build_returns_matrix(
+            tuple(growth_candidates),
+            euro_rate,
+            start,
+            end,
+         )
+        if warnings:
+            st.info("Certains fonds n'ont pas assez d'historique sur la fenêtre sélectionnée.")
+ 
+-    # Règle d’affectation
+-    st.header("Règle d’affectation des versements")
+-
+-    current_code = st.session_state.get("ALLOC_MODE", "equal")
+-    inv_labels = {v: k for k, v in ALLOC_LABELS.items()}
+-    current_label = inv_labels.get(current_code, "Répartition égale")
         valid_growth = [isin for isin in growth_candidates if status.get(isin) == "ok"]
         if growth_mode == "Auto — avec fonds imposé (anchor)" and anchor_isin not in valid_growth:
             st.warning("Le fonds imposé n'a pas assez d'historique sur la fenêtre. Sélection auto classique appliquée.")
             anchor_isin = None
-
+ 
+-    mode_label = st.selectbox(
+-        "Mode",
+-        list(ALLOC_LABELS.keys()),
+-        index=list(ALLOC_LABELS.keys()).index(current_label),
+-        help="Répartition des versements entre les lignes.",
+-    )
+        st.markdown("**Univers croissance**")
+        for name, isin in RECO_FUNDS_CORE:
+            st.caption(
+                f"- {_safe_fund_label(name, isin)} — "
+                f"{'✅ historique suffisant' if status.get(isin) == 'ok' else '⚠️ historique insuffisant'}"
+            )
+ 
+-    st.session_state["ALLOC_MODE"] = ALLOC_LABELS[mode_label]
         selected_growth = []
         if returns.empty or len(valid_growth) == 0:
             selected_growth = valid_growth[: int(k)]
@@ -1666,14 +1478,52 @@ def render_portfolio_builder():
             weights_growth = _apply_weight_caps(weights_growth, max_weight_pct / 100.0)
         else:
             weights_growth = {}
-
+ 
+-    st.divider()
+-    st.header("Mode d’analyse")
         st.markdown("### 6) Allocation finale (montants entiers)")
         budget_euro = total_budget * euro_pct / 100.0
         budget_secure = total_budget * secure_pct / 100.0
         budget_growth = total_budget * growth_pct / 100.0
-
+ 
+-    mode_ui = st.radio(
+-        "Choix",
+-        ["Comparer Client vs Valority", "Analyser uniquement Valority", "Analyser uniquement Client"],
+-        index=0,
+-        key="MODE_ANALYSE_UI",
+-    )
         euro_amount = int(round(budget_euro))
-
+ 
+-    if "Comparer" in mode_ui:
+-        st.session_state["MODE_ANALYSE"] = "compare"
+-    elif "Valority" in mode_ui:
+-        st.session_state["MODE_ANALYSE"] = "valority"
+-    else:
+-        st.session_state["MODE_ANALYSE"] = "client"
+-        
+-
+-# Onglets principaux : Client / Valority
+-tabs = st.tabs(["Portefeuille Client", "Portefeuille Valority"])
+-
+-with tabs[0]:
+-    subtabs = st.tabs(["Fonds recommandés", "Saisie libre"])
+-    with subtabs[0]:
+-        _add_from_reco_block("A_lines", "Ajouter un fonds recommandé (Client)")
+-    with subtabs[1]:
+-        _add_line_form_free("A_lines", "Portefeuille 1 — Client : saisie libre")
+-    st.markdown("#### Lignes actuelles — Portefeuille Client")
+-    for i, ln in enumerate(st.session_state.get("A_lines", [])):
+-        _line_card(ln, i, "A_lines")
+-
+-with tabs[1]:
+-    subtabs = st.tabs(["Fonds recommandés", "Saisie libre"])
+-    with subtabs[0]:
+-        _add_from_reco_block("B_lines", "Ajouter un fonds recommandé (Valority)")
+-    with subtabs[1]:
+-        _add_line_form_free("B_lines", "Portefeuille 2 — Valority : saisie libre")
+-    st.markdown("#### Lignes actuelles — Portefeuille Valority")
+-    for i, ln in enumerate(st.session_state.get("B_lines", [])):
+-        _line_card(ln, i, "B_lines")
         secure_amounts = {}
         if secure_isins:
             secure_weight = 1.0 / len(secure_isins)
@@ -1685,7 +1535,62 @@ def render_portfolio_builder():
             growth_amounts = _round_allocations(
                 {isin: budget_growth * w for isin, w in weights_growth.items()}
             )
-
+ 
+-# ------------------------------------------------------------
+-# Simulation (selon mode)
+-# ------------------------------------------------------------
+-mode = st.session_state.get("MODE_ANALYSE", "compare")
+-
+-single_target_A = id(st.session_state["A_lines"][0]) if st.session_state["A_lines"] else None
+-single_target_B = id(st.session_state["B_lines"][0]) if st.session_state["B_lines"] else None
+-
+-alloc_mode_code = st.session_state.get("ALLOC_MODE", "equal")
+-
+-custom_month_weights_A: Optional[Dict[int, float]] = None
+-custom_oneoff_weights_A: Optional[Dict[int, float]] = None
+-custom_month_weights_B: Optional[Dict[int, float]] = None
+-custom_oneoff_weights_B: Optional[Dict[int, float]] = None
+-
+-if alloc_mode_code == "custom":
+-    cmA = st.session_state.get("CUSTOM_M_A", {}) or {}
+-    coA = st.session_state.get("CUSTOM_O_A", {}) or {}
+-    tot_mA = sum(v for v in cmA.values() if v > 0)
+-    tot_oA = sum(v for v in coA.values() if v > 0)
+-    if tot_mA > 0:
+-        custom_month_weights_A = {k: v / tot_mA for k, v in cmA.items() if v > 0}
+-    if tot_oA > 0:
+-        custom_oneoff_weights_A = {k: v / tot_oA for k, v in coA.items() if v > 0}
+-
+-    cmB = st.session_state.get("CUSTOM_M_B", {}) or {}
+-    coB = st.session_state.get("CUSTOM_O_B", {}) or {}
+-    tot_mB = sum(v for v in cmB.values() if v > 0)
+-    tot_oB = sum(v for v in coB.values() if v > 0)
+-    if tot_mB > 0:
+-        custom_month_weights_B = {k: v / tot_mB for k, v in cmB.items() if v > 0}
+-    if tot_oB > 0:
+-        custom_oneoff_weights_B = {k: v / tot_oB for k, v in coB.items() if v > 0}
+-
+-# Reset warnings avant chaque run
+-st.session_state["DATE_WARNINGS"] = []
+-
+-# Valeurs par défaut (si on ne simule pas un des portefeuilles)
+-dfA, brutA, netA, valA, xirrA, startA_min, fullA = pd.DataFrame(), 0.0, 0.0, 0.0, None, TODAY, TODAY
+-dfB, brutB, netB, valB, xirrB, startB_min, fullB = pd.DataFrame(), 0.0, 0.0, 0.0, None, TODAY, TODAY
+-
+-if mode in ("compare", "client"):
+-    dfA, brutA, netA, valA, xirrA, startA_min, fullA = simulate_portfolio(
+-        st.session_state.get("A_lines", []),
+-        st.session_state.get("M_A", 0.0),
+-        st.session_state.get("ONE_A", 0.0),
+-        st.session_state.get("ONE_A_DATE", pd.Timestamp("2024-07-01").date()),
+-        alloc_mode_code,
+-        custom_month_weights_A,
+-        custom_oneoff_weights_A,
+-        single_target_A,
+-        st.session_state.get("EURO_RATE_A", 2.0),
+-        st.session_state.get("FEE_A", 0.0),
+-        portfolio_label="Client",
+-    )
         def _distribute_remainder(target: Dict[str, int], weights: Dict[str, float], delta: int) -> Dict[str, int]:
             if not target or delta == 0:
                 return target
@@ -1697,13 +1602,13 @@ def render_portfolio_builder():
             while delta != 0 and keys:
                 k = keys[idx % len(keys)]
                 if delta > 0:
-                    target[k] = target.get(k, 0) + 1
+                    target[k] = target.get(k, 0)  1
                     delta -= 1
                 else:
                     if target.get(k, 0) > 0:
                         target[k] -= 1
-                        delta += 1
-                idx += 1
+                        delta = 1
+                idx = 1
             return target
 
         rows = []
@@ -1711,7 +1616,7 @@ def render_portfolio_builder():
             rows.append(
                 {
                     "Poche": "Fonds euros",
-                    "Nom": "Fonds en euros (EUROFUND)",
+                    "Nom": _fund_name("EUROFUND"),
                     "ISIN": "EUROFUND",
                     "Poids poche %": 100.0,
                     "Poids global %": (euro_amount / total_budget * 100) if total_budget > 0 else 0.0,
@@ -1724,7 +1629,7 @@ def render_portfolio_builder():
             rows.append(
                 {
                     "Poche": "Sécuritaire",
-                    "Nom": isin,
+                    "Nom": _fund_name(isin),
                     "ISIN": isin,
                     "Poids poche %": (amt / budget_secure * 100) if budget_secure > 0 else 0.0,
                     "Poids global %": (amt / total_budget * 100) if total_budget > 0 else 0.0,
@@ -1737,7 +1642,7 @@ def render_portfolio_builder():
             rows.append(
                 {
                     "Poche": "Croissance",
-                    "Nom": isin,
+                    "Nom": _fund_name(isin),
                     "ISIN": isin,
                     "Poids poche %": (amt / budget_growth * 100) if budget_growth > 0 else 0.0,
                     "Poids global %": (amt / total_budget * 100) if total_budget > 0 else 0.0,
@@ -1745,7 +1650,21 @@ def render_portfolio_builder():
                     "Commentaire": "Actions / UC croissance",
                 }
             )
-
+ 
+-if mode in ("compare", "valority"):
+-    dfB, brutB, netB, valB, xirrB, startB_min, fullB = simulate_portfolio(
+-        st.session_state.get("B_lines", []),
+-        st.session_state.get("M_B", 0.0),
+-        st.session_state.get("ONE_B", 0.0),
+-        st.session_state.get("ONE_B_DATE", pd.Timestamp("2024-07-01").date()),
+-        alloc_mode_code,
+-        custom_month_weights_B,
+-        custom_oneoff_weights_B,
+-        single_target_B,
+-        st.session_state.get("EURO_RATE_B", 2.5),
+-        st.session_state.get("FEE_B", 0.0),
+-        portfolio_label="Valority",
+-    )
         df_export = pd.DataFrame(rows)
         allocated = df_export["Montant € (ENTIER)"].sum() if not df_export.empty else 0
         remainder = int(round(total_budget - allocated))
@@ -1756,14 +1675,21 @@ def render_portfolio_builder():
                 secure_weight_map = {isin: 1.0 for isin in secure_isins}
                 secure_amounts = _distribute_remainder(secure_amounts, secure_weight_map, remainder)
             else:
-                euro_amount = max(0, euro_amount + remainder)
-
+                euro_amount = max(0, euro_amount  remainder)
+ 
+-# ------------------------------------------------------------
+-# Avertissements sur les dates / 1ère VL
+-# ------------------------------------------------------------
+-if st.session_state.get("DATE_WARNINGS"):
+-    with st.expander("⚠️ Problèmes d'historique / dates de VL"):
+-        for msg in st.session_state["DATE_WARNINGS"]:
+-            st.warning(msg)
             rows = []
             if euro_amount > 0:
                 rows.append(
                     {
                         "Poche": "Fonds euros",
-                        "Nom": "Fonds en euros (EUROFUND)",
+                        "Nom": _fund_name("EUROFUND"),
                         "ISIN": "EUROFUND",
                         "Poids poche %": 100.0,
                         "Poids global %": (euro_amount / total_budget * 100) if total_budget > 0 else 0.0,
@@ -1776,7 +1702,7 @@ def render_portfolio_builder():
                 rows.append(
                     {
                         "Poche": "Sécuritaire",
-                        "Nom": isin,
+                        "Nom": _fund_name(isin),
                         "ISIN": isin,
                         "Poids poche %": (amt / budget_secure * 100) if budget_secure > 0 else 0.0,
                         "Poids global %": (amt / total_budget * 100) if total_budget > 0 else 0.0,
@@ -1789,7 +1715,7 @@ def render_portfolio_builder():
                 rows.append(
                     {
                         "Poche": "Croissance",
-                        "Nom": isin,
+                        "Nom": _fund_name(isin),
                         "ISIN": isin,
                         "Poids poche %": (amt / budget_growth * 100) if budget_growth > 0 else 0.0,
                         "Poids global %": (amt / total_budget * 100) if total_budget > 0 else 0.0,
@@ -1811,26 +1737,38 @@ def render_portfolio_builder():
         allocated = df_export["Montant € (ENTIER)"].sum() if not df_export.empty else 0
         remainder = int(round(total_budget - allocated))
         st.caption(f"Budget total : {to_eur(total_budget)} • Reste non alloué : {to_eur(remainder)}")
-
+ 
+-# ------------------------------------------------------------
+-# Graphique (évolution des portefeuilles)
+-# ------------------------------------------------------------
+-st.subheader("Évolution de la valeur des portefeuilles")
         st.download_button(
             "📥 Télécharger l’allocation (CSV)",
             data=df_export.to_csv(index=False).encode("utf-8"),
             file_name="allocation_portefeuille.csv",
             mime="text/csv",
         )
-
+ 
+-mode = st.session_state.get("MODE_ANALYSE", "compare")
         st.markdown("### 7) Analyses & visualisations")
         if returns.empty or not selected_growth:
             st.info("Données insuffisantes pour les analyses (corrélation/KPI).")
             return
-
+ 
+-# Déterminer le start_plot uniquement sur les portefeuilles affichés
+-full_dates: List[pd.Timestamp] = []
+-if mode in ("compare", "client") and isinstance(fullA, pd.Timestamp):
+-    full_dates.append(fullA)
+-if mode in ("compare", "valority") and isinstance(fullB, pd.Timestamp):
+-    full_dates.append(fullB)
         corr = returns[selected_growth].corr()
         avg_corr = (
             corr.values[np.triu_indices_from(corr, 1)].mean()
             if corr.shape[0] > 1
             else np.nan
         )
-
+ 
+-start_plot = max(full_dates) if full_dates else TODAY
         if weights_growth:
             w_vec = np.array([weights_growth[c] for c in corr.columns if c in weights_growth])
             sub = returns[[c for c in corr.columns if c in weights_growth]]
@@ -1841,7 +1779,9 @@ def render_portfolio_builder():
             port_ret = np.nan
             port_vol = np.nan
             dd = None
-
+ 
+-idx = pd.bdate_range(start=start_plot, end=TODAY, freq="B")
+-chart_df = pd.DataFrame(index=idx)
         kpi_cols = st.columns(4)
         with kpi_cols[0]:
             st.metric(
@@ -1863,14 +1803,18 @@ def render_portfolio_builder():
                 "Max drawdown",
                 fmt_pct_fr(dd * 100) if dd is not None else "—",
             )
-
+ 
+-if mode in ("compare", "client") and not dfA.empty:
+-    chart_df["Client"] = dfA.reindex(idx)["Valeur"].ffill()
         st.info(
             "Pourquoi cette sélection ?\n"
             "- Corrélations croisées minimisées\n"
             "- Diversification des trajectoires de VL\n"
             "- Limitation de la concentration"
         )
-
+ 
+-if mode in ("compare", "valority") and not dfB.empty:
+-    chart_df["Valority"] = dfB.reindex(idx)["Valeur"].ffill()
         viz_cols = st.columns(2)
         with viz_cols[0]:
             st.markdown("**Allocation globale**")
@@ -1932,14 +1876,17 @@ def render_portfolio_builder():
             st.caption("Corrélation proche de 1 = redondant • proche de 0 = décorrélé.")
         else:
             st.info("Corrélation indisponible (données insuffisantes).")
-
+ 
+-# Passage en format long pour Altair
+-chart_long = chart_df.reset_index().rename(columns={"index": "Date"})
+-chart_long = chart_long.melt("Date", var_name="variable", value_name="Valeur (€)")
         st.markdown("**Paires redondantes (> 0.80)**")
         if corr.empty or corr.shape[0] < 2:
             st.info("Aucune paire détectée (données insuffisantes).")
         else:
             pairs = []
             for i, a in enumerate(corr.columns):
-                for b in corr.columns[i + 1 :]:
+                for b in corr.columns[i  1 :]:
                     val = corr.loc[a, b]
                     if val > 0.8:
                         pairs.append({"Ligne 1": a, "Ligne 2": b, "Corrélation": float(val)})
@@ -1952,6 +1899,248 @@ def render_portfolio_builder():
                 )
             else:
                 st.success("Aucune paire redondante détectée.")
+ 
+-if chart_long.dropna().empty:
+-    st.info("Ajoutez des lignes et/ou vérifiez vos paramètres pour afficher le graphique.")
+-else:
+-    base = (
+-        alt.Chart(chart_long)
+-        .mark_line()
+-        .encode(
+-            x=alt.X("Date:T", title="Date"),
+-            y=alt.Y("Valeur (€):Q", title="Valeur (€)"),
+-            color=alt.Color("variable:N", title="Portefeuille"),
+-            tooltip=[
+-                alt.Tooltip("Date:T", title="Date"),
+-                alt.Tooltip("variable:N", title="Portefeuille"),
+-                alt.Tooltip("Valeur (€):Q", title="Valeur", format=",.2f"),
+-            ],
+-        )
+-        .properties(height=360, width="container")
+-    )
+-    st.altair_chart(base, use_container_width=True)
+        st.markdown("### 8) Analyse fondamentale (indicative)")
+        analyzable = [isin for isin in (selected_growth  secure_isins) if isin != "EUROFUND"]
+        if not analyzable:
+            st.info("Aucun fonds analysable (hors fonds euros).")
+            return
+ 
+-# ------------------------------------------------------------
+-# Synthèse chiffrée : cartes Client / Valority
+-# ------------------------------------------------------------
+-st.subheader("Synthèse chiffrée")
+        alloc_map = {}
+        if not df_export.empty and "ISIN" in df_export.columns:
+            alloc_map = {
+                str(row["ISIN"]): float(row["Montant € (ENTIER)"])
+                for _, row in df_export.iterrows()
+            }
+        total_alloc = sum(alloc_map.get(isin, 0.0) for isin in analyzable)
+ 
+-mode = st.session_state.get("MODE_ANALYSE", "compare")
+        chosen_labels = [_safe_fund_label(_fund_name(isin), isin) for isin in analyzable]
+        choice_lookup = {label: isin for label, isin in zip(chosen_labels, analyzable)}
+        chosen_label = st.selectbox("Fonds à analyser", chosen_labels)
+        isin_value = choice_lookup.get(chosen_label, "")
+ 
+-# Période analysée (uniquement sur ce qui est affiché)
+-period_dates: List[pd.Timestamp] = []
+-if mode in ("compare", "client") and isinstance(startA_min, pd.Timestamp):
+-    period_dates.append(startA_min)
+-if mode in ("compare", "valority") and isinstance(startB_min, pd.Timestamp):
+-    period_dates.append(startB_min)
+        sym_hint = sym_used_map.get(isin_value) if "sym_used_map" in locals() else None
+        fundamentals = _get_fundamentals_by_isin(isin_value, sym_hint=sym_hint)
+        if not fundamentals:
+            st.info("Données fondamentales indisponibles pour ce fonds.")
+            return
+ 
+-if period_dates:
+-    start_global = min(period_dates)
+-    st.caption(f"Période analysée : du **{fmt_date(start_global)}** au **{fmt_date(TODAY)}**")
+        def _top_df(data: Dict[str, float], label: str, n: int = 10) -> pd.DataFrame:
+            if not data:
+                return pd.DataFrame()
+            df = pd.DataFrame(
+                [{"Nom": k, label: v} for k, v in sorted(data.items(), key=lambda x: x[1], reverse=True)[:n]]
+            )
+            return df
+
+        def _aggregate_fundamentals(funds: List[Tuple[float, Dict[str, float]]]) -> Dict[str, float]:
+            if not funds:
+                return {}
+            total_weight = sum(w for w, _ in funds if w > 0)
+            if total_weight <= 0:
+                return {}
+            agg: Dict[str, float] = {}
+            for weight, data in funds:
+                for key, val in data.items():
+                    agg[key] = agg.get(key, 0.0)  (weight * float(val))
+            return {k: v / total_weight for k, v in agg.items()}
+
+        etf_data = fundamentals.get("ETF_Data", {})
+        asset_alloc = _extract_weights(etf_data.get("Asset_Allocation") or etf_data.get("asset_allocation"))
+        sectors = _extract_weights(etf_data.get("Sector_Weights") or etf_data.get("sector_weights"))
+        countries = _extract_weights(etf_data.get("Country_Weights") or etf_data.get("country_weights"))
+        holdings = _extract_weights(etf_data.get("Holdings") or etf_data.get("holdings"))
+
+        if not asset_alloc and not sectors and not countries and not holdings:
+            st.info("Données fondamentales incomplètes pour ce fonds.")
+            return
+ 
+-perf_tot_client = (valA / netA - 1.0) * 100.0 if netA > 0 else None
+-perf_tot_valority = (valB / netB - 1.0) * 100.0 if netB > 0 else None
+        portfolio_asset = []
+        portfolio_sector = []
+        portfolio_geo = []
+        portfolio_holdings = []
+        missing_funds = []
+
+        for isin in analyzable:
+            weight = alloc_map.get(isin, 0.0)
+            if weight <= 0 or total_alloc <= 0:
+                continue
+            sym_hint = sym_used_map.get(isin) if "sym_used_map" in locals() else None
+            data = _get_fundamentals_by_isin(isin, sym_hint=sym_hint)
+            if not data:
+                missing_funds.append(isin)
+                continue
+            etf = data.get("ETF_Data", {})
+            asset = _extract_weights(etf.get("Asset_Allocation") or etf.get("asset_allocation"))
+            sector = _extract_weights(etf.get("Sector_Weights") or etf.get("sector_weights"))
+            geo = _extract_weights(etf.get("Country_Weights") or etf.get("country_weights"))
+            hold = _extract_weights(etf.get("Holdings") or etf.get("holdings"))
+            if asset:
+                portfolio_asset.append((weight, asset))
+            if sector:
+                portfolio_sector.append((weight, sector))
+            if geo:
+                portfolio_geo.append((weight, geo))
+            if hold:
+                portfolio_holdings.append((weight, hold))
+
+        if missing_funds:
+            st.caption(
+                "Données fondamentales manquantes pour : "
+                 ", ".join([_fund_name(isin) for isin in missing_funds])
+            )
+ 
+-# ✅ 2 colonnes si compare, sinon 1 colonne (container)
+-if mode == "compare":
+-    col_client, col_valority = st.columns(2)
+-else:
+-    col_client = st.container()
+-    col_valority = st.container()
+        st.markdown("**Vue agrégée du portefeuille (pro-rata des montants)**")
+        agg_assets = _aggregate_fundamentals(portfolio_asset)
+        agg_sectors = _aggregate_fundamentals(portfolio_sector)
+        agg_countries = _aggregate_fundamentals(portfolio_geo)
+        agg_holdings = _aggregate_fundamentals(portfolio_holdings)
+
+        agg_cols = st.columns(2)
+        with agg_cols[0]:
+            st.markdown("**Allocation d’actifs (agrégée)**")
+            df_assets = _top_df(agg_assets, "Poids %")
+            if df_assets.empty:
+                st.info("Allocation d’actifs indisponible.")
+            else:
+                st.dataframe(
+                    df_assets.style.format({"Poids %": "{:,.2f}%".format}),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+        with agg_cols[1]:
+            st.markdown("**Secteurs (agrégés)**")
+            df_sectors = _top_df(agg_sectors, "Poids %")
+            if df_sectors.empty:
+                st.info("Secteurs indisponibles.")
+            else:
+                st.dataframe(
+                    df_sectors.style.format({"Poids %": "{:,.2f}%".format}),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+ 
+-# ----- Carte Client -----
+-if mode in ("compare", "client"):
+-    with col_client:
+-        with st.container(border=True):
+-            st.markdown("#### 🧍 Situation actuelle — Client")
+-            st.metric("Valeur actuelle", to_eur(valA))
+-            st.markdown(
+-                f"""
+        agg_cols = st.columns(2)
+        with agg_cols[0]:
+            st.markdown("**Géographie (agrégée)**")
+            df_countries = _top_df(agg_countries, "Poids %")
+            if df_countries.empty:
+                st.info("Répartition géographique indisponible.")
+            else:
+                st.dataframe(
+                    df_countries.style.format({"Poids %": "{:,.2f}%".format}),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+        with agg_cols[1]:
+            st.markdown("**Top holdings (agrégés)**")
+            df_holdings = _top_df(agg_holdings, "Poids %")
+            if df_holdings.empty:
+                st.info("Top holdings indisponibles.")
+            else:
+                st.dataframe(
+                    df_holdings.style.format({"Poids %": "{:,.2f}%".format}),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+        st.markdown("**Détail du fonds sélectionné**")
+        cols = st.columns(2)
+        with cols[0]:
+            st.markdown("**Allocation d’actifs**")
+            df_assets = _top_df(asset_alloc, "Poids %")
+            if df_assets.empty:
+                st.info("Allocation d’actifs indisponible.")
+            else:
+                st.dataframe(
+                    df_assets.style.format({"Poids %": "{:,.2f}%".format}),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+        with cols[1]:
+            st.markdown("**Secteurs**")
+            df_sectors = _top_df(sectors, "Poids %")
+            if df_sectors.empty:
+                st.info("Secteurs indisponibles.")
+            else:
+                st.dataframe(
+                    df_sectors.style.format({"Poids %": "{:,.2f}%".format}),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+        cols = st.columns(2)
+        with cols[0]:
+            st.markdown("**Géographie**")
+            df_countries = _top_df(countries, "Poids %")
+            if df_countries.empty:
+                st.info("Répartition géographique indisponible.")
+            else:
+                st.dataframe(
+                    df_countries.style.format({"Poids %": "{:,.2f}%".format}),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+        with cols[1]:
+            st.markdown("**Top holdings**")
+            df_holdings = _top_df(holdings, "Poids %")
+            if df_holdings.empty:
+                st.info("Top holdings indisponibles.")
+            else:
+                st.dataframe(
+                    df_holdings.style.format({"Poids %": "{:,.2f}%".format}),
+                    use_container_width=True,
+                    hide_index=True,
+                )
     except Exception as exc:
         st.error("Une erreur est survenue dans le builder. L’application reste utilisable.")
         st.exception(exc)
@@ -2351,24 +2540,40 @@ def render_app(run_page_config: bool = True):
                 st.metric("Valeur actuelle", to_eur(valA))
                 st.markdown(
                     f"""
-- Montants réellement investis (après frais) : **{to_eur(netA)}**
-- Montants versés (brut) : {to_eur(brutA)}
-- Rendement total depuis le début : **{perf_tot_client:.2f}%**
-"""
+ - Montants réellement investis (après frais) : **{to_eur(netA)}**
+ - Montants versés (brut) : {to_eur(brutA)}
+ - Rendement total depuis le début : **{perf_tot_client:.2f}%**
+ """
+-                if perf_tot_client is not None
+-                else f"""
                     if perf_tot_client is not None
                     else f"""
-- Montants réellement investis (après frais) : **{to_eur(netA)}**
-- Montants versés (brut) : {to_eur(brutA)}
-- Rendement total depuis le début : **—**
-"""
+ - Montants réellement investis (après frais) : **{to_eur(netA)}**
+ - Montants versés (brut) : {to_eur(brutA)}
+ - Rendement total depuis le début : **—**
+ """
+-            )
+-            st.markdown(
+-                f"- Rendement annualisé (XIRR) : **{xirrA:.2f}%**"
+-                if xirrA is not None
+-                else "- Rendement annualisé (XIRR) : **—**"
+-            )
                 )
                 st.markdown(
                     f"- Rendement annualisé (XIRR) : **{xirrA:.2f}%**"
                     if xirrA is not None
                     else "- Rendement annualisé (XIRR) : **—**"
                 )
-
-
+ 
+ 
+-# ----- Carte Valority -----
+-if mode in ("compare", "valority"):
+-    with col_valority:
+-        with st.container(border=True):
+-            st.markdown("#### 🏢 Simulation — Allocation Valority")
+-            st.metric("Valeur actuelle simulée", to_eur(valB))
+-            st.markdown(
+-                f"""
     # ----- Carte Valority -----
     if mode in ("compare", "valority"):
         with col_valority:
@@ -2377,24 +2582,42 @@ def render_app(run_page_config: bool = True):
                 st.metric("Valeur actuelle simulée", to_eur(valB))
                 st.markdown(
                     f"""
-- Montants réellement investis (après frais) : **{to_eur(netB)}**
-- Montants versés (brut) : {to_eur(brutB)}
-- Rendement total depuis le début : **{perf_tot_valority:.2f}%**
-"""
+ - Montants réellement investis (après frais) : **{to_eur(netB)}**
+ - Montants versés (brut) : {to_eur(brutB)}
+ - Rendement total depuis le début : **{perf_tot_valority:.2f}%**
+ """
+-                if perf_tot_valority is not None
+-                else f"""
                     if perf_tot_valority is not None
                     else f"""
-- Montants réellement investis (après frais) : **{to_eur(netB)}**
-- Montants versés (brut) : {to_eur(brutB)}
-- Rendement total depuis le début : **—**
-"""
+ - Montants réellement investis (après frais) : **{to_eur(netB)}**
+ - Montants versés (brut) : {to_eur(brutB)}
+ - Rendement total depuis le début : **—**
+ """
+-            )
+-            st.markdown(
+-                f"- Rendement annualisé (XIRR) : **{xirrB:.2f}%**"
+-                if xirrB is not None
+-                else "- Rendement annualisé (XIRR) : **—**"
+-            )
+-
                 )
                 st.markdown(
                     f"- Rendement annualisé (XIRR) : **{xirrB:.2f}%**"
                     if xirrB is not None
                     else "- Rendement annualisé (XIRR) : **—**"
                 )
-
-
+ 
+ 
+-def build_html_report(report: Dict[str, Any]) -> str:
+-    """
+-    Construit un rapport HTML exportable pour le client.
+-    Le contenu repose sur 'report', préparé plus bas dans le code.
+-    """
+-    as_of = report.get("as_of", "")
+-    synthA = report.get("client_summary", {})
+-    synthB = report.get("valority_summary", {})
+-    comp = report.get("comparison", {})
     def build_html_report(report: Dict[str, Any]) -> str:
         """
         Construit un rapport HTML exportable pour le client.
@@ -2404,138 +2627,119 @@ def render_app(run_page_config: bool = True):
         synthA = report.get("client_summary", {})
         synthB = report.get("valority_summary", {})
         comp = report.get("comparison", {})
-
+ 
+-    dfA_lines = report.get("df_client_lines")
+-    dfB_lines = report.get("df_valority_lines")
+-    dfA_val = report.get("dfA_val")
+-    dfB_val = report.get("dfB_val")
         dfA_lines = report.get("df_client_lines")
         dfB_lines = report.get("df_valority_lines")
         dfA_val = report.get("dfA_val")
         dfB_val = report.get("dfB_val")
-
+ 
+-    def _fmt_eur(x):
+-        try:
+-            return f"{x:,.2f} €".replace(",", " ").replace(".", ",")
+-        except Exception:
+-            return str(x)
         def _fmt_eur(x):
             try:
                 return f"{x:,.2f} €".replace(",", " ").replace(".", ",")
             except Exception:
                 return str(x)
-
+ 
+-    # Tables en HTML
+-    html_client_lines = dfA_lines.to_html(index=False, border=0, justify="left") if dfA_lines is not None else ""
+-    html_valority_lines = dfB_lines.to_html(index=False, border=0, justify="left") if dfB_lines is not None else ""
         # Tables en HTML
         html_client_lines = dfA_lines.to_html(index=False, border=0, justify="left") if dfA_lines is not None else ""
         html_valority_lines = dfB_lines.to_html(index=False, border=0, justify="left") if dfB_lines is not None else ""
-
+ 
+-    if dfA_val is not None:
+-        html_A_val = dfA_val.to_html(index=False, border=0, justify="left")
+-    else:
+-        html_A_val = ""
         if dfA_val is not None:
             html_A_val = dfA_val.to_html(index=False, border=0, justify="left")
         else:
             html_A_val = ""
-
+ 
+-    if dfB_val is not None:
+-        html_B_val = dfB_val.to_html(index=False, border=0, justify="left")
+-    else:
+-        html_B_val = ""
         if dfB_val is not None:
             html_B_val = dfB_val.to_html(index=False, border=0, justify="left")
         else:
             html_B_val = ""
-
+ 
+-    html = f"""
         html = f"""
-<!DOCTYPE html>
-<html lang="fr">
-<head>
-<meta charset="utf-8" />
-<title>Rapport de portefeuille</title>
-<style>
-body {{
-  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-  margin: 24px;
-  color: #222;
-}}
-h1, h2, h3 {{
-  margin-top: 24px;
-}}
-table {{
-  border-collapse: collapse;
-  width: 100%;
-  margin: 8px 0 16px 0;
-  font-size: 14px;
-}}
-th, td {{
-  border: 1px solid #ddd;
-  padding: 6px 8px;
-}}
-th {{
-  background-color: #f5f5f5;
-  text-align: left;
-}}
-.small {{
-  font-size: 12px;
-  color: #666;
-}}
-.block {{
-  border: 1px solid #eee;
-  border-radius: 8px;
-  padding: 12px 16px;
-  margin-bottom: 16px;
-  background-color: #fafafa;
-}}
-</style>
-</head>
-<body>
-
-<h1>Rapport de portefeuille</h1>
-<p class="small">Date de génération : {as_of}</p>
-
-<h2>1. Synthèse chiffrée</h2>
-
-<div class="block">
-  <h3>Situation actuelle — Client</h3>
-  <ul>
-    <li>Valeur actuelle : <b>{_fmt_eur(synthA.get("val", 0))}</b></li>
-    <li>Montants réellement investis (net) : {_fmt_eur(synthA.get("net", 0))}</li>
-    <li>Montants versés (brut) : {_fmt_eur(synthA.get("brut", 0))}</li>
-    <li>Rendement total depuis le début : <b>{synthA.get("perf_tot_pct", 0):.2f} %</b></li>
-    <li>Rendement annualisé (XIRR) : <b>{synthA.get("irr_pct", 0):.2f} %</b></li>
-  </ul>
-</div>
-
-<div class="block">
-  <h3>Simulation — Allocation Valority</h3>
-  <ul>
-    <li>Valeur actuelle simulée : <b>{_fmt_eur(synthB.get("val", 0))}</b></li>
-    <li>Montants réellement investis (net) : {_fmt_eur(synthB.get("net", 0))}</li>
-    <li>Montants versés (brut) : {_fmt_eur(synthB.get("brut", 0))}</li>
-    <li>Rendement total depuis le début : <b>{synthB.get("perf_tot_pct", 0):.2f} %</b></li>
-    <li>Rendement annualisé (XIRR) : <b>{synthB.get("irr_pct", 0):.2f} %</b></li>
-  </ul>
-</div>
-
-<div class="block">
-  <h3>Comparaison Client vs Valority</h3>
-  <ul>
-    <li>Différence de valeur finale : <b>{_fmt_eur(comp.get("delta_val", 0))}</b></li>
-    <li>Écart de performance totale (Valority – Client) :
-        <b>{comp.get("delta_perf_pct", 0):.2f} %</b></li>
-  </ul>
-</div>
-
-<h2>2. Détail des lignes</h2>
-
-<h3>Portefeuille Client</h3>
-{html_client_lines}
-
-<h3>Portefeuille Valority</h3>
-{html_valority_lines}
-
-<h2>3. Historique de la valeur des portefeuilles</h2>
-
-<h3>Client – Valeur du portefeuille par date</h3>
-{html_A_val}
-
-<h3>Valority – Valeur du portefeuille par date</h3>
-{html_B_val}
-
-<p class="small">
-Ce document est fourni à titre informatif uniquement et ne constitue pas un conseil en investissement
-personnalisé.
-</p>
-
-</body>
+ <!DOCTYPE html>
+ <html lang="fr">
+ <head>
+ <meta charset="utf-8" />
+ <title>Rapport de portefeuille</title>
+ <style>
+ body {{
+   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+   margin: 24px;
+   color: #222;
+ }}
+ h1, h2, h3 {{
+   margin-top: 24px;
+ }}
+ table {{
+   border-collapse: collapse;
+   width: 100%;
+   margin: 8px 0 16px 0;
+   font-size: 14px;
+ }}
+ th, td {{
+   border: 1px solid #ddd;
+   padding: 6px 8px;
+ }}
+ th {{
+@@ -1715,271 2789,1078 @@ th {{
+   </ul>
+ </div>
+ 
+ <h2>2. Détail des lignes</h2>
+ 
+ <h3>Portefeuille Client</h3>
+ {html_client_lines}
+ 
+ <h3>Portefeuille Valority</h3>
+ {html_valority_lines}
+ 
+ <h2>3. Historique de la valeur des portefeuilles</h2>
+ 
+ <h3>Client – Valeur du portefeuille par date</h3>
+ {html_A_val}
+ 
+ <h3>Valority – Valeur du portefeuille par date</h3>
+ {html_B_val}
+ 
+ <p class="small">
+ Ce document est fourni à titre informatif uniquement et ne constitue pas un conseil en investissement
+ personnalisé.
+ </p>
+ 
+ </body>
+-</html>
     </html>
-"""
+ """
+-    return html
         return html
-
+ 
+-    report_data = st.session_state.get("REPORT_DATA")
+-    if report_data is not None:
+-        html_report = build_html_report(report_data)
+-        st.download_button(
+-            "📄 Télécharger le rapport complet (HTML)",
+-            data=html_report.encode("utf-8"),
+-            file_name="rapport_portefeuille_valority.html",
+-            mime="text/html",
 
     def _add_table_to_story(
         story: List[Any],
@@ -2558,7 +2762,7 @@ personnalisé.
                 else:
                     formatted.append(str(val))
             fmt_rows.append(formatted)
-        data = [headers] + fmt_rows
+        data = [headers]  fmt_rows
         table = Table(data, repeatRows=1, colWidths=col_widths)
         style = [
             ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
@@ -2667,7 +2871,7 @@ personnalisé.
             startangle=90,
             labels=None,
             wedgeprops=dict(width=0.35, edgecolor="white"),
-        )
+         )
         labels = [
             f"{_wrap_label(nm)} ({pct:.1f}%)"
             for nm, pct in zip(df_alloc["Nom"], df_alloc["Part %"])
@@ -2697,11 +2901,11 @@ personnalisé.
             isin = str(ln.get("isin", "")).upper()
             val = float(ln.get("value", 0.0))
             if isin == "EUROFUND":
-                categories["Fonds euros"] += val
+                categories["Fonds euros"] = val
             elif isin == "STRUCTURED":
-                categories["Structurés"] += val
+                categories["Structurés"] = val
             else:
-                categories["UC"] += val
+                categories["UC"] = val
         total = sum(categories.values())
         if total <= 0:
             return None, "Répartition par enveloppe : —"
@@ -2721,7 +2925,7 @@ personnalisé.
         ax.set_xlabel("%")
         ax.set_title(title)
         for i, v in enumerate(values):
-            ax.text(min(v + 1, 98), i, f"{v:.1f}%", va="center", fontsize=8)
+            ax.text(min(v  1, 98), i, f"{v:.1f}%", va="center", fontsize=8)
         fig.tight_layout()
         return _fig_to_rl_image(fig, width=460, height=140), None
 
@@ -2734,7 +2938,7 @@ personnalisé.
             return None
         df["Contribution €"] = df["Valeur actuelle €"] - df["Net investi €"]
         df = df.sort_values("Contribution €", ascending=False)
-        fig_height = max(2.0, min(4.2, 0.35 * len(df) + 1.2))
+        fig_height = max(2.0, min(4.2, 0.35 * len(df)  1.2))
         fig, ax = plt.subplots(figsize=(6.2, fig_height))
         ax.barh(df["Nom"], df["Contribution €"], color="#2F6F9F")
         ax.invert_yaxis()
@@ -2743,7 +2947,7 @@ personnalisé.
         ax.tick_params(axis="y", labelsize=8)
         for i, v in enumerate(df["Contribution €"]):
             offset = 0.01 * abs(v) if v != 0 else 0.5
-            x_pos = v + offset if v >= 0 else v - offset
+            x_pos = v  offset if v >= 0 else v - offset
             ax.text(x_pos, i, fmt_eur_fr(v), va="center", fontsize=8)
         fig.tight_layout()
         return _fig_to_rl_image(fig, width=460, height=200)
@@ -2929,7 +3133,11 @@ personnalisé.
                     ("Valeur/an", fmt_eur_fr(fees.get("value_per_year", 0))),
                 ]
                 story.append(_kpi_table("Frais & valeur créée", fees_rows))
-
+ 
+-# ------------------------------------------------------------
+-# Bloc final : Comparaison OU "Frais & valeur créée"
+-# ------------------------------------------------------------
+-mode = st.session_state.get("MODE_ANALYSE", "compare")
         story.append(Spacer(1, 12))
         story.append(Paragraph("Graphiques", styles["h1"]))
 
@@ -3058,12 +3266,23 @@ personnalisé.
                 report.get("positions_df", pd.DataFrame()),
                 report.get("lines", []),
             )
-
+ 
+-def _years_between(d0: pd.Timestamp, d1: pd.Timestamp) -> float:
+-    return max(0.0, (d1 - d0).days / 365.25)
         doc.build(story, canvasmaker=NumberedCanvas)
         buffer.seek(0)
         return buffer.read()
-
-
+ 
+-# ============================
+-# CAS 1 — MODE COMPARAISON
+-# ============================
+-if mode == "compare":
+-    st.subheader("📌 Comparaison : Client vs Valority")
+ 
+-    gain_vs_client = (valB - valA) if (valA is not None and valB is not None) else 0.0
+-    delta_xirr = (xirrB - xirrA) if (xirrA is not None and xirrB is not None) else None
+-    perf_diff_tot = (
+-        (perf_tot_valority - perf_tot_client)
     def _years_between(d0: pd.Timestamp, d1: pd.Timestamp) -> float:
         return max(0.0, (d1 - d0).days / 365.25)
 
@@ -3100,7 +3319,8 @@ personnalisé.
     report_data["comparison"] = {
         "delta_val": (valB - valA) if (valA is not None and valB is not None) else 0.0,
         "delta_perf_pct": (perf_tot_valority - perf_tot_client)
-        if (perf_tot_client is not None and perf_tot_valority is not None)
+         if (perf_tot_client is not None and perf_tot_valority is not None)
+-        else None
         else 0.0,
     }
 
@@ -3165,10 +3385,29 @@ personnalisé.
     report_data["lines_valority"] = _build_lines_with_values(
         st.session_state.get("B_lines", []),
         df_valority_lines,
-    )
-
+     )
+ 
+-    with st.container(border=True):
+-        c1, c2, c3 = st.columns(3)
+-        with c1:
+-            st.metric("Gain en valeur", to_eur(gain_vs_client))
+-        with c2:
+-            st.metric(
+-                "Surperformance totale",
+-                f"{perf_diff_tot:.2f}%" if perf_diff_tot is not None else "—",
+-            )
+-        with c3:
+-            st.metric(
+-                "Surperformance annualisée (Δ XIRR)",
+-                f"{delta_xirr:.2f}%" if delta_xirr is not None else "—",
+-            )
     st.session_state["REPORT_DATA"] = report_data
-
+ 
+-        st.markdown(
+-            f"""
+-Aujourd’hui, avec votre allocation actuelle, votre portefeuille vaut **{to_eur(valA)}**.  
+-Avec l’allocation Valority, il serait autour de **{to_eur(valB)}**, soit environ **{to_eur(gain_vs_client)}** de plus.
+-"""
     if report_data is not None:
         html_report = build_html_report(report_data)
         st.download_button(
@@ -3176,7 +3415,7 @@ personnalisé.
             data=html_report.encode("utf-8"),
             file_name="rapport_portefeuille_valority.html",
             mime="text/html",
-        )
+         )
         pdf_bytes = None
         try:
             pdf_bytes = generate_pdf_report(report_data)
@@ -3190,12 +3429,47 @@ personnalisé.
                 file_name="rapport_portefeuille.pdf",
                 mime="application/pdf",
             )
-
+ 
+-# ============================
+-# CAS 2 — MODE ANALYSE SIMPLE
+-# ============================
+-else:
+-    # Sélection des variables selon le mode
+-    if mode == "valority":
+-        brut = brutB
+-        net = netB
+-        val = valB
+-        start_min = startB_min
+-        irr = xirrB
+-        fee_pct = st.session_state.get("FEE_B", 0.0)
+-        title = "🏢 Allocation Valority — Frais & valeur créée"
+-    else:  # mode == "client"
+-        brut = brutA
+-        net = netA
+-        val = valA
+-        start_min = startA_min
+-        irr = xirrA
+-        fee_pct = st.session_state.get("FEE_A", 0.0)
+-        title = "🧍 Portefeuille — Frais & valeur créée"
+-
+-    st.subheader("📌 Analyse : frais & valeur créée")
+-
+-    if brut > 0 and net >= 0 and val >= 0 and isinstance(start_min, pd.Timestamp):
+-        fees_paid = max(0.0, brut - net)     # frais d'entrée réellement payés
+-        value_created = val - net            # valeur créée vs capital réellement investi
+-        years = _years_between(start_min, TODAY)
+-        value_per_year = (value_created / years) if years > 0 else None
     # ------------------------------------------------------------
     # Bloc final : Comparaison OU "Frais & valeur créée"
     # ------------------------------------------------------------
     mode = st.session_state.get("MODE_ANALYSE", "compare")
-
+ 
+-        with st.container(border=True):
+-            st.markdown(f"#### {title}")
+-            st.caption(
+-                f"Période : **{fmt_date(start_min)} → {fmt_date(TODAY)}** "
+-                f"• Frais d’entrée : **{fee_pct:.2f}%**"
+-            )
     # ============================
     # CAS 1 — MODE COMPARAISON
     # ============================
@@ -3209,24 +3483,28 @@ personnalisé.
             if (perf_tot_client is not None and perf_tot_valority is not None)
             else None
         )
-
+ 
         with st.container(border=True):
-            c1, c2, c3 = st.columns(3)
-            with c1:
+             c1, c2, c3 = st.columns(3)
+             with c1:
+-                st.metric("Frais d’entrée payés", to_eur(fees_paid))
                 st.metric("Gain en valeur", to_eur(gain_vs_client))
-            with c2:
+             with c2:
+-                st.metric("Valeur créée (net)", to_eur(value_created))
                 st.metric(
                     "Surperformance totale",
-                    f"{perf_diff_tot:+.2f}%" if perf_diff_tot is not None else "—",
+                    f"{perf_diff_tot:.2f}%" if perf_diff_tot is not None else "—",
                 )
-            with c3:
-                st.metric(
+             with c3:
+                 st.metric(
+-                    "Valeur créée / an (moyenne)",
+-                    to_eur(value_per_year) if value_per_year is not None else "—",
                     "Surperformance annualisée (Δ XIRR)",
-                    f"{delta_xirr:+.2f}%" if delta_xirr is not None else "—",
-                )
-
-            st.markdown(
-                f"""
+                    f"{delta_xirr:.2f}%" if delta_xirr is not None else "—",
+                 )
+ 
+             st.markdown(
+                 f"""
 Aujourd’hui, avec votre allocation actuelle, votre portefeuille vaut **{to_eur(valA)}**.  
 Avec l’allocation Valority, il serait autour de **{to_eur(valB)}**, soit environ **{to_eur(gain_vs_client)}** de plus.
 """
@@ -3282,10 +3560,11 @@ Avec l’allocation Valority, il serait autour de **{to_eur(valB)}**, soit envir
 
                 st.markdown(
                     f"""
-- Montants versés (brut) : **{to_eur(brut)}**
-- Montants réellement investis (après frais) : **{to_eur(net)}**
-- Valeur actuelle : **{to_eur(val)}**
-"""
+ - Montants versés (brut) : **{to_eur(brut)}**
+ - Montants réellement investis (après frais) : **{to_eur(net)}**
+ - Valeur actuelle : **{to_eur(val)}**
+ """
+-            )
                 )
 
                 if irr is not None:
@@ -3368,7 +3647,9 @@ Avec l’allocation Valority, il serait autour de **{to_eur(valB)}**, soit envir
         if df_positions.empty:
             st.info("Aucune donnée pour le portefeuille Valority.")
             return
-
+ 
+-            if irr is not None:
+-                st.markdown(f"- Rendement annualisé (XIRR) : **{irr:.2f}%**")
         df = df_positions.copy()
         total_val = df["Valeur actuelle €"].sum()
         if total_val > 0:
@@ -3377,7 +3658,20 @@ Avec l’allocation Valority, il serait autour de **{to_eur(valB)}**, soit envir
             total_net = df["Net investi €"].sum()
             if total_net > 0:
                 df["Poids %"] = df["Net investi €"] / total_net * 100.0
-            else:
+             else:
+-                st.markdown("- Rendement annualisé (XIRR) : **—**")
+-
+-            # Message "vendeur" mais strictement factuel
+-            if fees_paid > 0:
+-                ratio = (value_created / fees_paid) if fees_paid > 0 else None
+-                if ratio is not None:
+-                    st.markdown(
+-                        f"**Lecture :** {to_eur(fees_paid)} de frais d’entrée ont été compensés par "
+-                        f"**{to_eur(value_created)}** de valeur nette créée à date "
+-                        f"(**×{ratio:.1f}**)."
+-                    )
+-    else:
+-        st.info("Ajoutez des lignes (et/ou des versements) pour afficher l’analyse frais & valeur créée.")
                 df["Poids %"] = 0.0
                 if len(df) > 0:
                     df.loc[df.index[0], "Poids %"] = 100.0
@@ -3426,7 +3720,7 @@ Avec l’allocation Valority, il serait autour de **{to_eur(valB)}**, soit envir
             plt.close(fig)
         else:
             st.info("Portefeuille concentré : 100% sur une seule ligne.")
-
+ 
         df_table = df[["Nom", "ISIN / Code", "Poids %", "Net investi €", "Valeur actuelle €"]]
         st.dataframe(
             df_table.style.format(
@@ -3439,23 +3733,42 @@ Avec l’allocation Valority, il serait autour de **{to_eur(valB)}**, soit envir
             hide_index=True,
             use_container_width=True,
         )
-
+ 
+-# ------------------------------------------------------------
+-# Tables positions
+-# ------------------------------------------------------------
+-positions_table("Portefeuille 1 — Client", "A_lines")
+-positions_table("Portefeuille 2 — Valority", "B_lines")
     _render_valority_composition_section()
-
+ 
+-with st.expander("Aide rapide"):
+-    st.markdown(
+-        """
     with st.expander("Aide rapide"):
         st.markdown(
             """
-- Dans chaque portefeuille, vous pouvez **soit** ajouter des *fonds recommandés* (onglet dédié),
-  **soit** utiliser la *saisie libre* avec ISIN / code.
-- Pour le **fonds en euros**, utilisez le symbole **EUROFUND** (taux paramétrable dans la barre de gauche).
-- Les frais d’entrée s’appliquent à chaque investissement.
-- Le **rendement total** est la performance globale depuis l’origine (valeur actuelle / net investi).
-- Le **rendement annualisé** utilise le XIRR (prise en compte des dates et montants).
-- En mode **Personnalisé**, vous pouvez affecter précisément les versements mensuels et ponctuels à chaque ligne,
-  avec un contrôle automatique de cohérence par rapport aux montants bruts saisis.
+ - Dans chaque portefeuille, vous pouvez **soit** ajouter des *fonds recommandés* (onglet dédié),
+   **soit** utiliser la *saisie libre* avec ISIN / code.
+ - Pour le **fonds en euros**, utilisez le symbole **EUROFUND** (taux paramétrable dans la barre de gauche).
+ - Les frais d’entrée s’appliquent à chaque investissement.
+ - Le **rendement total** est la performance globale depuis l’origine (valeur actuelle / net investi).
+ - Le **rendement annualisé** utilise le XIRR (prise en compte des dates et montants).
+ - En mode **Personnalisé**, vous pouvez affecter précisément les versements mensuels et ponctuels à chaque ligne,
+   avec un contrôle automatique de cohérence par rapport aux montants bruts saisis.
+-        """
+-    )
             """
         )
-
+ 
+-# ------------------------------------------------------------
+-# Analyse interne — Corrélation & volatilité (réservé conseiller)
+-# ------------------------------------------------------------
+-st.markdown("---")
+-with st.expander("🔒 Analyse interne — Corrélation, volatilité et profil de risque", expanded=False):
+-    st.caption(
+-        "Section réservée au conseiller : analyse technique basée sur les valeurs liquidatives "
+-        "(corrélations, volatilités, drawdown)."
+-    )
     # ------------------------------------------------------------
     # Analyse interne — Corrélation & volatilité (réservé conseiller)
     # ------------------------------------------------------------
@@ -3465,17 +3778,39 @@ Avec l’allocation Valority, il serait autour de **{to_eur(valB)}**, soit envir
             "Section réservée au conseiller : analyse technique basée sur les valeurs liquidatives "
             "(corrélations, volatilités, drawdown)."
         )
-
+ 
+-    euro_rate = st.session_state.get("EURO_RATE_PREVIEW", 2.0)
+-    linesA = st.session_state.get("A_lines", [])
+-    linesB = st.session_state.get("B_lines", [])
         euro_rate = st.session_state.get("EURO_RATE_PREVIEW", 2.0)
         linesA = st.session_state.get("A_lines", [])
         linesB = st.session_state.get("B_lines", [])
-
+ 
+-    # Portefeuille Client
+-    st.markdown("### Portefeuille 1 — Client")
+-    corrA = correlation_matrix_from_lines(linesA, euro_rate)
+-    volA = volatility_table_from_lines(linesA, euro_rate)
+-    riskA = portfolio_risk_stats(linesA, euro_rate)
         # Portefeuille Client
         st.markdown("### Portefeuille 1 — Client")
         corrA = correlation_matrix_from_lines(linesA, euro_rate)
         volA = volatility_table_from_lines(linesA, euro_rate)
         riskA = portfolio_risk_stats(linesA, euro_rate)
-
+ 
+-    if corrA.empty and volA.empty:
+-        st.info("Pas assez d'historique ou de lignes pour analyser ce portefeuille.")
+-    else:
+-        if riskA is not None:
+-            c1, c2 = st.columns(2)
+-            with c1:
+-                st.metric(
+-                    "Volatilité annuelle estimée",
+-                    f"{riskA['vol_ann_pct']:.2f} %",
+-                )
+-            with c2:
+-                st.metric(
+-                    "Max drawdown (historique sur la période)",
+-                    f"{riskA['max_dd_pct']:.2f} %",
         if corrA.empty and volA.empty:
             st.info("Pas assez d'historique ou de lignes pour analyser ce portefeuille.")
         else:
@@ -3502,21 +3837,42 @@ Avec l’allocation Valority, il serait autour de **{to_eur(valB)}**, soit envir
                         }
                     ),
                     use_container_width=True,
-                )
-
+                 )
+ 
+-        if not volA.empty:
+-            st.markdown("**Volatilité par ligne**")
+-            st.dataframe(
+-                volA.style.format(
+-                    {
+-                        "Écart-type quotidien %": "{:,.2f}%".format,
+-                        "Volatilité annuelle %": "{:,.2f}%".format,
+-                    }
+-                ),
+-                use_container_width=True,
+-            )
             if not corrA.empty:
                 chartA = _corr_heatmap_chart(corrA, "Corrélation des lignes — Portefeuille Client")
                 if chartA is not None:
                     st.altair_chart(chartA, use_container_width=True)
-
+ 
+-        if not corrA.empty:
+-            chartA = _corr_heatmap_chart(corrA, "Corrélation des lignes — Portefeuille Client")
+-            if chartA is not None:
+-                st.altair_chart(chartA, use_container_width=True)
         st.markdown("---")
-
+ 
+-    st.markdown("---")
         # Portefeuille Valority
         st.markdown("### Portefeuille 2 — Valority")
         corrB = correlation_matrix_from_lines(linesB, euro_rate)
         volB = volatility_table_from_lines(linesB, euro_rate)
         riskB = portfolio_risk_stats(linesB, euro_rate)
-
+ 
+-    # Portefeuille Valority
+-    st.markdown("### Portefeuille 2 — Valority")
+-    corrB = correlation_matrix_from_lines(linesB, euro_rate)
+-    volB = volatility_table_from_lines(linesB, euro_rate)
+-    riskB = portfolio_risk_stats(linesB, euro_rate)
         if corrB.empty and volB.empty:
             st.info("Pas assez d'historique ou de lignes pour analyser ce portefeuille.")
         else:
@@ -3532,7 +3888,21 @@ Avec l’allocation Valority, il serait autour de **{to_eur(valB)}**, soit envir
                         "Max drawdown (historique sur la période)",
                         f"{riskB['max_dd_pct']:.2f} %",
                     )
-
+ 
+-    if corrB.empty and volB.empty:
+-        st.info("Pas assez d'historique ou de lignes pour analyser ce portefeuille.")
+-    else:
+-        if riskB is not None:
+-            c1, c2 = st.columns(2)
+-            with c1:
+-                st.metric(
+-                    "Volatilité annuelle estimée",
+-                    f"{riskB['vol_ann_pct']:.2f} %",
+-                )
+-            with c2:
+-                st.metric(
+-                    "Max drawdown (historique sur la période)",
+-                    f"{riskB['max_dd_pct']:.2f} %",
             if not volB.empty:
                 st.markdown("**Volatilité par ligne**")
                 st.dataframe(
@@ -3543,15 +3913,31 @@ Avec l’allocation Valority, il serait autour de **{to_eur(valB)}**, soit envir
                         }
                     ),
                     use_container_width=True,
-                )
-
+                 )
+ 
+-        if not volB.empty:
+-            st.markdown("**Volatilité par ligne**")
+-            st.dataframe(
+-                volB.style.format(
+-                    {
+-                        "Écart-type quotidien %": "{:,.2f}%".format,
+-                        "Volatilité annuelle %": "{:,.2f}%".format,
+-                    }
+-                ),
+-                use_container_width=True,
+-            )
             if not corrB.empty:
                 chartB = _corr_heatmap_chart(corrB, "Corrélation des lignes — Portefeuille Valority")
                 if chartB is not None:
                     st.altair_chart(chartB, use_container_width=True)
 
 
-
+ 
+-        if not corrB.empty:
+-            chartB = _corr_heatmap_chart(corrB, "Corrélation des lignes — Portefeuille Valority")
+-            if chartB is not None:
+-                st.altair_chart(chartB, use_container_width=True)
+-            
 def render_mode_router():
     st.set_page_config(page_title=APP_TITLE, layout="wide")
     mode = st.radio(
@@ -3585,3 +3971,6 @@ Conseils :
 
 
 _render_with_crash_shield()
+ 
+EOF
+)

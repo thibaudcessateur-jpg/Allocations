@@ -1,27 +1,28 @@
-# FIX BLANK SCREEN: crash shield global, imports sécurisés, debug sidebar, PDF/graphes safe
 from __future__ import annotations
 
 import json
 import sys
+import textwrap
+import importlib.util
 from datetime import date
 from io import BytesIO
 from typing import Any, Dict, List, Optional, Tuple
 
-try:
+if importlib.util.find_spec("matplotlib") is not None:
     import matplotlib.pyplot as plt
     MATPLOTLIB_AVAILABLE = True
     MATPLOTLIB_ERROR = ""
-except Exception as e:
+else:
     plt = None
     MATPLOTLIB_AVAILABLE = False
-    MATPLOTLIB_ERROR = str(e)
+    MATPLOTLIB_ERROR = "matplotlib non installé"
 import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
 import altair as alt
-try:
-    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image, Table, TableStyle
+if importlib.util.find_spec("reportlab") is not None:
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image, Table, TableStyle, PageBreak
     from reportlab.lib.pagesizes import A4
     from reportlab.lib.styles import getSampleStyleSheet
     from reportlab.lib import colors
@@ -29,15 +30,15 @@ try:
     from reportlab.pdfgen import canvas
     REPORTLAB_AVAILABLE = True
     REPORTLAB_ERROR = ""
-except Exception as e:
-    SimpleDocTemplate = Paragraph = Spacer = Image = Table = TableStyle = None
+else:
+    SimpleDocTemplate = Paragraph = Spacer = Image = Table = TableStyle = PageBreak = None
     A4 = None
     getSampleStyleSheet = None
     colors = None
     ParagraphStyle = None
     canvas = None
     REPORTLAB_AVAILABLE = False
-    REPORTLAB_ERROR = str(e)
+    REPORTLAB_ERROR = "reportlab non installé"
 
 # ------------------------------------------------------------
 # Constantes & univers de fonds recommandés
@@ -74,6 +75,7 @@ ALLOC_LABELS = {
 # ------------------------------------------------------------
 # Utils format
 # ------------------------------------------------------------
+
 def to_eur(x: Any) -> str:
     try:
         v = float(x)
@@ -111,6 +113,7 @@ def fmt_pct_fr(x: Any) -> str:
 # ------------------------------------------------------------
 # XIRR
 # ------------------------------------------------------------
+
 def _npv(rate: float, cfs: List[Tuple[pd.Timestamp, float]]) -> float:
     t0 = cfs[0][0]
     return sum(cf / ((1 + rate) ** ((t - t0).days / 365.25)) for t, cf in cfs)
@@ -142,6 +145,7 @@ def xirr(cash_flows: List[Tuple[pd.Timestamp, float]], guess: float = 0.1) -> Op
 # ------------------------------------------------------------
 # API EODHD
 # ------------------------------------------------------------
+
 def _get_api_key() -> str:
     return st.secrets.get("EODHD_API_KEY", "")
 
@@ -294,6 +298,7 @@ def get_price_series(
 
     return pd.DataFrame(), "", json.dumps(debug)
 
+
 @st.cache_data(show_spinner=False, ttl=3600)
 def structured_series(
     start: pd.Timestamp,
@@ -343,6 +348,7 @@ def structured_series(
 # ------------------------------------------------------------
 # Alternatives si date < 1ère VL
 # ------------------------------------------------------------
+
 def suggest_alternative_funds(buy_date: pd.Timestamp, euro_rate: float) -> List[Tuple[str, str, pd.Timestamp]]:
     """
     Propose des fonds recommandés (core + défensifs) dont la première VL
@@ -361,6 +367,8 @@ def suggest_alternative_funds(buy_date: pd.Timestamp, euro_rate: float) -> List[
             alternatives.append((name, isin, inception))
 
     return alternatives
+
+
 def correlation_matrix_from_lines(
     lines: List[Dict[str, Any]],
     euro_rate: float,
@@ -412,6 +420,7 @@ def correlation_matrix_from_lines(
 # ------------------------------------------------------------
 # Calendrier versements & poids
 # ------------------------------------------------------------
+
 def _month_schedule(d0: pd.Timestamp, d1: pd.Timestamp) -> List[pd.Timestamp]:
     if d0 > d1:
         return []
@@ -454,6 +463,7 @@ def _weights_for(
 # ------------------------------------------------------------
 # Calcul par ligne (avec frais)
 # ------------------------------------------------------------
+
 def compute_line_metrics(
     line: Dict[str, Any], fee_pct: float, euro_rate: float
 ) -> Tuple[float, float, float]:
@@ -482,6 +492,7 @@ def compute_line_metrics(
 # Simulation d'un portefeuille (avec contrôle 1ère VL)
 # + distinction poids mensuels / ponctuels
 # ------------------------------------------------------------
+
 def simulate_portfolio(
     lines: List[Dict[str, Any]],
     monthly_amt_gross: float,
@@ -683,6 +694,7 @@ def simulate_portfolio(
 # ------------------------------------------------------------
 # Cartes lignes (édition / suppression)
 # ------------------------------------------------------------
+
 def _line_card(line: Dict[str, Any], idx: int, port_key: str):
     state_key = f"edit_mode_{port_key}_{idx}"
     if state_key not in st.session_state:
@@ -761,6 +773,7 @@ def _line_card(line: Dict[str, Any], idx: int, port_key: str):
                     st.session_state[state_key] = False
                     st.success("Ligne mise à jour.")
                     st.experimental_rerun()
+
 
 def portfolio_summary_dataframe(port_key: str) -> pd.DataFrame:
     """
@@ -848,9 +861,11 @@ def build_positions_dataframe(port_key: str) -> pd.DataFrame:
         )
 
     return pd.DataFrame(rows)
+
 # ------------------------------------------------------------
 # Tableau synthétique par ligne (un seul tableau par portefeuille)
 # ------------------------------------------------------------
+
 def positions_table(title: str, port_key: str):
     """
     Affiche un seul tableau synthétique par portefeuille :
@@ -1164,6 +1179,7 @@ def _corr_heatmap_chart(corr: pd.DataFrame, title: str) -> Optional[alt.Chart]:
 # ------------------------------------------------------------
 # Blocs de saisie : soit fonds recommandés, soit saisie libre
 # ------------------------------------------------------------
+
 def _add_from_reco_block(port_key: str, label: str):
     st.subheader(label)
 
@@ -1280,6 +1296,7 @@ def _add_from_reco_block(port_key: str, label: str):
         st.session_state[port_key].append(ln)
         st.success("Fonds recommandé ajouté.")
 
+
 def _add_line_form_free(port_key: str, label: str):
     st.subheader(label)
 
@@ -1353,6 +1370,7 @@ def _add_line_form_free(port_key: str, label: str):
     st.session_state[port_key].append(ln)
     st.success("Ligne ajoutée.")
 
+
 def render_app():
     # ------------------------------------------------------------
     # Layout principal
@@ -1377,14 +1395,14 @@ def render_app():
     st.session_state.setdefault("INIT_B_DATE", pd.Timestamp("2024-01-02").date())
     st.session_state.setdefault("EURO_RATE_A", 2.0)
     st.session_state.setdefault("EURO_RATE_B", 2.5)
-    
+
     # -------------------------------------------------------------------
     # Sidebar : paramètres globaux
     # -------------------------------------------------------------------
     with st.sidebar:
         # Fonds en euros — Taux annuel (par portefeuille)
         st.header("Fonds en euros — Taux annuel")
-    
+
         EURO_RATE_A = st.number_input(
             "Portefeuille 1 (Client) — taux annuel (%)",
             0.0,
@@ -1393,7 +1411,7 @@ def render_app():
             0.10,
             key="EURO_RATE_A",
         )
-    
+
         EURO_RATE_B = st.number_input(
             "Portefeuille 2 (Valority) — taux annuel (%)",
             0.0,
@@ -1402,16 +1420,16 @@ def render_app():
             0.10,
             key="EURO_RATE_B",
         )
-    
+
         st.caption(
             "Le taux est appliqué annuellement sur la part investie en fonds euros (EUROFUND), "
             f"net des frais UC : {ANNUAL_FEE_EURO_PCT:.1f}%/an pour le fonds euros "
             f"et {ANNUAL_FEE_UC_PCT:.1f}%/an pour les unités de compte."
         )
-    
+
         # Frais d’entrée
         st.header("Frais d’entrée (%)")
-    
+
         FEE_A = st.number_input(
             "Frais d’entrée — Portefeuille 1 (Client)",
             0.0,
@@ -1420,7 +1438,7 @@ def render_app():
             0.10,
             key="FEE_A",
         )
-    
+
         FEE_B = st.number_input(
             "Frais d’entrée — Portefeuille 2 (Valority)",
             0.0,
@@ -1429,27 +1447,27 @@ def render_app():
             0.10,
             key="FEE_B",
         )
-    
+
         st.caption("Les frais s’appliquent sur chaque investissement (initial, mensuel, ponctuel).")
-    
+
         # Date du versement initial (centralisée)
         st.header("Date du versement initial")
-    
+
         st.date_input(
             "Portefeuille 1 (Client) — date d’investissement initiale",
             value=st.session_state.get("INIT_A_DATE", pd.Timestamp("2024-01-02").date()),
             key="INIT_A_DATE",
         )
-    
+
         st.date_input(
             "Portefeuille 2 (Valority) — date d’investissement initiale",
             value=st.session_state.get("INIT_B_DATE", pd.Timestamp("2024-01-02").date()),
             key="INIT_B_DATE",
         )
-    
+
         # Paramètres de versement
         st.header("Paramètres de versement")
-    
+
         with st.expander("Portefeuille 1 — Client"):
             M_A = st.number_input(
                 "Mensuel brut (€)",
@@ -1472,7 +1490,7 @@ def render_app():
                 value=st.session_state.get("ONE_A_DATE", pd.Timestamp("2024-07-01").date()),
                 key="ONE_A_DATE",
             )
-    
+
         with st.expander("Portefeuille 2 — Valority"):
             M_B = st.number_input(
                 "Mensuel brut (€)",
@@ -1495,40 +1513,40 @@ def render_app():
                 value=st.session_state.get("ONE_B_DATE", pd.Timestamp("2024-07-01").date()),
                 key="ONE_B_DATE",
             )
-    
+
         # Règle d’affectation
         st.header("Règle d’affectation des versements")
-    
+
         current_code = st.session_state.get("ALLOC_MODE", "equal")
         inv_labels = {v: k for k, v in ALLOC_LABELS.items()}
         current_label = inv_labels.get(current_code, "Répartition égale")
-    
+
         mode_label = st.selectbox(
             "Mode",
             list(ALLOC_LABELS.keys()),
             index=list(ALLOC_LABELS.keys()).index(current_label),
             help="Répartition des versements entre les lignes.",
         )
-    
+
         st.session_state["ALLOC_MODE"] = ALLOC_LABELS[mode_label]
-    
+
         st.divider()
         st.header("Mode d’analyse")
-    
+
         mode_ui = st.radio(
             "Choix",
             ["Comparer Client vs Valority", "Analyser uniquement Valority", "Analyser uniquement Client"],
             index=0,
             key="MODE_ANALYSE_UI",
         )
-    
+
         if "Comparer" in mode_ui:
             st.session_state["MODE_ANALYSE"] = "compare"
         elif "Valority" in mode_ui:
             st.session_state["MODE_ANALYSE"] = "valority"
         else:
             st.session_state["MODE_ANALYSE"] = "client"
-    
+
         st.divider()
         debug_mode = st.checkbox("Mode debug", value=False)
         if debug_mode:
@@ -1557,11 +1575,11 @@ def render_app():
                     st.write(f"Erreur EODHD: {e}")
             else:
                 st.write("Token EODHD absent")
-            
-    
+
+
     # Onglets principaux : Client / Valority
     tabs = st.tabs(["Portefeuille Client", "Portefeuille Valority"])
-    
+
     with tabs[0]:
         subtabs = st.tabs(["Fonds recommandés", "Saisie libre"])
         with subtabs[0]:
@@ -1571,7 +1589,7 @@ def render_app():
         st.markdown("#### Lignes actuelles — Portefeuille Client")
         for i, ln in enumerate(st.session_state.get("A_lines", [])):
             _line_card(ln, i, "A_lines")
-    
+
     with tabs[1]:
         subtabs = st.tabs(["Fonds recommandés", "Saisie libre"])
         with subtabs[0]:
@@ -1581,22 +1599,22 @@ def render_app():
         st.markdown("#### Lignes actuelles — Portefeuille Valority")
         for i, ln in enumerate(st.session_state.get("B_lines", [])):
             _line_card(ln, i, "B_lines")
-    
+
     # ------------------------------------------------------------
     # Simulation (selon mode)
     # ------------------------------------------------------------
     mode = st.session_state.get("MODE_ANALYSE", "compare")
-    
+
     single_target_A = id(st.session_state["A_lines"][0]) if st.session_state["A_lines"] else None
     single_target_B = id(st.session_state["B_lines"][0]) if st.session_state["B_lines"] else None
-    
+
     alloc_mode_code = st.session_state.get("ALLOC_MODE", "equal")
-    
+
     custom_month_weights_A: Optional[Dict[int, float]] = None
     custom_oneoff_weights_A: Optional[Dict[int, float]] = None
     custom_month_weights_B: Optional[Dict[int, float]] = None
     custom_oneoff_weights_B: Optional[Dict[int, float]] = None
-    
+
     if alloc_mode_code == "custom":
         cmA = st.session_state.get("CUSTOM_M_A", {}) or {}
         coA = st.session_state.get("CUSTOM_O_A", {}) or {}
@@ -1606,7 +1624,7 @@ def render_app():
             custom_month_weights_A = {k: v / tot_mA for k, v in cmA.items() if v > 0}
         if tot_oA > 0:
             custom_oneoff_weights_A = {k: v / tot_oA for k, v in coA.items() if v > 0}
-    
+
         cmB = st.session_state.get("CUSTOM_M_B", {}) or {}
         coB = st.session_state.get("CUSTOM_O_B", {}) or {}
         tot_mB = sum(v for v in cmB.values() if v > 0)
@@ -1615,14 +1633,14 @@ def render_app():
             custom_month_weights_B = {k: v / tot_mB for k, v in cmB.items() if v > 0}
         if tot_oB > 0:
             custom_oneoff_weights_B = {k: v / tot_oB for k, v in coB.items() if v > 0}
-    
+
     # Reset warnings avant chaque run
     st.session_state["DATE_WARNINGS"] = []
-    
+
     # Valeurs par défaut (si on ne simule pas un des portefeuilles)
     dfA, brutA, netA, valA, xirrA, startA_min, fullA = pd.DataFrame(), 0.0, 0.0, 0.0, None, TODAY, TODAY
     dfB, brutB, netB, valB, xirrB, startB_min, fullB = pd.DataFrame(), 0.0, 0.0, 0.0, None, TODAY, TODAY
-    
+
     if mode in ("compare", "client"):
         dfA, brutA, netA, valA, xirrA, startA_min, fullA = simulate_portfolio(
             st.session_state.get("A_lines", []),
@@ -1637,7 +1655,7 @@ def render_app():
             st.session_state.get("FEE_A", 0.0),
             portfolio_label="Client",
         )
-    
+
     if mode in ("compare", "valority"):
         dfB, brutB, netB, valB, xirrB, startB_min, fullB = simulate_portfolio(
             st.session_state.get("B_lines", []),
@@ -1652,7 +1670,7 @@ def render_app():
             st.session_state.get("FEE_B", 0.0),
             portfolio_label="Valority",
         )
-    
+
     # ------------------------------------------------------------
     # Avertissements sur les dates / 1ère VL
     # ------------------------------------------------------------
@@ -1660,36 +1678,36 @@ def render_app():
         with st.expander("⚠️ Problèmes d'historique / dates de VL"):
             for msg in st.session_state["DATE_WARNINGS"]:
                 st.warning(msg)
-    
+
     # ------------------------------------------------------------
     # Graphique (évolution des portefeuilles)
     # ------------------------------------------------------------
     st.subheader("Évolution de la valeur des portefeuilles")
-    
+
     mode = st.session_state.get("MODE_ANALYSE", "compare")
-    
+
     # Déterminer le start_plot uniquement sur les portefeuilles affichés
     full_dates: List[pd.Timestamp] = []
     if mode in ("compare", "client") and isinstance(fullA, pd.Timestamp):
         full_dates.append(fullA)
     if mode in ("compare", "valority") and isinstance(fullB, pd.Timestamp):
         full_dates.append(fullB)
-    
+
     start_plot = max(full_dates) if full_dates else TODAY
-    
+
     idx = pd.bdate_range(start=start_plot, end=TODAY, freq="B")
     chart_df = pd.DataFrame(index=idx)
-    
+
     if mode in ("compare", "client") and not dfA.empty:
         chart_df["Client"] = dfA.reindex(idx)["Valeur"].ffill()
-    
+
     if mode in ("compare", "valority") and not dfB.empty:
         chart_df["Valority"] = dfB.reindex(idx)["Valeur"].ffill()
-    
+
     # Passage en format long pour Altair
     chart_long = chart_df.reset_index().rename(columns={"index": "Date"})
     chart_long = chart_long.melt("Date", var_name="variable", value_name="Valeur (€)")
-    
+
     if chart_long.dropna().empty:
         st.info("Ajoutez des lignes et/ou vérifiez vos paramètres pour afficher le graphique.")
     else:
@@ -1709,35 +1727,35 @@ def render_app():
             .properties(height=360, width="container")
         )
         st.altair_chart(base, use_container_width=True)
-    
+
     # ------------------------------------------------------------
     # Synthèse chiffrée : cartes Client / Valority
     # ------------------------------------------------------------
     st.subheader("Synthèse chiffrée")
-    
+
     mode = st.session_state.get("MODE_ANALYSE", "compare")
-    
+
     # Période analysée (uniquement sur ce qui est affiché)
     period_dates: List[pd.Timestamp] = []
     if mode in ("compare", "client") and isinstance(startA_min, pd.Timestamp):
         period_dates.append(startA_min)
     if mode in ("compare", "valority") and isinstance(startB_min, pd.Timestamp):
         period_dates.append(startB_min)
-    
+
     if period_dates:
         start_global = min(period_dates)
         st.caption(f"Période analysée : du **{fmt_date(start_global)}** au **{fmt_date(TODAY)}**")
-    
+
     perf_tot_client = (valA / netA - 1.0) * 100.0 if netA > 0 else None
     perf_tot_valority = (valB / netB - 1.0) * 100.0 if netB > 0 else None
-    
+
     # ✅ 2 colonnes si compare, sinon 1 colonne (container)
     if mode == "compare":
         col_client, col_valority = st.columns(2)
     else:
         col_client = st.container()
         col_valority = st.container()
-    
+
     # ----- Carte Client -----
     if mode in ("compare", "client"):
         with col_client:
@@ -1746,24 +1764,24 @@ def render_app():
                 st.metric("Valeur actuelle", to_eur(valA))
                 st.markdown(
                     f"""
-    - Montants réellement investis (après frais) : **{to_eur(netA)}**
-    - Montants versés (brut) : {to_eur(brutA)}
-    - Rendement total depuis le début : **{perf_tot_client:.2f}%**
-    """
+- Montants réellement investis (après frais) : **{to_eur(netA)}**
+- Montants versés (brut) : {to_eur(brutA)}
+- Rendement total depuis le début : **{perf_tot_client:.2f}%**
+"""
                     if perf_tot_client is not None
                     else f"""
-    - Montants réellement investis (après frais) : **{to_eur(netA)}**
-    - Montants versés (brut) : {to_eur(brutA)}
-    - Rendement total depuis le début : **—**
-    """
+- Montants réellement investis (après frais) : **{to_eur(netA)}**
+- Montants versés (brut) : {to_eur(brutA)}
+- Rendement total depuis le début : **—**
+"""
                 )
                 st.markdown(
                     f"- Rendement annualisé (XIRR) : **{xirrA:.2f}%**"
                     if xirrA is not None
                     else "- Rendement annualisé (XIRR) : **—**"
                 )
-    
-    
+
+
     # ----- Carte Valority -----
     if mode in ("compare", "valority"):
         with col_valority:
@@ -1772,25 +1790,24 @@ def render_app():
                 st.metric("Valeur actuelle simulée", to_eur(valB))
                 st.markdown(
                     f"""
-    - Montants réellement investis (après frais) : **{to_eur(netB)}**
-    - Montants versés (brut) : {to_eur(brutB)}
-    - Rendement total depuis le début : **{perf_tot_valority:.2f}%**
-    """
+- Montants réellement investis (après frais) : **{to_eur(netB)}**
+- Montants versés (brut) : {to_eur(brutB)}
+- Rendement total depuis le début : **{perf_tot_valority:.2f}%**
+"""
                     if perf_tot_valority is not None
                     else f"""
-    - Montants réellement investis (après frais) : **{to_eur(netB)}**
-    - Montants versés (brut) : {to_eur(brutB)}
-    - Rendement total depuis le début : **—**
-    """
+- Montants réellement investis (après frais) : **{to_eur(netB)}**
+- Montants versés (brut) : {to_eur(brutB)}
+- Rendement total depuis le début : **—**
+"""
                 )
                 st.markdown(
                     f"- Rendement annualisé (XIRR) : **{xirrB:.2f}%**"
                     if xirrB is not None
                     else "- Rendement annualisé (XIRR) : **—**"
                 )
-    
-    
-    
+
+
     def build_html_report(report: Dict[str, Any]) -> str:
         """
         Construit un rapport HTML exportable pour le client.
@@ -1800,140 +1817,145 @@ def render_app():
         synthA = report.get("client_summary", {})
         synthB = report.get("valority_summary", {})
         comp = report.get("comparison", {})
-    
+
         dfA_lines = report.get("df_client_lines")
         dfB_lines = report.get("df_valority_lines")
         dfA_val = report.get("dfA_val")
         dfB_val = report.get("dfB_val")
-    
+
         def _fmt_eur(x):
             try:
                 return f"{x:,.2f} €".replace(",", " ").replace(".", ",")
             except Exception:
                 return str(x)
-    
+
         # Tables en HTML
         html_client_lines = dfA_lines.to_html(index=False, border=0, justify="left") if dfA_lines is not None else ""
         html_valority_lines = dfB_lines.to_html(index=False, border=0, justify="left") if dfB_lines is not None else ""
-    
+
         if dfA_val is not None:
             html_A_val = dfA_val.to_html(index=False, border=0, justify="left")
         else:
             html_A_val = ""
-    
+
         if dfB_val is not None:
             html_B_val = dfB_val.to_html(index=False, border=0, justify="left")
         else:
             html_B_val = ""
-    
+
         html = f"""
-    <!DOCTYPE html>
-    <html lang="fr">
-    <head>
-    <meta charset="utf-8" />
-    <title>Rapport de portefeuille</title>
-    <style>
-    body {{
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-      margin: 24px;
-      color: #222;
-    }}
-    h1, h2, h3 {{
-      margin-top: 24px;
-    }}
-    table {{
-      border-collapse: collapse;
-      width: 100%;
-      margin: 8px 0 16px 0;
-      font-size: 14px;
-    }}
-    th, td {{
-      border: 1px solid #ddd;
-      padding: 6px 8px;
-    }}
-    th {{
-      background-color: #f5f5f5;
-      text-align: left;
-    }}
-    .small {{
-      font-size: 12px;
-      color: #666;
-    }}
-    .block {{
-      border: 1px solid #eee;
-      border-radius: 8px;
-      padding: 12px 16px;
-      margin-bottom: 16px;
-      background-color: #fafafa;
-    }}
-    </style>
-    </head>
-    <body>
-    
-    <h1>Rapport de portefeuille</h1>
-    <p class="small">Date de génération : {as_of}</p>
-    
-    <h2>1. Synthèse chiffrée</h2>
-    
-    <div class="block">
-      <h3>Situation actuelle — Client</h3>
-      <ul>
-        <li>Valeur actuelle : <b>{_fmt_eur(synthA.get("val", 0))}</b></li>
-        <li>Montants réellement investis (net) : {_fmt_eur(synthA.get("net", 0))}</li>
-        <li>Montants versés (brut) : {_fmt_eur(synthA.get("brut", 0))}</li>
-        <li>Rendement total depuis le début : <b>{synthA.get("perf_tot_pct", 0):.2f} %</b></li>
-        <li>Rendement annualisé (XIRR) : <b>{synthA.get("irr_pct", 0):.2f} %</b></li>
-      </ul>
-    </div>
-    
-    <div class="block">
-      <h3>Simulation — Allocation Valority</h3>
-      <ul>
-        <li>Valeur actuelle simulée : <b>{_fmt_eur(synthB.get("val", 0))}</b></li>
-        <li>Montants réellement investis (net) : {_fmt_eur(synthB.get("net", 0))}</li>
-        <li>Montants versés (brut) : {_fmt_eur(synthB.get("brut", 0))}</li>
-        <li>Rendement total depuis le début : <b>{synthB.get("perf_tot_pct", 0):.2f} %</b></li>
-        <li>Rendement annualisé (XIRR) : <b>{synthB.get("irr_pct", 0):.2f} %</b></li>
-      </ul>
-    </div>
-    
-    <div class="block">
-      <h3>Comparaison Client vs Valority</h3>
-      <ul>
-        <li>Différence de valeur finale : <b>{_fmt_eur(comp.get("delta_val", 0))}</b></li>
-        <li>Écart de performance totale (Valority – Client) :
-            <b>{comp.get("delta_perf_pct", 0):.2f} %</b></li>
-      </ul>
-    </div>
-    
-    <h2>2. Détail des lignes</h2>
-    
-    <h3>Portefeuille Client</h3>
-    {html_client_lines}
-    
-    <h3>Portefeuille Valority</h3>
-    {html_valority_lines}
-    
-    <h2>3. Historique de la valeur des portefeuilles</h2>
-    
-    <h3>Client – Valeur du portefeuille par date</h3>
-    {html_A_val}
-    
-    <h3>Valority – Valeur du portefeuille par date</h3>
-    {html_B_val}
-    
-    <p class="small">
-    Ce document est fourni à titre informatif uniquement et ne constitue pas un conseil en investissement
-    personnalisé.
-    </p>
-    
-    </body>
-        </html>
-    """
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="utf-8" />
+<title>Rapport de portefeuille</title>
+<style>
+body {{
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  margin: 24px;
+  color: #222;
+}}
+h1, h2, h3 {{
+  margin-top: 24px;
+}}
+table {{
+  border-collapse: collapse;
+  width: 100%;
+  margin: 8px 0 16px 0;
+  font-size: 14px;
+}}
+th, td {{
+  border: 1px solid #ddd;
+  padding: 6px 8px;
+}}
+th {{
+  background-color: #f5f5f5;
+  text-align: left;
+}}
+.small {{
+  font-size: 12px;
+  color: #666;
+}}
+.block {{
+  border: 1px solid #eee;
+  border-radius: 8px;
+  padding: 12px 16px;
+  margin-bottom: 16px;
+  background-color: #fafafa;
+}}
+</style>
+</head>
+<body>
+
+<h1>Rapport de portefeuille</h1>
+<p class="small">Date de génération : {as_of}</p>
+
+<h2>1. Synthèse chiffrée</h2>
+
+<div class="block">
+  <h3>Situation actuelle — Client</h3>
+  <ul>
+    <li>Valeur actuelle : <b>{_fmt_eur(synthA.get("val", 0))}</b></li>
+    <li>Montants réellement investis (net) : {_fmt_eur(synthA.get("net", 0))}</li>
+    <li>Montants versés (brut) : {_fmt_eur(synthA.get("brut", 0))}</li>
+    <li>Rendement total depuis le début : <b>{synthA.get("perf_tot_pct", 0):.2f} %</b></li>
+    <li>Rendement annualisé (XIRR) : <b>{synthA.get("irr_pct", 0):.2f} %</b></li>
+  </ul>
+</div>
+
+<div class="block">
+  <h3>Simulation — Allocation Valority</h3>
+  <ul>
+    <li>Valeur actuelle simulée : <b>{_fmt_eur(synthB.get("val", 0))}</b></li>
+    <li>Montants réellement investis (net) : {_fmt_eur(synthB.get("net", 0))}</li>
+    <li>Montants versés (brut) : {_fmt_eur(synthB.get("brut", 0))}</li>
+    <li>Rendement total depuis le début : <b>{synthB.get("perf_tot_pct", 0):.2f} %</b></li>
+    <li>Rendement annualisé (XIRR) : <b>{synthB.get("irr_pct", 0):.2f} %</b></li>
+  </ul>
+</div>
+
+<div class="block">
+  <h3>Comparaison Client vs Valority</h3>
+  <ul>
+    <li>Différence de valeur finale : <b>{_fmt_eur(comp.get("delta_val", 0))}</b></li>
+    <li>Écart de performance totale (Valority – Client) :
+        <b>{comp.get("delta_perf_pct", 0):.2f} %</b></li>
+  </ul>
+</div>
+
+<h2>2. Détail des lignes</h2>
+
+<h3>Portefeuille Client</h3>
+{html_client_lines}
+
+<h3>Portefeuille Valority</h3>
+{html_valority_lines}
+
+<h2>3. Historique de la valeur des portefeuilles</h2>
+
+<h3>Client – Valeur du portefeuille par date</h3>
+{html_A_val}
+
+<h3>Valority – Valeur du portefeuille par date</h3>
+{html_B_val}
+
+<p class="small">
+Ce document est fourni à titre informatif uniquement et ne constitue pas un conseil en investissement
+personnalisé.
+</p>
+
+</body>
+    </html>
+"""
         return html
-    
-    
-    def _add_table_to_story(story: List[Any], df: pd.DataFrame):
+
+
+    def _add_table_to_story(
+        story: List[Any],
+        df: pd.DataFrame,
+        col_widths: Optional[List[float]] = None,
+        font_size: int = 9,
+    ):
         if df.empty:
             story.append(Paragraph("Données indisponibles.", getSampleStyleSheet()["Normal"]))
             return
@@ -1950,21 +1972,23 @@ def render_app():
                     formatted.append(str(val))
             fmt_rows.append(formatted)
         data = [headers] + fmt_rows
-        table = Table(data, repeatRows=1)
+        table = Table(data, repeatRows=1, colWidths=col_widths)
         style = [
             ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
             ("GRID", (0, 0), (-1, -1), 0.25, colors.grey),
             ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-            ("FONTSIZE", (0, 0), (-1, -1), 8),
+            ("FONTSIZE", (0, 0), (-1, -1), font_size),
             ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+            ("LEFTPADDING", (0, 0), (-1, -1), 4),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 4),
         ]
         for i in range(1, len(data)):
             if i % 2 == 0:
                 style.append(("BACKGROUND", (0, i), (-1, i), colors.whitesmoke))
         table.setStyle(TableStyle(style))
         story.append(table)
-    
-    
+
+
     def _fig_to_rl_image(fig: plt.Figure, width: float = 480, height: float = 270) -> Image:
         if not MATPLOTLIB_AVAILABLE:
             return None
@@ -1973,8 +1997,8 @@ def render_app():
         buf.seek(0)
         plt.close(fig)
         return Image(buf, width=width, height=height)
-    
-    
+
+
     def _build_value_chart(df_map: Dict[str, pd.DataFrame]) -> Optional[Image]:
         if not MATPLOTLIB_AVAILABLE:
             return None
@@ -1996,105 +2020,176 @@ def render_app():
         ax.legend(loc="best")
         fig.autofmt_xdate()
         return _fig_to_rl_image(fig)
-    
-    
-    def _build_pie_chart(df_positions: pd.DataFrame, title: str) -> Optional[Image]:
-        if not MATPLOTLIB_AVAILABLE:
-            return None
-        if df_positions.empty:
-            return None
+
+
+    def _wrap_label(label: str, width: int = 28) -> str:
+        if not label:
+            return "—"
+        return "\n".join(textwrap.wrap(str(label), width=width)) or str(label)
+
+
+    def _allocation_from_positions(df_positions: pd.DataFrame) -> Tuple[pd.DataFrame, str]:
         df = df_positions.copy()
-        if "Valeur actuelle €" not in df.columns:
-            return None
-        df = df[df["Valeur actuelle €"] > 0]
-        if df.empty:
-            return None
-        total = df["Valeur actuelle €"].sum()
-        df["Part"] = df["Valeur actuelle €"] / total
-        small = df[df["Part"] < 0.03]
-        df_main = df[df["Part"] >= 0.03]
-        if not small.empty:
-            df_main = pd.concat(
-                [
-                    df_main,
-                    pd.DataFrame(
-                        {
-                            "Nom": ["Autres"],
-                            "Valeur actuelle €": [small["Valeur actuelle €"].sum()],
-                            "Part": [small["Part"].sum()],
-                        }
-                    ),
-                ],
-                ignore_index=True,
+        df = df[df["Valeur actuelle €"] >= 0]
+        df["Nom"] = df["Nom"].fillna("—")
+        df["ISIN / Code"] = df["ISIN / Code"].fillna("—")
+
+        total_value = df["Valeur actuelle €"].sum()
+        if total_value > 0:
+            df["Poids"] = df["Valeur actuelle €"] / total_value
+            basis_label = "Valeur actuelle"
+        else:
+            total_net = df["Net investi €"].sum()
+            if total_net > 0:
+                df["Poids"] = df["Net investi €"] / total_net
+            else:
+                df["Poids"] = 0.0
+                if len(df) > 0:
+                    df.loc[df.index[0], "Poids"] = 1.0
+            basis_label = "Net investi"
+
+        df = df.sort_values("Poids", ascending=False)
+        if len(df) > 8:
+            df_main = df.iloc[:8].copy()
+            df_other = df.iloc[8:]
+            other_row = pd.DataFrame(
+                {
+                    "Nom": ["Autres"],
+                    "ISIN / Code": ["—"],
+                    "Net investi €": [df_other["Net investi €"].sum()],
+                    "Valeur actuelle €": [df_other["Valeur actuelle €"].sum()],
+                    "Poids": [df_other["Poids"].sum()],
+                }
             )
-        fig, ax = plt.subplots(figsize=(5, 3))
-        ax.pie(df_main["Valeur actuelle €"], labels=df_main["Nom"], autopct="%1.1f%%")
+            df = pd.concat([df_main, other_row], ignore_index=True)
+
+        df["Part %"] = df["Poids"] * 100.0
+        return df, basis_label
+
+
+    def _build_allocation_donut(
+        df_alloc: pd.DataFrame,
+        title: str,
+        figsize: Tuple[float, float] = (6.0, 3.4),
+    ) -> Optional[Image]:
+        if not MATPLOTLIB_AVAILABLE or df_alloc.empty:
+            return None
+        fig, ax = plt.subplots(figsize=figsize)
+        wedges, _ = ax.pie(
+            df_alloc["Poids"],
+            startangle=90,
+            labels=None,
+            wedgeprops=dict(width=0.35, edgecolor="white"),
+        )
+        labels = [
+            f"{_wrap_label(nm)} ({pct:.1f}%)"
+            for nm, pct in zip(df_alloc["Nom"], df_alloc["Part %"])
+        ]
+        ax.legend(
+            wedges,
+            labels,
+            loc="center left",
+            bbox_to_anchor=(1.02, 0.5),
+            frameon=False,
+            fontsize=8,
+        )
         ax.set_title(title)
-        return _fig_to_rl_image(fig, width=420, height=280)
-    
-    
-    def _build_allocation_pie(lines: List[Dict[str, Any]], title: str) -> Optional[Image]:
-        if not MATPLOTLIB_AVAILABLE:
-            return None
+        ax.set_aspect("equal")
+        fig.tight_layout(rect=[0, 0, 0.78, 1])
+        return _fig_to_rl_image(fig, width=460, height=280)
+
+
+    def _build_envelope_breakdown(
+        lines: List[Dict[str, Any]],
+        title: str,
+    ) -> Tuple[Optional[Image], Optional[str]]:
         if not lines:
-            return None
-        categories = {"EUROFUND": 0.0, "UC": 0.0, "STRUCTURED": 0.0}
+            return None, "Répartition par enveloppe : —"
+        categories = {"Fonds euros": 0.0, "UC": 0.0, "Structurés": 0.0}
         for ln in lines:
             isin = str(ln.get("isin", "")).upper()
             val = float(ln.get("value", 0.0))
             if isin == "EUROFUND":
-                categories["EUROFUND"] += val
+                categories["Fonds euros"] += val
             elif isin == "STRUCTURED":
-                categories["STRUCTURED"] += val
+                categories["Structurés"] += val
             else:
                 categories["UC"] += val
-        if sum(categories.values()) <= 0:
-            return None
-        fig, ax = plt.subplots(figsize=(5, 3))
-        ax.pie(list(categories.values()), labels=list(categories.keys()), autopct="%1.1f%%")
-        ax.set_title(title)
-        return _fig_to_rl_image(fig, width=420, height=280)
-    
-    
-    def _build_contribution_bar(df_positions: pd.DataFrame) -> Optional[Image]:
+        total = sum(categories.values())
+        if total <= 0:
+            return None, "Répartition par enveloppe : —"
+
+        shares = {k: v / total for k, v in categories.items() if v > 0}
+        major = max(shares.items(), key=lambda x: x[1])
+        if sum(1 for v in shares.values() if v >= 0.01) < 2:
+            return None, f"Répartition par enveloppe : {major[1] * 100:.1f}% {major[0]}"
+
         if not MATPLOTLIB_AVAILABLE:
-            return None
-        if df_positions.empty:
+            return None, None
+        labels = list(shares.keys())
+        values = [shares[k] * 100 for k in labels]
+        fig, ax = plt.subplots(figsize=(6.0, 1.8))
+        ax.barh(labels, values, color="#4C78A8")
+        ax.set_xlim(0, 100)
+        ax.set_xlabel("%")
+        ax.set_title(title)
+        for i, v in enumerate(values):
+            ax.text(min(v + 1, 98), i, f"{v:.1f}%", va="center", fontsize=8)
+        fig.tight_layout()
+        return _fig_to_rl_image(fig, width=460, height=140), None
+
+
+    def _build_contribution_bar(df_positions: pd.DataFrame) -> Optional[Image]:
+        if not MATPLOTLIB_AVAILABLE or df_positions.empty:
             return None
         df = df_positions.copy()
         if not {"Nom", "Valeur actuelle €", "Net investi €"}.issubset(df.columns):
             return None
         df["Contribution €"] = df["Valeur actuelle €"] - df["Net investi €"]
-        positives = df[df["Contribution €"] > 0].nlargest(5, "Contribution €")
-        negatives = df[df["Contribution €"] < 0].nsmallest(5, "Contribution €")
-        df_show = pd.concat([positives, negatives]).drop_duplicates(subset=["Nom"])
-        if df_show.empty:
-            return None
-        fig, ax = plt.subplots(figsize=(6, 3))
-        ax.bar(df_show["Nom"], df_show["Contribution €"])
-        ax.set_title("Contribution par ligne (€)")
-        ax.set_ylabel("Contribution €")
-        ax.axhline(0, color="black", linewidth=0.5)
-        ax.tick_params(axis="x", rotation=45, labelsize=8)
+        df = df.sort_values("Contribution €", ascending=False)
+        fig_height = max(2.0, min(4.2, 0.35 * len(df) + 1.2))
+        fig, ax = plt.subplots(figsize=(6.2, fig_height))
+        ax.barh(df["Nom"], df["Contribution €"], color="#2F6F9F")
+        ax.invert_yaxis()
+        ax.set_title("Contribution à la performance (€)")
+        ax.axvline(0, color="black", linewidth=0.5)
+        ax.tick_params(axis="y", labelsize=8)
+        for i, v in enumerate(df["Contribution €"]):
+            offset = 0.01 * abs(v) if v != 0 else 0.5
+            x_pos = v + offset if v >= 0 else v - offset
+            ax.text(x_pos, i, fmt_eur_fr(v), va="center", fontsize=8)
         fig.tight_layout()
-        return _fig_to_rl_image(fig)
-    
-    
+        return _fig_to_rl_image(fig, width=460, height=200)
+
+
+    def _build_single_line_bar(label: str, value: float, title: str) -> Optional[Image]:
+        if not MATPLOTLIB_AVAILABLE:
+            return None
+        fig, ax = plt.subplots(figsize=(6.0, 1.3))
+        ax.barh([label], [100], color="#4C78A8")
+        ax.set_xlim(0, 100)
+        ax.set_title(title)
+        ax.set_xticks([])
+        ax.tick_params(axis="y", labelsize=8)
+        fig.tight_layout()
+        return _fig_to_rl_image(fig, width=460, height=90)
+
+
     def generate_pdf_report(report: Dict[str, Any]) -> bytes:
         if not REPORTLAB_AVAILABLE:
             raise RuntimeError(f"PDF indisponible: {REPORTLAB_ERROR}")
         if not MATPLOTLIB_AVAILABLE:
             raise RuntimeError(f"PDF indisponible: {MATPLOTLIB_ERROR}")
-    
+
         class NumberedCanvas(canvas.Canvas):
             def __init__(self, *args, **kwargs):
                 super().__init__(*args, **kwargs)
                 self._saved_page_states = []
-    
+
             def showPage(self):
                 self._saved_page_states.append(dict(self.__dict__))
                 self._startPage()
-    
+
             def save(self):
                 page_count = len(self._saved_page_states)
                 for state in self._saved_page_states:
@@ -2102,7 +2197,7 @@ def render_app():
                     self._draw_header_footer(page_count)
                     super().showPage()
                 super().save()
-    
+
             def _draw_header_footer(self, page_count: int):
                 width, height = A4
                 self.setFillColor(colors.HexColor("#1F3B6D"))
@@ -2119,7 +2214,7 @@ def render_app():
                     "Document informatif, ne constitue pas un conseil en investissement.",
                 )
                 self.drawRightString(width - 36, 24, f"Page {self.getPageNumber()} / {page_count}")
-    
+
         buffer = BytesIO()
         doc = SimpleDocTemplate(
             buffer,
@@ -2166,7 +2261,7 @@ def render_app():
             ),
         }
         story: List[Any] = []
-    
+
         def _kpi_table(title: str, rows: List[Tuple[str, str]]) -> Table:
             data = [[Paragraph(f"<b>{title}</b>", styles["h2"]), ""]]
             for label, value in rows:
@@ -2186,16 +2281,16 @@ def render_app():
                 )
             )
             return table
-    
+
         story.append(Paragraph("Rapport client", styles["title"]))
         story.append(Paragraph(f"Date de génération : {report.get('as_of', '')}", styles["small"]))
         story.append(Spacer(1, 12))
-    
+
         mode = report.get("mode", "compare")
         synthA = report.get("client_summary", {})
         synthB = report.get("valority_summary", {})
         comp = report.get("comparison", {})
-    
+
         story.append(Paragraph("Synthèse", styles["h1"]))
         if mode == "compare":
             client_rows = [
@@ -2243,61 +2338,133 @@ def render_app():
                     ("Valeur/an", fmt_eur_fr(fees.get("value_per_year", 0))),
                 ]
                 story.append(_kpi_table("Frais & valeur créée", fees_rows))
-    
+
         story.append(Spacer(1, 12))
         story.append(Paragraph("Graphiques", styles["h1"]))
-    
+
         value_chart = _build_value_chart(report.get("df_map", {}))
         if value_chart is not None:
             story.append(value_chart)
             story.append(Spacer(1, 8))
         else:
             story.append(Paragraph("Données indisponibles pour la courbe de valeur.", styles["small"]))
-    
+
         positions_df = report.get("positions_df")
+
+        # PAGE 2 — Composition du portefeuille
+        story.append(PageBreak())
+        story.append(Paragraph("Composition du portefeuille", styles["h1"]))
+
         if isinstance(positions_df, pd.DataFrame) and not positions_df.empty:
-            pie_chart = _build_pie_chart(positions_df, "Composition du portefeuille")
-            if pie_chart is not None:
-                story.append(pie_chart)
-                story.append(Spacer(1, 8))
-    
-            allocation_pie = _build_allocation_pie(report.get("lines", []), "EUROFUND vs UC vs STRUCTURED")
-            if allocation_pie is not None:
-                story.append(allocation_pie)
-                story.append(Spacer(1, 8))
-    
-            contrib_chart = _build_contribution_bar(positions_df)
-            if contrib_chart is not None:
-                story.append(contrib_chart)
-                story.append(Spacer(1, 12))
+            df_alloc, basis_label = _allocation_from_positions(positions_df)
+
+            if len(df_alloc) >= 2:
+                story.append(Paragraph(f"Allocation par ligne ({basis_label})", styles["h2"]))
+                donut = _build_allocation_donut(df_alloc, "Allocation par ligne")
+                if donut is not None:
+                    story.append(donut)
+                    story.append(Spacer(1, 6))
+            else:
+                line = df_alloc.iloc[0] if not df_alloc.empty else None
+                name = line["Nom"] if line is not None else "—"
+                story.append(
+                    Paragraph(
+                        f"Portefeuille concentré : 100% sur <b>{name}</b>.",
+                        styles["kpi"],
+                    )
+                )
+                bar = _build_single_line_bar(_wrap_label(name), 100.0, "Répartition 100%")
+                if bar is not None:
+                    story.append(bar)
+                    story.append(Spacer(1, 6))
+
+            alloc_table = df_alloc[
+                ["Nom", "ISIN / Code", "Part %", "Net investi €", "Valeur actuelle €"]
+            ].copy()
+            _add_table_to_story(
+                story,
+                alloc_table,
+                col_widths=[170, 80, 55, 95, 95],
+                font_size=9,
+            )
+            story.append(Spacer(1, 6))
+
+            envelope_chart, envelope_text = _build_envelope_breakdown(
+                report.get("lines", []),
+                "Répartition par enveloppe",
+            )
+            if envelope_chart is not None:
+                story.append(envelope_chart)
+            elif envelope_text:
+                story.append(Paragraph(envelope_text, styles["small"]))
         else:
             story.append(Paragraph("Données indisponibles pour la composition.", styles["small"]))
-            story.append(Spacer(1, 12))
-    
-        story.append(Paragraph("Positions", styles["h1"]))
+
+        # PAGE 3 — Contribution & Positions
+        story.append(PageBreak())
+        story.append(Paragraph("Contribution & positions", styles["h1"]))
+
         if isinstance(positions_df, pd.DataFrame) and not positions_df.empty:
-            _add_table_to_story(story, positions_df)
+            if len(positions_df) == 1:
+                ln = positions_df.iloc[0]
+                story.append(
+                    Paragraph(
+                        f"Contribution : <b>{ln['Nom']}</b> = {fmt_eur_fr(ln['Valeur actuelle €'] - ln['Net investi €'])}",
+                        styles["kpi"],
+                    )
+                )
+                bar = _build_single_line_bar(_wrap_label(ln["Nom"]), 100.0, "Contribution (ligne unique)")
+                if bar is not None:
+                    story.append(bar)
+                    story.append(Spacer(1, 6))
+            else:
+                contrib_chart = _build_contribution_bar(positions_df)
+                if contrib_chart is not None:
+                    story.append(contrib_chart)
+                    story.append(Spacer(1, 6))
+        else:
+            story.append(Paragraph("Données indisponibles pour la contribution.", styles["small"]))
+
+        story.append(Paragraph("Positions", styles["h2"]))
+        if isinstance(positions_df, pd.DataFrame) and not positions_df.empty:
+            positions_table = positions_df[
+                [
+                    "Nom",
+                    "ISIN / Code",
+                    "Date d'achat",
+                    "Net investi €",
+                    "Valeur actuelle €",
+                    "Perf €",
+                    "Perf %",
+                ]
+            ].copy()
+            _add_table_to_story(
+                story,
+                positions_table,
+                col_widths=[150, 70, 65, 80, 80, 50, 45],
+                font_size=9,
+            )
         else:
             story.append(Paragraph("Données indisponibles.", styles["small"]))
-    
+
         doc.build(story, canvasmaker=NumberedCanvas)
         buffer.seek(0)
         return buffer.read()
-    
-    
+
+
     def _years_between(d0: pd.Timestamp, d1: pd.Timestamp) -> float:
         return max(0.0, (d1 - d0).days / 365.25)
-    
-    
+
+
     report_data = {
         "as_of": fmt_date(TODAY),
         "mode": st.session_state.get("MODE_ANALYSE", "compare"),
     }
-    
+
     mode_report = report_data["mode"]
     df_client_lines = build_positions_dataframe("A_lines")
     df_valority_lines = build_positions_dataframe("B_lines")
-    
+
     report_data["df_client_lines"] = df_client_lines
     report_data["df_valority_lines"] = df_valority_lines
     report_data["dfA_val"] = dfA.reset_index().rename(columns={"index": "Date"}) if not dfA.empty else pd.DataFrame()
@@ -2322,14 +2489,14 @@ def render_app():
         if (perf_tot_client is not None and perf_tot_valority is not None)
         else 0.0,
     }
-    
+
     df_map: Dict[str, pd.DataFrame] = {}
     if mode_report in ("compare", "client") and not dfA.empty:
         df_map["Client"] = dfA
     if mode_report in ("compare", "valority") and not dfB.empty:
         df_map["Valority"] = dfB
     report_data["df_map"] = df_map
-    
+
     if mode_report == "compare":
         positions_df = df_valority_lines if not df_valority_lines.empty else df_client_lines
         lines = st.session_state.get("B_lines", []) or st.session_state.get("A_lines", [])
@@ -2348,7 +2515,7 @@ def render_app():
             brut = brutA
             net = netA
             val = valA
-    
+
         years = _years_between(start_min, TODAY) if isinstance(start_min, pd.Timestamp) else 0.0
         fees_paid = max(0.0, brut - net) if brut is not None and net is not None else 0.0
         value_created = (val - net) if val is not None and net is not None else 0.0
@@ -2358,7 +2525,7 @@ def render_app():
             "value_created": value_created,
             "value_per_year": value_per_year,
         }
-    
+
     report_data["positions_df"] = positions_df
     lines_with_values: List[Dict[str, Any]] = []
     if isinstance(positions_df, pd.DataFrame) and not positions_df.empty:
@@ -2371,9 +2538,9 @@ def render_app():
             val = float(match["Valeur actuelle €"].iloc[0]) if not match.empty else 0.0
             lines_with_values.append({"isin": isin, "value": val})
     report_data["lines"] = lines_with_values
-    
+
     st.session_state["REPORT_DATA"] = report_data
-    
+
     if report_data is not None:
         html_report = build_html_report(report_data)
         st.download_button(
@@ -2395,18 +2562,18 @@ def render_app():
                 file_name="rapport_portefeuille.pdf",
                 mime="application/pdf",
             )
-    
+
     # ------------------------------------------------------------
     # Bloc final : Comparaison OU "Frais & valeur créée"
     # ------------------------------------------------------------
     mode = st.session_state.get("MODE_ANALYSE", "compare")
-    
+
     # ============================
     # CAS 1 — MODE COMPARAISON
     # ============================
     if mode == "compare":
         st.subheader("📌 Comparaison : Client vs Valority")
-    
+
         gain_vs_client = (valB - valA) if (valA is not None and valB is not None) else 0.0
         delta_xirr = (xirrB - xirrA) if (xirrA is not None and xirrB is not None) else None
         perf_diff_tot = (
@@ -2414,7 +2581,7 @@ def render_app():
             if (perf_tot_client is not None and perf_tot_valority is not None)
             else None
         )
-    
+
         with st.container(border=True):
             c1, c2, c3 = st.columns(3)
             with c1:
@@ -2429,14 +2596,14 @@ def render_app():
                     "Surperformance annualisée (Δ XIRR)",
                     f"{delta_xirr:+.2f}%" if delta_xirr is not None else "—",
                 )
-    
+
             st.markdown(
                 f"""
-    Aujourd’hui, avec votre allocation actuelle, votre portefeuille vaut **{to_eur(valA)}**.  
-    Avec l’allocation Valority, il serait autour de **{to_eur(valB)}**, soit environ **{to_eur(gain_vs_client)}** de plus.
-    """
+Aujourd’hui, avec votre allocation actuelle, votre portefeuille vaut **{to_eur(valA)}**.  
+Avec l’allocation Valority, il serait autour de **{to_eur(valB)}**, soit environ **{to_eur(gain_vs_client)}** de plus.
+"""
             )
-    
+
     # ============================
     # CAS 2 — MODE ANALYSE SIMPLE
     # ============================
@@ -2458,22 +2625,22 @@ def render_app():
             irr = xirrA
             fee_pct = st.session_state.get("FEE_A", 0.0)
             title = "🧍 Portefeuille — Frais & valeur créée"
-    
+
         st.subheader("📌 Analyse : frais & valeur créée")
-    
+
         if brut > 0 and net >= 0 and val >= 0 and isinstance(start_min, pd.Timestamp):
             fees_paid = max(0.0, brut - net)     # frais d'entrée réellement payés
             value_created = val - net            # valeur créée vs capital réellement investi
             years = _years_between(start_min, TODAY)
             value_per_year = (value_created / years) if years > 0 else None
-    
+
             with st.container(border=True):
                 st.markdown(f"#### {title}")
                 st.caption(
                     f"Période : **{fmt_date(start_min)} → {fmt_date(TODAY)}** "
                     f"• Frais d’entrée : **{fee_pct:.2f}%**"
                 )
-    
+
                 c1, c2, c3 = st.columns(3)
                 with c1:
                     st.metric("Frais d’entrée payés", to_eur(fees_paid))
@@ -2484,20 +2651,20 @@ def render_app():
                         "Valeur créée / an (moyenne)",
                         to_eur(value_per_year) if value_per_year is not None else "—",
                     )
-    
+
                 st.markdown(
                     f"""
-    - Montants versés (brut) : **{to_eur(brut)}**
-    - Montants réellement investis (après frais) : **{to_eur(net)}**
-    - Valeur actuelle : **{to_eur(val)}**
-    """
+- Montants versés (brut) : **{to_eur(brut)}**
+- Montants réellement investis (après frais) : **{to_eur(net)}**
+- Valeur actuelle : **{to_eur(val)}**
+"""
                 )
-    
+
                 if irr is not None:
                     st.markdown(f"- Rendement annualisé (XIRR) : **{irr:.2f}%**")
                 else:
                     st.markdown("- Rendement annualisé (XIRR) : **—**")
-    
+
                 # Message "vendeur" mais strictement factuel
                 if fees_paid > 0:
                     ratio = (value_created / fees_paid) if fees_paid > 0 else None
@@ -2509,16 +2676,16 @@ def render_app():
                         )
         else:
             st.info("Ajoutez des lignes (et/ou des versements) pour afficher l’analyse frais & valeur créée.")
-    
-    
+
+
     # ------------------------------------------------------------
     # Tables positions
     # ------------------------------------------------------------
     positions_table("Portefeuille 1 — Client", "A_lines")
     positions_table("Portefeuille 2 — Valority", "B_lines")
-    
+
     st.subheader("Composition du portefeuille")
-    
+
     def _render_portfolio_pie(port_key: str, title: str):
         if not MATPLOTLIB_AVAILABLE:
             st.warning(f"{title} : Camembert indisponible ({MATPLOTLIB_ERROR}).")
@@ -2550,27 +2717,117 @@ def render_app():
             hide_index=True,
             use_container_width=True,
         )
-    
+
     col_a, col_b = st.columns(2)
     with col_a:
         _render_portfolio_pie("A_lines", "Portefeuille Client")
     with col_b:
         _render_portfolio_pie("B_lines", "Portefeuille Valority")
-    
+
+    # APP – Composition
+    st.subheader("Composition du portefeuille (Valority)")
+
+    def _wrap_label_app(label: str, width: int = 28) -> str:
+        if not label:
+            return "—"
+        return "\n".join(textwrap.wrap(str(label), width=width)) or str(label)
+
+    def _render_valority_composition_section():
+        if not MATPLOTLIB_AVAILABLE:
+            st.warning(f"Valority : graphique indisponible ({MATPLOTLIB_ERROR}).")
+            return
+        df_positions = build_positions_dataframe("B_lines")
+        if df_positions.empty:
+            st.info("Aucune donnée pour le portefeuille Valority.")
+            return
+
+        df = df_positions.copy()
+        total_val = df["Valeur actuelle €"].sum()
+        if total_val > 0:
+            df["Poids %"] = df["Valeur actuelle €"] / total_val * 100.0
+        else:
+            total_net = df["Net investi €"].sum()
+            if total_net > 0:
+                df["Poids %"] = df["Net investi €"] / total_net * 100.0
+            else:
+                df["Poids %"] = 0.0
+                if len(df) > 0:
+                    df.loc[df.index[0], "Poids %"] = 100.0
+        df = df.sort_values("Poids %", ascending=False)
+
+        if len(df) > 8:
+            df_main = df.iloc[:8].copy()
+            df_other = df.iloc[8:]
+            other_row = pd.DataFrame(
+                {
+                    "Nom": ["Autres"],
+                    "ISIN / Code": ["—"],
+                    "Date d'achat": ["—"],
+                    "Net investi €": [df_other["Net investi €"].sum()],
+                    "Valeur actuelle €": [df_other["Valeur actuelle €"].sum()],
+                    "Perf €": [df_other["Perf €"].sum()],
+                    "Perf %": [np.nan],
+                    "Poids %": [df_other["Poids %"].sum()],
+                }
+            )
+            df = pd.concat([df_main, other_row], ignore_index=True)
+
+        if len(df) >= 2:
+            fig, ax = plt.subplots(figsize=(5.2, 3.2))
+            wedges, _ = ax.pie(
+                df["Poids %"],
+                startangle=90,
+                labels=None,
+                wedgeprops=dict(width=0.35, edgecolor="white"),
+            )
+            labels = [
+                f"{_wrap_label_app(nm)} ({pct:.1f}%)"
+                for nm, pct in zip(df["Nom"], df["Poids %"])
+            ]
+            ax.legend(
+                wedges,
+                labels,
+                loc="center left",
+                bbox_to_anchor=(1.02, 0.5),
+                frameon=False,
+                fontsize=8,
+            )
+            ax.set_aspect("equal")
+            fig.tight_layout(rect=[0, 0, 0.78, 1])
+            st.pyplot(fig)
+            plt.close(fig)
+        else:
+            st.info("Portefeuille concentré : 100% sur une seule ligne.")
+
+        df_table = df[["Nom", "ISIN / Code", "Poids %", "Net investi €", "Valeur actuelle €"]]
+        st.dataframe(
+            df_table.style.format(
+                {
+                    "Poids %": "{:,.2f}%".format,
+                    "Net investi €": to_eur,
+                    "Valeur actuelle €": to_eur,
+                }
+            ),
+            hide_index=True,
+            use_container_width=True,
+        )
+
+    _render_valority_composition_section()
+
     with st.expander("Aide rapide"):
         st.markdown(
             """
-    - Dans chaque portefeuille, vous pouvez **soit** ajouter des *fonds recommandés* (onglet dédié),
-      **soit** utiliser la *saisie libre* avec ISIN / code.
-    - Pour le **fonds en euros**, utilisez le symbole **EUROFUND** (taux paramétrable dans la barre de gauche).
-    - Les frais d’entrée s’appliquent à chaque investissement.
-    - Le **rendement total** est la performance globale depuis l’origine (valeur actuelle / net investi).
-    - Le **rendement annualisé** utilise le XIRR (prise en compte des dates et montants).
-    - En mode **Personnalisé**, vous pouvez affecter précisément les versements mensuels et ponctuels à chaque ligne,
-      avec un contrôle automatique de cohérence par rapport aux montants bruts saisis.
+- Dans chaque portefeuille, vous pouvez **soit** ajouter des *fonds recommandés* (onglet dédié),
+  **soit** utiliser la *saisie libre* avec ISIN / code.
+- Pour le **fonds en euros**, utilisez le symbole **EUROFUND** (taux paramétrable dans la barre de gauche).
+- Les frais d’entrée s’appliquent à chaque investissement.
+- Le **rendement total** est la performance globale depuis l’origine (valeur actuelle / net investi).
+- Le **rendement annualisé** utilise le XIRR (prise en compte des dates et montants).
+- En mode **Personnalisé**, vous pouvez affecter précisément les versements mensuels et ponctuels à chaque ligne,
+  avec un contrôle automatique de cohérence par rapport aux montants bruts saisis.
             """
         )
-    
+
     # ------------------------------------------------------------
     # Analyse interne — Corrélation & volatilité (réservé conseiller)
     # ------------------------------------------------------------
@@ -2580,17 +2837,17 @@ def render_app():
             "Section réservée au conseiller : analyse technique basée sur les valeurs liquidatives "
             "(corrélations, volatilités, drawdown)."
         )
-    
+
         euro_rate = st.session_state.get("EURO_RATE_PREVIEW", 2.0)
         linesA = st.session_state.get("A_lines", [])
         linesB = st.session_state.get("B_lines", [])
-    
+
         # Portefeuille Client
         st.markdown("### Portefeuille 1 — Client")
         corrA = correlation_matrix_from_lines(linesA, euro_rate)
         volA = volatility_table_from_lines(linesA, euro_rate)
         riskA = portfolio_risk_stats(linesA, euro_rate)
-    
+
         if corrA.empty and volA.empty:
             st.info("Pas assez d'historique ou de lignes pour analyser ce portefeuille.")
         else:
@@ -2606,7 +2863,7 @@ def render_app():
                         "Max drawdown (historique sur la période)",
                         f"{riskA['max_dd_pct']:.2f} %",
                     )
-    
+
             if not volA.empty:
                 st.markdown("**Volatilité par ligne**")
                 st.dataframe(
@@ -2618,20 +2875,20 @@ def render_app():
                     ),
                     use_container_width=True,
                 )
-    
+
             if not corrA.empty:
                 chartA = _corr_heatmap_chart(corrA, "Corrélation des lignes — Portefeuille Client")
                 if chartA is not None:
                     st.altair_chart(chartA, use_container_width=True)
-    
+
         st.markdown("---")
-    
+
         # Portefeuille Valority
         st.markdown("### Portefeuille 2 — Valority")
         corrB = correlation_matrix_from_lines(linesB, euro_rate)
         volB = volatility_table_from_lines(linesB, euro_rate)
         riskB = portfolio_risk_stats(linesB, euro_rate)
-    
+
         if corrB.empty and volB.empty:
             st.info("Pas assez d'historique ou de lignes pour analyser ce portefeuille.")
         else:
@@ -2647,7 +2904,7 @@ def render_app():
                         "Max drawdown (historique sur la période)",
                         f"{riskB['max_dd_pct']:.2f} %",
                     )
-    
+
             if not volB.empty:
                 st.markdown("**Volatilité par ligne**")
                 st.dataframe(
@@ -2659,11 +2916,12 @@ def render_app():
                     ),
                     use_container_width=True,
                 )
-    
+
             if not corrB.empty:
                 chartB = _corr_heatmap_chart(corrB, "Corrélation des lignes — Portefeuille Valority")
                 if chartB is not None:
                     st.altair_chart(chartB, use_container_width=True)
+
 
 
 def _render_with_crash_shield():

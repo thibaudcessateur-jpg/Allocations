@@ -4,6 +4,7 @@ import json
 import sys
 import textwrap
 import importlib.util
+import itertools
 from datetime import date
 from io import BytesIO
 from typing import Any, Dict, List, Optional, Tuple
@@ -1446,11 +1447,11 @@ def _suggest_weights(
     return weights
 
 
-def _round_allocations(amounts: Dict[str, float]) -> Tuple[Dict[str, int], int]:
+def _round_allocations(amounts: Dict[str, float]) -> Dict[str, int]:
     floors = {k: int(np.floor(v)) for k, v in amounts.items()}
     remainder = int(round(sum(amounts.values()) - sum(floors.values())))
     if remainder <= 0:
-        return floors, int(round(sum(amounts.values()) - sum(floors.values())))
+        return floors
     fractions = sorted(
         ((k, amounts[k] - floors[k]) for k in amounts),
         key=lambda x: x[1],
@@ -1459,8 +1460,68 @@ def _round_allocations(amounts: Dict[str, float]) -> Tuple[Dict[str, int], int]:
     for i in range(min(remainder, len(fractions))):
         k, _ = fractions[i]
         floors[k] += 1
-    leftover = int(round(sum(amounts.values()) - sum(floors.values())))
-    return floors, leftover
+    return floors
+
+
+def _apply_weight_caps(weights: Dict[str, float], max_weight: float) -> Dict[str, float]:
+    if not weights or max_weight <= 0:
+        return weights
+    weights = weights.copy()
+    for _ in range(10):
+        over = {k: v for k, v in weights.items() if v > max_weight}
+        if not over:
+            break
+        excess = sum(v - max_weight for v in over.values())
+        for k in over:
+            weights[k] = max_weight
+        remaining = {k: v for k, v in weights.items() if k not in over}
+        if not remaining or excess <= 0:
+            break
+        total_remaining = sum(remaining.values())
+        for k in remaining:
+            weights[k] += excess * (remaining[k] / total_remaining)
+    total = sum(weights.values())
+    if total > 0:
+        weights = {k: v / total for k, v in weights.items()}
+    return weights
+
+
+def _select_min_corr_combo(
+    returns: pd.DataFrame,
+    k: int,
+    anchor: Optional[str] = None,
+) -> List[str]:
+    if returns.empty:
+        return []
+    cols = list(returns.columns)
+    if anchor and anchor not in cols:
+        return []
+    if k <= 0:
+        return []
+    if k > len(cols):
+        return cols
+    corr = returns.corr()
+    best_combo: List[str] = []
+    best_score = None
+    if anchor:
+        others = [c for c in cols if c != anchor]
+        for combo in itertools.combinations(others, k - 1):
+            candidate = [anchor, *combo]
+            sub = corr.loc[candidate, candidate].to_numpy()
+            triu = sub[np.triu_indices_from(sub, 1)]
+            score = float(triu.mean()) if triu.size else 1.0
+            if best_score is None or score < best_score:
+                best_score = score
+                best_combo = candidate
+    else:
+        for combo in itertools.combinations(cols, k):
+            sub = corr.loc[list(combo), list(combo)].to_numpy()
+            triu = sub[np.triu_indices_from(sub, 1)]
+            score = float(triu.mean()) if triu.size else 1.0
+            if best_score is None or score < best_score:
+                best_score = score
+                best_combo = list(combo)
+    return best_combo
 
 
 def _compute_drawdown(returns: pd.Series) -> Optional[float]:
@@ -1476,41 +1537,34 @@ def render_portfolio_builder():
     st.title("Créer le portefeuille parfait")
     try:
         profile_map = {
-            "Prudent": 70,
-            "Équilibré": 50,
-            "Dynamique": 30,
-            "Agressif": 10,
+            "Prudent": (20, 50),
+            "Équilibré": (10, 40),
+            "Dynamique": (5, 30),
+            "Agressif": (0, 20),
         }
 
         st.markdown("### 1) Profil & enveloppe cible")
         profile = st.selectbox("Profil recommandé", list(profile_map.keys()))
-        secure_default = profile_map[profile]
+        euro_default, secure_default = profile_map[profile]
         st.caption(
-            f"Recommandation : {secure_default}% sécuritaire / {100 - secure_default}% croissance "
-            "(ajustable ci-dessous)."
-        )
-        secure_pct = st.slider("Poche sécuritaire (%)", 0, 100, secure_default, 1)
-        growth_pct = 100 - secure_pct
-        st.caption(
-            "Sécuritaire = fonds euros + obligataire + défensifs. "
-            "Croissance = fonds actions."
+            f"Recommandation : {euro_default}% fonds euros / {secure_default}% sécuritaire / "
+            f"{100 - euro_default - secure_default}% croissance (ajustable)."
         )
 
-        st.markdown("### 2) Budget et dates")
-        c1, c2 = st.columns([2, 2])
-        with c1:
-            total_budget = st.number_input(
-                "Budget à investir (€)",
-                min_value=0,
-                max_value=10_000_000,
-                value=100_000,
-                step=1_000,
-            )
-        with c2:
-            invest_date = st.date_input(
-                "Date d’investissement initiale (pour envoi vers comparateur)",
-                value=st.session_state.get("INIT_B_DATE", pd.Timestamp("2024-01-02").date()),
-            )
+        euro_pct = st.slider("Fonds en euros (%)", 0, 100, euro_default, 1)
+        secure_max = max(0, 100 - euro_pct)
+        secure_pct = st.slider("Poche sécuritaire (%)", 0, secure_max, min(secure_default, secure_max), 1)
+        growth_pct = max(0, 100 - euro_pct - secure_pct)
+        st.caption("Sécuritaire = obligataires / défensifs • Croissance = actions.")
+
+        st.markdown("### 2) Budget")
+        total_budget = st.number_input(
+            "Budget à investir (€)",
+            min_value=0,
+            max_value=10_000_000,
+            value=100_000,
+            step=1_000,
+        )
 
         st.markdown("### 3) Fenêtre d’analyse")
         window_mode = st.radio(
@@ -1547,234 +1601,144 @@ def render_portfolio_builder():
             st.warning("La date de début doit être antérieure à la date de fin.")
             return
 
-        st.markdown("### 4) Sélection des fonds")
-        st.session_state.setdefault("builder_lines", [])
+        st.markdown("### 4) Sélection poche sécuritaire")
+        secure_options = [f"{name} ({isin})" for name, isin in RECO_FUNDS_DEF if isin != "EUROFUND"]
+        secure_sel = st.multiselect(
+            "Fonds défensifs / obligataires",
+            secure_options,
+            default=secure_options[:2],
+        )
+        secure_isins = [opt.split("(")[-1].replace(")", "").strip() for opt in secure_sel]
 
-        def _add_builder_line(name: str, isin: str, bucket: str):
-            for ln in st.session_state["builder_lines"]:
-                if ln["isin"] == isin and ln["bucket"] == bucket:
-                    return
-            st.session_state["builder_lines"].append(
-                {
-                    "name": name,
-                    "isin": isin,
-                    "bucket": bucket,
-                    "weight": 0.0,
-                    "amount": 0,
-                    "min_amount": 0,
-                    "status": "",
-                    "comment": "",
-                }
-            )
+        free_secure = st.text_input("Ajouter un ISIN défensif (optionnel)", value="")
+        if free_secure.strip():
+            secure_isins.append(free_secure.strip())
 
-        secure_options = {f"{name} ({isin})": (name, isin) for name, isin in RECO_FUNDS_DEF}
-        growth_options = {f"{name} ({isin})": (name, isin) for name, isin in RECO_FUNDS_CORE}
-
-        add_cols = st.columns(2)
-        with add_cols[0]:
-            st.markdown("**Fonds sécuritaires**")
-            choice_secure = st.selectbox(
-                "Ajouter un fonds défensif",
-                ["—"] + list(secure_options.keys()),
-                key="builder_secure_choice",
-            )
-            if st.button("Ajouter (sécuritaire)", key="builder_add_secure"):
-                if choice_secure != "—":
-                    nm, isin = secure_options[choice_secure]
-                    _add_builder_line(nm, isin, "secure")
-        with add_cols[1]:
-            st.markdown("**Fonds croissance**")
-            choice_growth = st.selectbox(
-                "Ajouter un fonds croissance",
-                ["—"] + list(growth_options.keys()),
-                key="builder_growth_choice",
-            )
-            if st.button("Ajouter (croissance)", key="builder_add_growth"):
-                if choice_growth != "—":
-                    nm, isin = growth_options[choice_growth]
-                    _add_builder_line(nm, isin, "growth")
-
-        free_cols = st.columns(2)
-        with free_cols[0]:
-            free_isin = st.text_input("Ajouter un ISIN libre (sécuritaire)", value="")
-            if st.button("Ajouter ISIN (sécuritaire)", key="builder_add_free_secure"):
-                if free_isin.strip():
-                    _add_builder_line(free_isin.strip(), free_isin.strip(), "secure")
-        with free_cols[1]:
-            free_isin_growth = st.text_input("Ajouter un ISIN libre (croissance)", value="")
-            if st.button("Ajouter ISIN (croissance)", key="builder_add_free_growth"):
-                if free_isin_growth.strip():
-                    _add_builder_line(free_isin_growth.strip(), free_isin_growth.strip(), "growth")
-
-        if not st.session_state["builder_lines"]:
-            st.info("Ajoutez des fonds pour commencer la construction.")
-            return
-
-        st.markdown("### 5) Lignes sélectionnées")
-        remove_idx = None
-        for idx, ln in enumerate(st.session_state["builder_lines"]):
-            with st.container(border=True):
-                header_cols = st.columns([3, 2, 2, 1])
-                with header_cols[0]:
-                    st.markdown(f"**{ln['name']}**")
-                    st.caption(f"ISIN : `{ln['isin']}`")
-                with header_cols[1]:
-                    st.caption("Poche")
-                    st.write("Sécuritaire" if ln["bucket"] == "secure" else "Croissance")
-                with header_cols[2]:
-                    if ln["bucket"] == "secure":
-                        st.info("Non analysé")
-                    else:
-                        status = ln.get("status", "")
-                        if status == "insufficient":
-                            st.warning("Historique insuffisant")
-                        else:
-                            st.success("Historique OK")
-                with header_cols[3]:
-                    if st.button("🗑️", key=f"builder_remove_{idx}"):
-                        remove_idx = idx
-
-                c1, c2, c3 = st.columns([2, 2, 2])
-                with c1:
-                    ln["weight"] = st.number_input(
-                        "Poids (%)",
-                        min_value=0.0,
-                        max_value=100.0,
-                        value=float(ln.get("weight", 0.0)),
-                        step=1.0,
-                        key=f"builder_weight_{idx}",
-                    )
-                with c2:
-                    ln["amount"] = st.number_input(
-                        "Montant (€)",
-                        min_value=0,
-                        max_value=10_000_000,
-                        value=int(ln.get("amount", 0)),
-                        step=100,
-                        key=f"builder_amount_{idx}",
-                    )
-                with c3:
-                    ln["min_amount"] = st.number_input(
-                        "Montant minimal (€)",
-                        min_value=0,
-                        max_value=10_000_000,
-                        value=int(ln.get("min_amount", 0)),
-                        step=100,
-                        key=f"builder_min_{idx}",
-                    )
-
-        if remove_idx is not None:
-            st.session_state["builder_lines"].pop(remove_idx)
-            st.experimental_rerun()
-
-        secure_lines = [ln for ln in st.session_state["builder_lines"] if ln["bucket"] == "secure"]
-        growth_lines = [ln for ln in st.session_state["builder_lines"] if ln["bucket"] == "growth"]
-
-        if not secure_lines and not growth_lines:
-            st.info("Ajoutez au moins une ligne.")
-            return
+        st.markdown("### 5) Sélection poche croissance (auto)")
+        growth_mode = st.radio(
+            "Mode croissance",
+            [
+                "Auto — fonds les plus diversifiés entre eux",
+                "Auto — avec fonds imposé (anchor)",
+            ],
+            horizontal=True,
+        )
+        k = st.number_input("Nombre de fonds croissance (k)", min_value=2, max_value=6, value=3, step=1)
+        max_weight_pct = st.number_input("Poids max par fonds (%)", min_value=5, max_value=100, value=40, step=5)
+        weight_method = st.selectbox("Méthode de pondération", ["Égalitaire", "Inverse-volatilité"])
+        anchor_isin = None
+        if growth_mode == "Auto — avec fonds imposé (anchor)":
+            anchor_options = [f"{name} ({isin})" for name, isin in RECO_FUNDS_CORE]
+            anchor_choice = st.selectbox("Fonds croissance imposé", anchor_options)
+            anchor_isin = anchor_choice.split("(")[-1].replace(")", "").strip()
 
         euro_rate = st.number_input("Taux fonds euros (%)", 0.0, 10.0, 2.0, 0.10)
 
-        growth_isins = tuple(sorted({ln["isin"] for ln in growth_lines}))
-        returns, warnings, status = _build_returns_matrix(growth_isins, euro_rate, start, end)
-        for ln in growth_lines:
-            ln["status"] = status.get(ln["isin"], "")
+        growth_candidates = [isin for _, isin in RECO_FUNDS_CORE]
+        returns, warnings, status = _build_returns_matrix(tuple(growth_candidates), euro_rate, start, end)
         for msg in warnings:
             st.info(msg)
 
-        st.markdown("### 6) Auto-diversification (poche croissance)")
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            min_funds = st.number_input(
-                "Minimum de fonds",
-                min_value=1,
-                max_value=max(1, len(growth_isins)),
-                value=min(3, max(1, len(growth_isins))),
-                step=1,
-            )
-        with c2:
-            max_weight_pct = st.number_input(
-                "Poids max par fonds (%)",
-                min_value=5,
-                max_value=100,
-                value=40,
-                step=5,
-            )
-        with c3:
-            st.caption("Basé sur corrélation + volatilité.")
+        valid_growth = [isin for isin in growth_candidates if status.get(isin) == "ok"]
+        if growth_mode == "Auto — avec fonds imposé (anchor)" and anchor_isin not in valid_growth:
+            st.warning("Le fonds imposé n'a pas assez d'historique sur la fenêtre. Sélection auto classique appliquée.")
+            anchor_isin = None
 
-        weights_growth: Dict[str, float] = {}
-        if st.button("Répartir automatiquement (croissance)"):
-            if returns.empty or len(growth_isins) == 0:
-                st.warning("Données insuffisantes pour l’auto-allocation.")
+        selected_growth = []
+        if returns.empty or len(valid_growth) == 0:
+            selected_growth = valid_growth[: int(k)]
+        else:
+            selected_growth = _select_min_corr_combo(returns[valid_growth], int(k), anchor=anchor_isin)
+            if not selected_growth:
+                selected_growth = valid_growth[: int(k)]
+
+        if len(selected_growth) < int(k):
+            st.warning("Historique insuffisant : nombre de fonds croissance réduit.")
+
+        if selected_growth:
+            sub_returns = returns[selected_growth] if not returns.empty else pd.DataFrame()
+            if weight_method == "Inverse-volatilité" and not sub_returns.empty:
+                vols = sub_returns.std() * np.sqrt(252.0)
+                inv_vol = 1 / vols
+                weights_growth = (inv_vol / inv_vol.sum()).to_dict()
             else:
-                weights_growth = _suggest_weights(returns, max_weight_pct / 100.0, int(min_funds))
-                for ln in growth_lines:
-                    ln["weight"] = round(weights_growth.get(ln["isin"], 0.0) * 100, 2)
-                    ln["amount"] = 0
-                st.success("Pondération automatique appliquée.")
+                weights_growth = {isin: 1.0 / len(selected_growth) for isin in selected_growth}
+            weights_growth = _apply_weight_caps(weights_growth, max_weight_pct / 100.0)
+        else:
+            weights_growth = {}
 
-        st.info(
-            "Pourquoi ces fonds ?\n"
-            "- Faible corrélation moyenne\n"
-            "- Réduction de la concentration\n"
-            "- Diversification des trajectoires de VL"
-        )
-
-        st.markdown("### 7) Allocation finale (montants entiers)")
+        st.markdown("### 6) Allocation finale (montants entiers)")
+        budget_euro = total_budget * euro_pct / 100.0
         budget_secure = total_budget * secure_pct / 100.0
         budget_growth = total_budget * growth_pct / 100.0
 
-        def _derive_amounts(lines: List[Dict[str, Any]], budget: float) -> Tuple[Dict[str, int], int]:
-            fixed = {ln["isin"]: int(ln["amount"]) for ln in lines if int(ln["amount"]) > 0}
-            remaining_budget = budget - sum(fixed.values())
-            if remaining_budget < 0:
-                remaining_budget = 0
-            weighted = {}
-            total_weight = sum(max(0.0, float(ln.get("weight", 0.0))) for ln in lines if int(ln["amount"]) == 0)
-            for ln in lines:
-                if int(ln["amount"]) > 0:
-                    continue
-                w = max(0.0, float(ln.get("weight", 0.0)))
-                if total_weight > 0:
-                    weighted[ln["isin"]] = remaining_budget * (w / total_weight)
+        euro_amount = int(round(budget_euro))
+
+        secure_amounts = {}
+        if secure_isins:
+            secure_weight = 1.0 / len(secure_isins)
+            secure_amounts = _round_allocations(
+                {isin: budget_secure * secure_weight for isin in secure_isins}
+            )
+        growth_amounts = {}
+        if weights_growth:
+            growth_amounts = _round_allocations(
+                {isin: budget_growth * w for isin, w in weights_growth.items()}
+            )
+
+        def _distribute_remainder(target: Dict[str, int], weights: Dict[str, float], delta: int) -> Dict[str, int]:
+            if not target or delta == 0:
+                return target
+            ordered = sorted(weights.items(), key=lambda x: x[1], reverse=True)
+            if not ordered:
+                ordered = [(k, 1.0) for k in target.keys()]
+            idx = 0
+            keys = [k for k, _ in ordered]
+            while delta != 0 and keys:
+                k = keys[idx % len(keys)]
+                if delta > 0:
+                    target[k] = target.get(k, 0) + 1
+                    delta -= 1
                 else:
-                    weighted[ln["isin"]] = remaining_budget / max(1, len(lines))
-            rounded, leftover = _round_allocations({**fixed, **weighted})
-
-            # enforce minimums
-            for ln in lines:
-                min_amt = int(ln.get("min_amount", 0))
-                if min_amt > 0 and rounded.get(ln["isin"], 0) < min_amt:
-                    rounded[ln["isin"]] = min_amt
-            leftover = int(round(budget - sum(rounded.values())))
-            return rounded, leftover
-
-        alloc_secure, left_secure = _derive_amounts(secure_lines, budget_secure)
-        alloc_growth, left_growth = _derive_amounts(growth_lines, budget_growth)
+                    if target.get(k, 0) > 0:
+                        target[k] -= 1
+                        delta += 1
+                idx += 1
+            return target
 
         rows = []
-        for ln in secure_lines:
-            amt = alloc_secure.get(ln["isin"], 0)
+        if euro_amount > 0:
+            rows.append(
+                {
+                    "Poche": "Fonds euros",
+                    "Nom": "Fonds en euros (EUROFUND)",
+                    "ISIN": "EUROFUND",
+                    "Poids poche %": 100.0,
+                    "Poids global %": (euro_amount / total_budget * 100) if total_budget > 0 else 0.0,
+                    "Montant € (ENTIER)": euro_amount,
+                    "Commentaire": "Décorrélé / capital sécurisé",
+                }
+            )
+        for isin in secure_isins:
+            amt = secure_amounts.get(isin, 0)
             rows.append(
                 {
                     "Poche": "Sécuritaire",
-                    "Nom": ln["name"],
-                    "ISIN": ln["isin"],
+                    "Nom": isin,
+                    "ISIN": isin,
                     "Poids poche %": (amt / budget_secure * 100) if budget_secure > 0 else 0.0,
                     "Poids global %": (amt / total_budget * 100) if total_budget > 0 else 0.0,
                     "Montant € (ENTIER)": int(amt),
-                    "Commentaire": "Défensif / obligataire / fonds euros",
+                    "Commentaire": "Défensif / obligataire",
                 }
             )
-        for ln in growth_lines:
-            amt = alloc_growth.get(ln["isin"], 0)
+        for isin in selected_growth:
+            amt = growth_amounts.get(isin, 0)
             rows.append(
                 {
                     "Poche": "Croissance",
-                    "Nom": ln["name"],
-                    "ISIN": ln["isin"],
+                    "Nom": isin,
+                    "ISIN": isin,
                     "Poids poche %": (amt / budget_growth * 100) if budget_growth > 0 else 0.0,
                     "Poids global %": (amt / total_budget * 100) if total_budget > 0 else 0.0,
                     "Montant € (ENTIER)": int(amt),
@@ -1783,6 +1747,57 @@ def render_portfolio_builder():
             )
 
         df_export = pd.DataFrame(rows)
+        allocated = df_export["Montant € (ENTIER)"].sum() if not df_export.empty else 0
+        remainder = int(round(total_budget - allocated))
+        if remainder != 0:
+            if growth_amounts:
+                growth_amounts = _distribute_remainder(growth_amounts, weights_growth, remainder)
+            elif secure_amounts:
+                secure_weight_map = {isin: 1.0 for isin in secure_isins}
+                secure_amounts = _distribute_remainder(secure_amounts, secure_weight_map, remainder)
+            else:
+                euro_amount = max(0, euro_amount + remainder)
+
+            rows = []
+            if euro_amount > 0:
+                rows.append(
+                    {
+                        "Poche": "Fonds euros",
+                        "Nom": "Fonds en euros (EUROFUND)",
+                        "ISIN": "EUROFUND",
+                        "Poids poche %": 100.0,
+                        "Poids global %": (euro_amount / total_budget * 100) if total_budget > 0 else 0.0,
+                        "Montant € (ENTIER)": euro_amount,
+                        "Commentaire": "Décorrélé / capital sécurisé",
+                    }
+                )
+            for isin in secure_isins:
+                amt = secure_amounts.get(isin, 0)
+                rows.append(
+                    {
+                        "Poche": "Sécuritaire",
+                        "Nom": isin,
+                        "ISIN": isin,
+                        "Poids poche %": (amt / budget_secure * 100) if budget_secure > 0 else 0.0,
+                        "Poids global %": (amt / total_budget * 100) if total_budget > 0 else 0.0,
+                        "Montant € (ENTIER)": int(amt),
+                        "Commentaire": "Défensif / obligataire",
+                    }
+                )
+            for isin in selected_growth:
+                amt = growth_amounts.get(isin, 0)
+                rows.append(
+                    {
+                        "Poche": "Croissance",
+                        "Nom": isin,
+                        "ISIN": isin,
+                        "Poids poche %": (amt / budget_growth * 100) if budget_growth > 0 else 0.0,
+                        "Poids global %": (amt / total_budget * 100) if total_budget > 0 else 0.0,
+                        "Montant € (ENTIER)": int(amt),
+                        "Commentaire": "Actions / UC croissance",
+                    }
+                )
+            df_export = pd.DataFrame(rows)
         st.dataframe(
             df_export.style.format(
                 {
@@ -1793,10 +1808,9 @@ def render_portfolio_builder():
             use_container_width=True,
             hide_index=True,
         )
-        st.caption(
-            f"Reste à allouer (sécuritaire) : {to_eur(left_secure)} | "
-            f"(croissance) : {to_eur(left_growth)}"
-        )
+        allocated = df_export["Montant € (ENTIER)"].sum() if not df_export.empty else 0
+        remainder = int(round(total_budget - allocated))
+        st.caption(f"Budget total : {to_eur(total_budget)} • Reste non alloué : {to_eur(remainder)}")
 
         st.download_button(
             "📥 Télécharger l’allocation (CSV)",
@@ -1805,44 +1819,21 @@ def render_portfolio_builder():
             mime="text/csv",
         )
 
-        if st.button("📤 Envoyer vers le comparateur (portefeuille Valority)"):
-            st.session_state["B_lines"] = []
-            for _, row in df_export.iterrows():
-                if int(row["Montant € (ENTIER)"]) <= 0:
-                    continue
-                st.session_state["B_lines"].append(
-                    {
-                        "name": row["Nom"],
-                        "isin": row["ISIN"],
-                        "amount_gross": int(row["Montant € (ENTIER)"]),
-                        "buy_date": pd.Timestamp(invest_date),
-                        "buy_px": "",
-                        "note": "",
-                        "sym_used": "",
-                    }
-                )
-            st.success("Allocation envoyée vers le comparateur (Portefeuille Valority).")
-
-        st.markdown("### 8) Analyses & visualisations")
-        if returns.empty:
+        st.markdown("### 7) Analyses & visualisations")
+        if returns.empty or not selected_growth:
             st.info("Données insuffisantes pour les analyses (corrélation/KPI).")
             return
 
-        corr = returns.corr()
+        corr = returns[selected_growth].corr()
         avg_corr = (
             corr.values[np.triu_indices_from(corr, 1)].mean()
             if corr.shape[0] > 1
             else np.nan
         )
 
-        weights_growth_used = {
-            ln["isin"]: (alloc_growth.get(ln["isin"], 0) / budget_growth if budget_growth > 0 else 0.0)
-            for ln in growth_lines
-            if ln["isin"] in returns.columns
-        }
-        if weights_growth_used:
-            w_vec = np.array([weights_growth_used[c] for c in returns.columns if c in weights_growth_used])
-            sub = returns[[c for c in returns.columns if c in weights_growth_used]]
+        if weights_growth:
+            w_vec = np.array([weights_growth[c] for c in corr.columns if c in weights_growth])
+            sub = returns[[c for c in corr.columns if c in weights_growth]]
             port_ret = float(sub.mean().dot(w_vec) * 252.0)
             port_vol = float(sub.std().dot(w_vec) * np.sqrt(252.0))
             dd = _compute_drawdown(sub.dot(w_vec))
@@ -1873,22 +1864,27 @@ def render_portfolio_builder():
                 fmt_pct_fr(dd * 100) if dd is not None else "—",
             )
 
-        st.caption("Le rendement est estimé via moyenne des rendements journaliers × 252.")
+        st.info(
+            "Pourquoi cette sélection ?\n"
+            "- Corrélations croisées minimisées\n"
+            "- Diversification des trajectoires de VL\n"
+            "- Limitation de la concentration"
+        )
 
         viz_cols = st.columns(2)
         with viz_cols[0]:
             st.markdown("**Allocation globale**")
             if MATPLOTLIB_AVAILABLE:
                 fig, ax = plt.subplots(figsize=(4.0, 3.0))
-                ax.pie([secure_pct, growth_pct], labels=["Sécuritaire", "Croissance"], autopct="%1.1f%%")
+                ax.pie([euro_pct, secure_pct, growth_pct], labels=["Euros", "Sécuritaire", "Croissance"], autopct="%1.1f%%")
                 ax.set_title("Global")
                 st.pyplot(fig)
                 plt.close(fig)
             else:
                 st.warning(f"Graphique indisponible ({MATPLOTLIB_ERROR}).")
         with viz_cols[1]:
-            st.markdown("**Répartition UC croissance**")
-            if MATPLOTLIB_AVAILABLE and growth_lines:
+            st.markdown("**Répartition croissance**")
+            if MATPLOTLIB_AVAILABLE and selected_growth:
                 df_growth = df_export[df_export["Poche"] == "Croissance"].copy()
                 if not df_growth.empty:
                     df_growth = df_growth.sort_values("Montant € (ENTIER)", ascending=False)
@@ -1912,7 +1908,7 @@ def render_portfolio_builder():
             else:
                 st.warning(f"Graphique indisponible ({MATPLOTLIB_ERROR}).")
 
-        st.markdown("**Heatmap corrélation (UC croissance)**")
+        st.markdown("**Heatmap corrélation (Croissance)**")
         if not corr.empty and corr.shape[0] >= 2:
             df_corr = corr.copy()
             df_corr["Ligne1"] = df_corr.index
@@ -1933,7 +1929,7 @@ def render_portfolio_builder():
                 .properties(height=260)
             )
             st.altair_chart(heat, use_container_width=True)
-            st.caption("Corrélation proche de 1 = très redondant • proche de 0 = décorrélé.")
+            st.caption("Corrélation proche de 1 = redondant • proche de 0 = décorrélé.")
         else:
             st.info("Corrélation indisponible (données insuffisantes).")
 
@@ -2320,7 +2316,7 @@ def render_app(run_page_config: bool = True):
         st.altair_chart(base, use_container_width=True)
 
     # ------------------------------------------------------------
-    # Synthèse chiffre : cartes Client / Valority
+    # Synthèse chiffrée : cartes Client / Valority
     # ------------------------------------------------------------
     st.subheader("Synthèse chiffrée")
 

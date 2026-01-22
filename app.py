@@ -2175,6 +2175,10 @@ personnalisé.
         return _fig_to_rl_image(fig, width=460, height=90)
 
 
+    def fmt_eur_pdf(x: Any) -> str:
+        return fmt_eur_fr(x)
+
+
     def generate_pdf_report(report: Dict[str, Any]) -> bytes:
         if not REPORTLAB_AVAILABLE:
             raise RuntimeError(f"PDF indisponible: {REPORTLAB_ERROR}")
@@ -2349,103 +2353,124 @@ personnalisé.
         else:
             story.append(Paragraph("Données indisponibles pour la courbe de valeur.", styles["small"]))
 
-        positions_df = report.get("positions_df")
+        def add_portfolio_details_section(
+            label: str,
+            positions_df: pd.DataFrame,
+            lines_values: List[Dict[str, Any]],
+        ):
+            # PAGE 2/4 — Détail du portefeuille
+            story.append(PageBreak())
+            story.append(Paragraph(f"Détail du portefeuille — {label}", styles["h1"]))
 
-        # PAGE 2 — Composition du portefeuille
-        story.append(PageBreak())
-        story.append(Paragraph("Composition du portefeuille", styles["h1"]))
+            if isinstance(positions_df, pd.DataFrame) and not positions_df.empty:
+                df_alloc, basis_label = _allocation_from_positions(positions_df)
 
-        if isinstance(positions_df, pd.DataFrame) and not positions_df.empty:
-            df_alloc, basis_label = _allocation_from_positions(positions_df)
-
-            if len(df_alloc) >= 2:
-                story.append(Paragraph(f"Allocation par ligne ({basis_label})", styles["h2"]))
-                donut = _build_allocation_donut(df_alloc, "Allocation par ligne")
-                if donut is not None:
-                    story.append(donut)
-                    story.append(Spacer(1, 6))
-            else:
-                line = df_alloc.iloc[0] if not df_alloc.empty else None
-                name = line["Nom"] if line is not None else "—"
-                story.append(
-                    Paragraph(
-                        f"Portefeuille concentré : 100% sur <b>{name}</b>.",
-                        styles["kpi"],
+                if len(df_alloc) >= 2:
+                    story.append(Paragraph(f"Allocation par ligne ({basis_label})", styles["h2"]))
+                    donut = _build_allocation_donut(df_alloc, "Allocation par ligne")
+                    if donut is not None:
+                        story.append(donut)
+                        story.append(Spacer(1, 6))
+                else:
+                    line = df_alloc.iloc[0] if not df_alloc.empty else None
+                    name = line["Nom"] if line is not None else "—"
+                    story.append(
+                        Paragraph(
+                            f"Portefeuille concentré : 100% sur <b>{name}</b>.",
+                            styles["kpi"],
+                        )
                     )
+                    bar = _build_single_line_bar(_wrap_label(name), 100.0, "Répartition 100%")
+                    if bar is not None:
+                        story.append(bar)
+                        story.append(Spacer(1, 6))
+
+                alloc_table = df_alloc[
+                    ["Nom", "ISIN / Code", "Part %", "Net investi €", "Valeur actuelle €"]
+                ].copy()
+                _add_table_to_story(
+                    story,
+                    alloc_table,
+                    col_widths=[170, 80, 55, 95, 95],
+                    font_size=9,
                 )
-                bar = _build_single_line_bar(_wrap_label(name), 100.0, "Répartition 100%")
-                if bar is not None:
-                    story.append(bar)
-                    story.append(Spacer(1, 6))
+                story.append(Spacer(1, 6))
 
-            alloc_table = df_alloc[
-                ["Nom", "ISIN / Code", "Part %", "Net investi €", "Valeur actuelle €"]
-            ].copy()
-            _add_table_to_story(
-                story,
-                alloc_table,
-                col_widths=[170, 80, 55, 95, 95],
-                font_size=9,
+                envelope_chart, envelope_text = _build_envelope_breakdown(
+                    lines_values,
+                    "Répartition par enveloppe",
+                )
+                if envelope_chart is not None:
+                    story.append(envelope_chart)
+                elif envelope_text:
+                    story.append(Paragraph(envelope_text, styles["small"]))
+            else:
+                story.append(Paragraph("Données indisponibles pour la composition.", styles["small"]))
+
+            # PAGE 3/5 — Contribution & Positions
+            story.append(PageBreak())
+            story.append(Paragraph(f"Contribution & positions — {label}", styles["h1"]))
+
+            if isinstance(positions_df, pd.DataFrame) and not positions_df.empty:
+                if len(positions_df) == 1:
+                    ln = positions_df.iloc[0]
+                    story.append(
+                        Paragraph(
+                            f"Contribution : <b>{ln['Nom']}</b> = {fmt_eur_pdf(ln['Valeur actuelle €'] - ln['Net investi €'])}",
+                            styles["kpi"],
+                        )
+                    )
+                    bar = _build_single_line_bar(_wrap_label(ln["Nom"]), 100.0, "Contribution (ligne unique)")
+                    if bar is not None:
+                        story.append(bar)
+                        story.append(Spacer(1, 6))
+                else:
+                    contrib_chart = _build_contribution_bar(positions_df)
+                    if contrib_chart is not None:
+                        story.append(contrib_chart)
+                        story.append(Spacer(1, 6))
+            else:
+                story.append(Paragraph("Données indisponibles pour la contribution.", styles["small"]))
+
+            story.append(Paragraph("Positions", styles["h2"]))
+            if isinstance(positions_df, pd.DataFrame) and not positions_df.empty:
+                positions_table = positions_df[
+                    [
+                        "Nom",
+                        "ISIN / Code",
+                        "Date d'achat",
+                        "Net investi €",
+                        "Valeur actuelle €",
+                        "Perf €",
+                        "Perf %",
+                    ]
+                ].copy()
+                _add_table_to_story(
+                    story,
+                    positions_table,
+                    col_widths=[150, 70, 65, 80, 80, 50, 45],
+                    font_size=9,
+                )
+            else:
+                story.append(Paragraph("Données indisponibles.", styles["small"]))
+
+        if mode == "compare":
+            add_portfolio_details_section(
+                "Client",
+                report.get("positions_df_client", pd.DataFrame()),
+                report.get("lines_client", []),
             )
-            story.append(Spacer(1, 6))
-
-            envelope_chart, envelope_text = _build_envelope_breakdown(
+            add_portfolio_details_section(
+                "Valority",
+                report.get("positions_df_valority", pd.DataFrame()),
+                report.get("lines_valority", []),
+            )
+        else:
+            add_portfolio_details_section(
+                "Valority" if mode == "valority" else "Client",
+                report.get("positions_df", pd.DataFrame()),
                 report.get("lines", []),
-                "Répartition par enveloppe",
             )
-            if envelope_chart is not None:
-                story.append(envelope_chart)
-            elif envelope_text:
-                story.append(Paragraph(envelope_text, styles["small"]))
-        else:
-            story.append(Paragraph("Données indisponibles pour la composition.", styles["small"]))
-
-        # PAGE 3 — Contribution & Positions
-        story.append(PageBreak())
-        story.append(Paragraph("Contribution & positions", styles["h1"]))
-
-        if isinstance(positions_df, pd.DataFrame) and not positions_df.empty:
-            if len(positions_df) == 1:
-                ln = positions_df.iloc[0]
-                story.append(
-                    Paragraph(
-                        f"Contribution : <b>{ln['Nom']}</b> = {fmt_eur_fr(ln['Valeur actuelle €'] - ln['Net investi €'])}",
-                        styles["kpi"],
-                    )
-                )
-                bar = _build_single_line_bar(_wrap_label(ln["Nom"]), 100.0, "Contribution (ligne unique)")
-                if bar is not None:
-                    story.append(bar)
-                    story.append(Spacer(1, 6))
-            else:
-                contrib_chart = _build_contribution_bar(positions_df)
-                if contrib_chart is not None:
-                    story.append(contrib_chart)
-                    story.append(Spacer(1, 6))
-        else:
-            story.append(Paragraph("Données indisponibles pour la contribution.", styles["small"]))
-
-        story.append(Paragraph("Positions", styles["h2"]))
-        if isinstance(positions_df, pd.DataFrame) and not positions_df.empty:
-            positions_table = positions_df[
-                [
-                    "Nom",
-                    "ISIN / Code",
-                    "Date d'achat",
-                    "Net investi €",
-                    "Valeur actuelle €",
-                    "Perf €",
-                    "Perf %",
-                ]
-            ].copy()
-            _add_table_to_story(
-                story,
-                positions_table,
-                col_widths=[150, 70, 65, 80, 80, 50, 45],
-                font_size=9,
-            )
-        else:
-            story.append(Paragraph("Données indisponibles.", styles["small"]))
 
         doc.build(story, canvasmaker=NumberedCanvas)
         buffer.seek(0)
@@ -2467,6 +2492,8 @@ personnalisé.
 
     report_data["df_client_lines"] = df_client_lines
     report_data["df_valority_lines"] = df_valority_lines
+    report_data["positions_df_client"] = df_client_lines
+    report_data["positions_df_valority"] = df_valority_lines
     report_data["dfA_val"] = dfA.reset_index().rename(columns={"index": "Date"}) if not dfA.empty else pd.DataFrame()
     report_data["dfB_val"] = dfB.reset_index().rename(columns={"index": "Date"}) if not dfB.empty else pd.DataFrame()
     report_data["client_summary"] = {
@@ -2526,18 +2553,32 @@ personnalisé.
             "value_per_year": value_per_year,
         }
 
+    def _build_lines_with_values(
+        lines_src: List[Dict[str, Any]],
+        positions_src: pd.DataFrame,
+    ) -> List[Dict[str, Any]]:
+        items: List[Dict[str, Any]] = []
+        if isinstance(positions_src, pd.DataFrame) and not positions_src.empty:
+            for ln in lines_src:
+                isin = ln.get("isin", "")
+                name = ln.get("name", "")
+                match = positions_src[
+                    (positions_src["Nom"] == name) & (positions_src["ISIN / Code"] == isin)
+                ]
+                val = float(match["Valeur actuelle €"].iloc[0]) if not match.empty else 0.0
+                items.append({"isin": isin, "value": val})
+        return items
+
     report_data["positions_df"] = positions_df
-    lines_with_values: List[Dict[str, Any]] = []
-    if isinstance(positions_df, pd.DataFrame) and not positions_df.empty:
-        for ln in lines:
-            isin = ln.get("isin", "")
-            name = ln.get("name", "")
-            match = positions_df[
-                (positions_df["Nom"] == name) & (positions_df["ISIN / Code"] == isin)
-            ]
-            val = float(match["Valeur actuelle €"].iloc[0]) if not match.empty else 0.0
-            lines_with_values.append({"isin": isin, "value": val})
-    report_data["lines"] = lines_with_values
+    report_data["lines"] = _build_lines_with_values(lines, positions_df)
+    report_data["lines_client"] = _build_lines_with_values(
+        st.session_state.get("A_lines", []),
+        df_client_lines,
+    )
+    report_data["lines_valority"] = _build_lines_with_values(
+        st.session_state.get("B_lines", []),
+        df_valority_lines,
+    )
 
     st.session_state["REPORT_DATA"] = report_data
 

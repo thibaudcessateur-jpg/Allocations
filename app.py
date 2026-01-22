@@ -1,10 +1,4 @@
- (cd "$(git rev-parse --show-toplevel)" && git apply --3way <<'EOF' 
-diff --git a/app.py b/app.py
-index a5772824f245811d5a6952335deefbc439d49029..0828b8c5080b7940b8edaaee6f5290034c159c9b 100644
---- a/app.py
- b/app.py
-@@ -1,132 1,189 @@
- from __future__ import annotations
+from __future__ import annotations
  
  import json
 import sys

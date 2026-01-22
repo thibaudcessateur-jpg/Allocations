@@ -1371,11 +1371,280 @@ def _add_line_form_free(port_key: str, label: str):
     st.success("Ligne ajoutée.")
 
 
-def render_app():
+@st.cache_data(show_spinner=False, ttl=3600)
+def _build_returns_matrix(
+    isins: Tuple[str, ...],
+    euro_rate: float,
+    years: int,
+) -> Tuple[pd.DataFrame, List[str]]:
+    series_map: Dict[str, pd.Series] = {}
+    warnings: List[str] = []
+    cutoff = None
+    if years > 0:
+        cutoff = TODAY - pd.Timedelta(days=365 * years)
+
+    for isin in isins:
+        df, _, _ = get_price_series(isin, None, euro_rate)
+        if df.empty or df["Close"].dropna().shape[0] < 30:
+            warnings.append(f"{isin} : historique insuffisant")
+            continue
+        s = df["Close"].astype(float)
+        if cutoff is not None:
+            s = s[s.index >= cutoff]
+        if s.dropna().shape[0] < 30:
+            warnings.append(f"{isin} : historique insuffisant")
+            continue
+        series_map[isin] = s
+
+    if not series_map:
+        return pd.DataFrame(), warnings
+
+    prices = pd.DataFrame(series_map).ffill().dropna(how="any")
+    if prices.shape[0] < 30:
+        return pd.DataFrame(), warnings
+    returns = prices.pct_change().dropna(how="any")
+    return returns, warnings
+
+
+def _suggest_weights(
+    returns: pd.DataFrame,
+    max_weight: float,
+    min_funds: int,
+) -> Dict[str, float]:
+    if returns.empty:
+        return {}
+    corr = returns.corr()
+    vols = returns.std() * np.sqrt(252.0)
+    avg_corr = corr.mean()
+    ranked = avg_corr.sort_values().index.tolist()
+    min_funds = max(1, min(min_funds, len(ranked)))
+    selected = ranked[:min_funds]
+    inv_vol = 1 / vols[selected]
+    weights = (inv_vol / inv_vol.sum()).to_dict()
+
+    # cap weights if needed
+    if max_weight > 0 and max_weight < 1:
+        for _ in range(10):
+            over = {k: v for k, v in weights.items() if v > max_weight}
+            if not over:
+                break
+            excess = sum(v - max_weight for v in over.values())
+            for k in over:
+                weights[k] = max_weight
+            remaining = {k: v for k, v in weights.items() if k not in over}
+            if not remaining:
+                break
+            total_remaining = sum(remaining.values())
+            for k in remaining:
+                weights[k] += excess * (remaining[k] / total_remaining)
+
+    total = sum(weights.values())
+    if total > 0:
+        weights = {k: v / total for k, v in weights.items()}
+    return weights
+
+
+def render_portfolio_builder():
+    st.title("Créer le portefeuille parfait")
+
+    profile_map = {
+        "Prudent": 70,
+        "Équilibré": 50,
+        "Dynamique": 30,
+        "Agressif": 10,
+    }
+    profile = st.selectbox("Profil recommandé", list(profile_map.keys()))
+    secure_default = profile_map[profile]
+    secure_pct = st.slider("Poche sécuritaire (%)", 0, 100, secure_default, 1)
+    growth_pct = 100 - secure_pct
+    st.caption(f"Poche croissance : {growth_pct}%")
+
+    euro_rate = st.number_input("Taux fonds euros (%)", 0.0, 10.0, 2.0, 0.10)
+    risk_free = st.number_input("Taux sans risque (%)", -1.0, 10.0, 0.0, 0.10)
+    window_years = st.selectbox("Fenêtre d’analyse", ["3 ans", "5 ans", "Max"])
+    years = 0 if window_years == "Max" else int(window_years.split()[0])
+
+    secure_options = {f"{name} ({isin})": (name, isin) for name, isin in RECO_FUNDS_DEF}
+    growth_options = {f"{name} ({isin})": (name, isin) for name, isin in RECO_FUNDS_CORE}
+
+    st.subheader("Sélection des fonds")
+    secure_sel = st.multiselect(
+        "Fonds sécuritaires",
+        list(secure_options.keys()),
+        default=list(secure_options.keys())[:1],
+    )
+    growth_sel = st.multiselect(
+        "Fonds croissance",
+        list(growth_options.keys()),
+        default=list(growth_options.keys())[:3],
+    )
+
+    st.session_state.setdefault("builder_secure_extra", [])
+    st.session_state.setdefault("builder_growth_extra", [])
+
+    c1, c2 = st.columns(2)
+    with c1:
+        extra_secure = st.text_input("Ajouter ISIN sécuritaire (optionnel)", value="")
+        if st.button("Ajouter ISIN sécuritaire"):
+            if extra_secure.strip():
+                st.session_state["builder_secure_extra"].append(extra_secure.strip())
+    with c2:
+        extra_growth = st.text_input("Ajouter ISIN croissance (optionnel)", value="")
+        if st.button("Ajouter ISIN croissance"):
+            if extra_growth.strip():
+                st.session_state["builder_growth_extra"].append(extra_growth.strip())
+
+    secure_funds = [secure_options[k] for k in secure_sel]
+    growth_funds = [growth_options[k] for k in growth_sel]
+    for isin in st.session_state["builder_secure_extra"]:
+        secure_funds.append((isin, isin))
+    for isin in st.session_state["builder_growth_extra"]:
+        growth_funds.append((isin, isin))
+
+    if not secure_funds and not growth_funds:
+        st.info("Ajoutez au moins un fonds pour démarrer.")
+        return
+
+    growth_isins = tuple(sorted({isin for _, isin in growth_funds}))
+    returns, warnings = _build_returns_matrix(growth_isins, euro_rate, years)
+    for msg in warnings:
+        st.warning(msg)
+
+    st.subheader("Construction des poids (poche croissance)")
+    mode_alloc = st.radio("Mode d’allocation", ["Auto (diversification)", "Manuel"], horizontal=True)
+    max_weight_pct = st.slider("Max par fonds (%)", 10, 100, 40, 5) / 100.0
+    min_funds = st.slider("Minimum de fonds", 1, max(1, len(growth_isins)), min(3, max(1, len(growth_isins))), 1)
+
+    weights_growth: Dict[str, float] = {}
+    if mode_alloc == "Auto (diversification)":
+        if returns.empty or len(growth_isins) == 0:
+            st.warning("Données insuffisantes pour l’auto-allocation.")
+        else:
+            weights_growth = _suggest_weights(returns, max_weight_pct, min_funds)
+    else:
+        if growth_isins:
+            for isin in growth_isins:
+                weights_growth[isin] = st.slider(f"Poids {isin} (%)", 0, 100, int(100 / len(growth_isins)), 1) / 100.0
+            total = sum(weights_growth.values())
+            if total > 0:
+                weights_growth = {k: v / total for k, v in weights_growth.items()}
+
+    if not weights_growth and growth_isins:
+        weights_growth = {isin: 1.0 / len(growth_isins) for isin in growth_isins}
+
+    weights_secure = {}
+    if secure_funds:
+        equal = 1.0 / len(secure_funds)
+        weights_secure = {isin: equal for _, isin in secure_funds}
+
+    st.subheader("Visualisation")
+    if MATPLOTLIB_AVAILABLE:
+        fig, ax = plt.subplots(figsize=(4.5, 3.0))
+        ax.pie([secure_pct, growth_pct], labels=["Sécuritaire", "Croissance"], autopct="%1.1f%%")
+        ax.set_title("Allocation globale")
+        st.pyplot(fig)
+        plt.close(fig)
+    else:
+        st.warning(f"Graphiques indisponibles ({MATPLOTLIB_ERROR}).")
+
+    if MATPLOTLIB_AVAILABLE and weights_growth:
+        fig, ax = plt.subplots(figsize=(4.5, 3.0))
+        labels = list(weights_growth.keys())
+        ax.pie(list(weights_growth.values()), labels=labels, autopct="%1.1f%%")
+        ax.set_title("Répartition UC (croissance)")
+        st.pyplot(fig)
+        plt.close(fig)
+
+    if not returns.empty and len(weights_growth) >= 2:
+        corr = returns.corr()
+        df_corr = corr.copy()
+        df_corr["Ligne1"] = df_corr.index
+        df_melt = df_corr.melt(id_vars="Ligne1", var_name="Ligne2", value_name="corr")
+        heat = (
+            alt.Chart(df_melt)
+            .mark_rect()
+            .encode(
+                x=alt.X("Ligne1:O", sort=None, title=""),
+                y=alt.Y("Ligne2:O", sort=None, title=""),
+                color=alt.Color("corr:Q", scale=alt.Scale(domain=[-1, 1])),
+                tooltip=["Ligne1", "Ligne2", alt.Tooltip("corr:Q", format=".2f")],
+            )
+            .properties(title="Corrélation UC (plus clair = plus décorrélé)", height=300)
+        )
+        st.altair_chart(heat, use_container_width=True)
+    else:
+        st.info("Corrélation indisponible (données insuffisantes).")
+
+    st.subheader("Alertes redondance")
+    if not returns.empty and len(weights_growth) >= 2:
+        corr = returns.corr()
+        alerts = []
+        for i, a in enumerate(corr.columns):
+            for b in corr.columns[i + 1 :]:
+                if corr.loc[a, b] > 0.8:
+                    alerts.append(f"{a} / {b} : {corr.loc[a, b]:.2f}")
+        if alerts:
+            st.warning("Paires très corrélées (>0.8) : " + ", ".join(alerts))
+        else:
+            st.success("Aucune corrélation excessive détectée.")
+    else:
+        st.info("Aucune alerte (données insuffisantes).")
+
+    st.subheader("KPI poche croissance")
+    if not returns.empty and weights_growth:
+        w = np.array([weights_growth[k] for k in returns.columns if k in weights_growth])
+        cols = [k for k in returns.columns if k in weights_growth]
+        if cols:
+            sub = returns[cols]
+            port_ret = sub.mean().dot(w) * 252.0
+            port_vol = sub.std().dot(w) * np.sqrt(252.0)
+            sharpe = (port_ret - risk_free / 100.0) / port_vol if port_vol > 0 else np.nan
+            avg_corr = sub.corr().values[np.triu_indices_from(sub.corr(), 1)].mean() if len(cols) > 1 else np.nan
+            st.metric("Rendement annualisé", fmt_pct_fr(port_ret * 100))
+            st.metric("Volatilité annualisée", fmt_pct_fr(port_vol * 100))
+            st.metric("Sharpe simplifié", f"{sharpe:.2f}" if sharpe == sharpe else "—")
+            st.metric("Corrélation moyenne", f"{avg_corr:.2f}" if avg_corr == avg_corr else "—")
+    else:
+        st.info("KPI indisponibles (données insuffisantes).")
+
+    st.subheader("Exporter portefeuille")
+    rows = []
+    for name, isin in secure_funds:
+        rows.append(
+            {
+                "Poche": "Sécuritaire",
+                "Nom": name,
+                "ISIN": isin,
+                "Poids poche %": weights_secure.get(isin, 0.0) * 100,
+                "Poids global %": weights_secure.get(isin, 0.0) * secure_pct,
+            }
+        )
+    for name, isin in growth_funds:
+        rows.append(
+            {
+                "Poche": "Croissance",
+                "Nom": name,
+                "ISIN": isin,
+                "Poids poche %": weights_growth.get(isin, 0.0) * 100,
+                "Poids global %": weights_growth.get(isin, 0.0) * growth_pct,
+            }
+        )
+    df_export = pd.DataFrame(rows)
+    st.dataframe(df_export, use_container_width=True, hide_index=True)
+    st.download_button(
+        "📥 Télécharger l’allocation (CSV)",
+        data=df_export.to_csv(index=False).encode("utf-8"),
+        file_name="allocation_portefeuille.csv",
+        mime="text/csv",
+    )
+
+
+def render_app(run_page_config: bool = True):
     # ------------------------------------------------------------
     # Layout principal
     # ------------------------------------------------------------
-    st.set_page_config(page_title=APP_TITLE, layout="wide")
+    if run_page_config:
+        st.set_page_config(page_title=APP_TITLE, layout="wide")
     st.title(APP_TITLE)
     st.info(f"App chargée, statut {st.session_state.get('APP_STATUS', 'OK')}")
     # Init state
@@ -2965,9 +3234,22 @@ Avec l’allocation Valority, il serait autour de **{to_eur(valB)}**, soit envir
 
 
 
+def render_mode_router():
+    st.set_page_config(page_title=APP_TITLE, layout="wide")
+    mode = st.radio(
+        "Choisissez votre mode",
+        ["Créer le portefeuille parfait", "Comparateur de portefeuilles"],
+        horizontal=True,
+    )
+    if mode == "Créer le portefeuille parfait":
+        render_portfolio_builder()
+    else:
+        render_app(run_page_config=False)
+
+
 def _render_with_crash_shield():
     try:
-        render_app()
+        render_mode_router()
         st.session_state["APP_STATUS"] = "OK"
     except Exception as e:
         st.session_state["APP_STATUS"] = "KO"

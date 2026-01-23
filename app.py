@@ -65,6 +65,8 @@ RECO_FUNDS_DEF = [
     ("Euro Bond 1-3 Years", "LU0321462953"),
 ]
 
+FUND_NAME_MAP = {isin: name for name, isin in RECO_FUNDS_CORE + RECO_FUNDS_DEF}
+
 # Libellés FR -> codes internes pour l'affectation des versements
 ALLOC_LABELS = {
     "Répartition égale": "equal",
@@ -815,6 +817,7 @@ def portfolio_summary_dataframe(port_key: str) -> pd.DataFrame:
     return df
 
 
+
 def build_positions_dataframe(port_key: str) -> pd.DataFrame:
     """
     Construit un DataFrame par ligne :
@@ -985,6 +988,7 @@ def _prepare_pie_df(df_positions: pd.DataFrame, max_items: int = 8, min_pct: flo
 # Analytics internes : retours, corrélation, volatilité
 # ------------------------------------------------------------
 
+
 def _build_returns_df(
     lines: List[Dict[str, Any]],
     euro_rate: float,
@@ -1024,6 +1028,7 @@ def _build_returns_df(
 
     returns = df_prices.pct_change().dropna(how="any")
     return returns
+
 
 
 def correlation_matrix_from_lines(
@@ -1379,13 +1384,16 @@ def _build_returns_matrix(
     start: pd.Timestamp,
     end: pd.Timestamp,
     min_points: int = 60,
-) -> Tuple[pd.DataFrame, List[str], Dict[str, str]]:
+) -> Tuple[pd.DataFrame, List[str], Dict[str, str], Dict[str, str]]:
     series_map: Dict[str, pd.Series] = {}
     warnings: List[str] = []
     status: Dict[str, str] = {}
+    sym_used_map: Dict[str, str] = {}
 
     for isin in isins:
-        df, _, _ = get_price_series(isin, None, euro_rate)
+        df, sym_used, _ = get_price_series(isin, None, euro_rate)
+        if sym_used:
+            sym_used_map[isin] = sym_used
         if df.empty or df["Close"].dropna().shape[0] < min_points:
             warnings.append(f"{isin} : historique insuffisant")
             status[isin] = "insufficient"
@@ -1400,13 +1408,13 @@ def _build_returns_matrix(
         status[isin] = "ok"
 
     if not series_map:
-        return pd.DataFrame(), warnings, status
+        return pd.DataFrame(), warnings, status, sym_used_map
 
     prices = pd.DataFrame(series_map).ffill().dropna(how="any")
     if prices.shape[0] < min_points:
-        return pd.DataFrame(), warnings, status
+        return pd.DataFrame(), warnings, status, sym_used_map
     returns = prices.pct_change().dropna(how="any")
-    return returns, warnings, status
+    return returns, warnings, status, sym_used_map
 
 
 def _suggest_weights(
@@ -1533,6 +1541,72 @@ def _compute_drawdown(returns: pd.Series) -> Optional[float]:
     return float(dd.min())
 
 
+def _fund_name(isin: str) -> str:
+    return FUND_NAME_MAP.get(isin, isin)
+
+
+def _get_fundamentals_by_isin(isin: str, sym_hint: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    if not isin or isin.upper() == "EUROFUND":
+        return None
+    candidates: List[str] = []
+    if sym_hint:
+        candidates.append(sym_hint)
+    candidates.extend(_symbol_candidates(isin))
+    seen = set()
+    for sym in candidates:
+        if sym in seen:
+            continue
+        seen.add(sym)
+        if "." not in sym:
+            continue
+        try:
+            data = eodhd_get(f"/fundamentals/{sym}")
+        except Exception:
+            data = None
+        if isinstance(data, dict) and data:
+            return data
+    return None
+
+
+def _safe_fund_label(name: str, isin: str) -> str:
+    cleaned = str(name or "").strip()
+    if cleaned:
+        return f"{cleaned} ({isin})"
+    if isin:
+        res = eodhd_search(isin)
+        if res:
+            maybe = res[0].get("Name") or res[0].get("name")
+            if maybe:
+                return f"{maybe} ({isin})"
+    return f"{isin} ({isin})"
+
+
+def _extract_weights(data: Any) -> Dict[str, float]:
+    if isinstance(data, dict):
+        out = {}
+        for k, v in data.items():
+            try:
+                out[k] = float(v)
+            except Exception:
+                continue
+        return out
+    if isinstance(data, list):
+        out = {}
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+            name = item.get("Name") or item.get("name") or item.get("Asset") or item.get("Asset_Name")
+            weight = item.get("Weight") or item.get("weight") or item.get("Allocation") or item.get("Percent")
+            if name is None or weight is None:
+                continue
+            try:
+                out[str(name)] = float(weight)
+            except Exception:
+                continue
+        return out
+    return {}
+
+
 def render_portfolio_builder():
     st.title("Créer le portefeuille parfait")
     try:
@@ -1628,21 +1702,33 @@ def render_portfolio_builder():
         weight_method = st.selectbox("Méthode de pondération", ["Égalitaire", "Inverse-volatilité"])
         anchor_isin = None
         if growth_mode == "Auto — avec fonds imposé (anchor)":
-            anchor_options = [f"{name} ({isin})" for name, isin in RECO_FUNDS_CORE]
+            anchor_options = [_safe_fund_label(name, isin) for name, isin in RECO_FUNDS_CORE]
+            anchor_lookup = {label: isin for label, (_, isin) in zip(anchor_options, RECO_FUNDS_CORE)}
             anchor_choice = st.selectbox("Fonds croissance imposé", anchor_options)
-            anchor_isin = anchor_choice.split("(")[-1].replace(")", "").strip()
+            anchor_isin = anchor_lookup.get(anchor_choice)
 
-        euro_rate = st.number_input("Taux fonds euros (%)", 0.0, 10.0, 2.0, 0.10)
-
+        euro_rate = 2.0
         growth_candidates = [isin for _, isin in RECO_FUNDS_CORE]
-        returns, warnings, status = _build_returns_matrix(tuple(growth_candidates), euro_rate, start, end)
-        for msg in warnings:
-            st.info(msg)
+        returns, warnings, status, sym_used_map = _build_returns_matrix(
+            tuple(growth_candidates),
+            euro_rate,
+            start,
+            end,
+        )
+        if warnings:
+            st.info("Certains fonds n'ont pas assez d'historique sur la fenêtre sélectionnée.")
 
         valid_growth = [isin for isin in growth_candidates if status.get(isin) == "ok"]
         if growth_mode == "Auto — avec fonds imposé (anchor)" and anchor_isin not in valid_growth:
             st.warning("Le fonds imposé n'a pas assez d'historique sur la fenêtre. Sélection auto classique appliquée.")
             anchor_isin = None
+
+        st.markdown("**Univers croissance**")
+        for name, isin in RECO_FUNDS_CORE:
+            st.caption(
+                f"- {_safe_fund_label(name, isin)} — "
+                f"{'✅ historique suffisant' if status.get(isin) == 'ok' else '⚠️ historique insuffisant'}"
+            )
 
         selected_growth = []
         if returns.empty or len(valid_growth) == 0:
@@ -1711,7 +1797,7 @@ def render_portfolio_builder():
             rows.append(
                 {
                     "Poche": "Fonds euros",
-                    "Nom": "Fonds en euros (EUROFUND)",
+                    "Nom": _fund_name("EUROFUND"),
                     "ISIN": "EUROFUND",
                     "Poids poche %": 100.0,
                     "Poids global %": (euro_amount / total_budget * 100) if total_budget > 0 else 0.0,
@@ -1724,7 +1810,7 @@ def render_portfolio_builder():
             rows.append(
                 {
                     "Poche": "Sécuritaire",
-                    "Nom": isin,
+                    "Nom": _fund_name(isin),
                     "ISIN": isin,
                     "Poids poche %": (amt / budget_secure * 100) if budget_secure > 0 else 0.0,
                     "Poids global %": (amt / total_budget * 100) if total_budget > 0 else 0.0,
@@ -1737,7 +1823,7 @@ def render_portfolio_builder():
             rows.append(
                 {
                     "Poche": "Croissance",
-                    "Nom": isin,
+                    "Nom": _fund_name(isin),
                     "ISIN": isin,
                     "Poids poche %": (amt / budget_growth * 100) if budget_growth > 0 else 0.0,
                     "Poids global %": (amt / total_budget * 100) if total_budget > 0 else 0.0,
@@ -1763,7 +1849,7 @@ def render_portfolio_builder():
                 rows.append(
                     {
                         "Poche": "Fonds euros",
-                        "Nom": "Fonds en euros (EUROFUND)",
+                        "Nom": _fund_name("EUROFUND"),
                         "ISIN": "EUROFUND",
                         "Poids poche %": 100.0,
                         "Poids global %": (euro_amount / total_budget * 100) if total_budget > 0 else 0.0,
@@ -1776,7 +1862,7 @@ def render_portfolio_builder():
                 rows.append(
                     {
                         "Poche": "Sécuritaire",
-                        "Nom": isin,
+                        "Nom": _fund_name(isin),
                         "ISIN": isin,
                         "Poids poche %": (amt / budget_secure * 100) if budget_secure > 0 else 0.0,
                         "Poids global %": (amt / total_budget * 100) if total_budget > 0 else 0.0,
@@ -1789,7 +1875,7 @@ def render_portfolio_builder():
                 rows.append(
                     {
                         "Poche": "Croissance",
-                        "Nom": isin,
+                        "Nom": _fund_name(isin),
                         "ISIN": isin,
                         "Poids poche %": (amt / budget_growth * 100) if budget_growth > 0 else 0.0,
                         "Poids global %": (amt / total_budget * 100) if total_budget > 0 else 0.0,
@@ -1952,6 +2038,199 @@ def render_portfolio_builder():
                 )
             else:
                 st.success("Aucune paire redondante détectée.")
+
+        st.markdown("### 8) Analyse fondamentale (indicative)")
+        analyzable = [isin for isin in (selected_growth + secure_isins) if isin != "EUROFUND"]
+        if not analyzable:
+            st.info("Aucun fonds analysable (hors fonds euros).")
+            return
+
+        alloc_map = {}
+        if not df_export.empty and "ISIN" in df_export.columns:
+            alloc_map = {
+                str(row["ISIN"]): float(row["Montant € (ENTIER)"])
+                for _, row in df_export.iterrows()
+            }
+        total_alloc = sum(alloc_map.get(isin, 0.0) for isin in analyzable)
+
+        chosen_labels = [_safe_fund_label(_fund_name(isin), isin) for isin in analyzable]
+        choice_lookup = {label: isin for label, isin in zip(chosen_labels, analyzable)}
+        chosen_label = st.selectbox("Fonds à analyser", chosen_labels)
+        isin_value = choice_lookup.get(chosen_label, "")
+
+        sym_hint = sym_used_map.get(isin_value) if "sym_used_map" in locals() else None
+        fundamentals = _get_fundamentals_by_isin(isin_value, sym_hint=sym_hint)
+        if not fundamentals:
+            st.info("Données fondamentales indisponibles pour ce fonds.")
+            return
+
+        def _top_df(data: Dict[str, float], label: str, n: int = 10) -> pd.DataFrame:
+            if not data:
+                return pd.DataFrame()
+            df = pd.DataFrame(
+                [{"Nom": k, label: v} for k, v in sorted(data.items(), key=lambda x: x[1], reverse=True)[:n]]
+            )
+            return df
+
+        def _aggregate_fundamentals(funds: List[Tuple[float, Dict[str, float]]]) -> Dict[str, float]:
+            if not funds:
+                return {}
+            total_weight = sum(w for w, _ in funds if w > 0)
+            if total_weight <= 0:
+                return {}
+            agg: Dict[str, float] = {}
+            for weight, data in funds:
+                for key, val in data.items():
+                    agg[key] = agg.get(key, 0.0) + (weight * float(val))
+            return {k: v / total_weight for k, v in agg.items()}
+
+        etf_data = fundamentals.get("ETF_Data", {})
+        asset_alloc = _extract_weights(etf_data.get("Asset_Allocation") or etf_data.get("asset_allocation"))
+        sectors = _extract_weights(etf_data.get("Sector_Weights") or etf_data.get("sector_weights"))
+        countries = _extract_weights(etf_data.get("Country_Weights") or etf_data.get("country_weights"))
+        holdings = _extract_weights(etf_data.get("Holdings") or etf_data.get("holdings"))
+
+        if not asset_alloc and not sectors and not countries and not holdings:
+            st.info("Données fondamentales incomplètes pour ce fonds.")
+            return
+
+        portfolio_asset = []
+        portfolio_sector = []
+        portfolio_geo = []
+        portfolio_holdings = []
+        missing_funds = []
+
+        for isin in analyzable:
+            weight = alloc_map.get(isin, 0.0)
+            if weight <= 0 or total_alloc <= 0:
+                continue
+            sym_hint = sym_used_map.get(isin) if "sym_used_map" in locals() else None
+            data = _get_fundamentals_by_isin(isin, sym_hint=sym_hint)
+            if not data:
+                missing_funds.append(isin)
+                continue
+            etf = data.get("ETF_Data", {})
+            asset = _extract_weights(etf.get("Asset_Allocation") or etf.get("asset_allocation"))
+            sector = _extract_weights(etf.get("Sector_Weights") or etf.get("sector_weights"))
+            geo = _extract_weights(etf.get("Country_Weights") or etf.get("country_weights"))
+            hold = _extract_weights(etf.get("Holdings") or etf.get("holdings"))
+            if asset:
+                portfolio_asset.append((weight, asset))
+            if sector:
+                portfolio_sector.append((weight, sector))
+            if geo:
+                portfolio_geo.append((weight, geo))
+            if hold:
+                portfolio_holdings.append((weight, hold))
+
+        if missing_funds:
+            st.caption(
+                "Données fondamentales manquantes pour : "
+                + ", ".join([_fund_name(isin) for isin in missing_funds])
+            )
+
+        st.markdown("**Vue agrégée du portefeuille (pro-rata des montants)**")
+        agg_assets = _aggregate_fundamentals(portfolio_asset)
+        agg_sectors = _aggregate_fundamentals(portfolio_sector)
+        agg_countries = _aggregate_fundamentals(portfolio_geo)
+        agg_holdings = _aggregate_fundamentals(portfolio_holdings)
+
+        agg_cols = st.columns(2)
+        with agg_cols[0]:
+            st.markdown("**Allocation d’actifs (agrégée)**")
+            df_assets = _top_df(agg_assets, "Poids %")
+            if df_assets.empty:
+                st.info("Allocation d’actifs indisponible.")
+            else:
+                st.dataframe(
+                    df_assets.style.format({"Poids %": "{:,.2f}%".format}),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+        with agg_cols[1]:
+            st.markdown("**Secteurs (agrégés)**")
+            df_sectors = _top_df(agg_sectors, "Poids %")
+            if df_sectors.empty:
+                st.info("Secteurs indisponibles.")
+            else:
+                st.dataframe(
+                    df_sectors.style.format({"Poids %": "{:,.2f}%".format}),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+        agg_cols = st.columns(2)
+        with agg_cols[0]:
+            st.markdown("**Géographie (agrégée)**")
+            df_countries = _top_df(agg_countries, "Poids %")
+            if df_countries.empty:
+                st.info("Répartition géographique indisponible.")
+            else:
+                st.dataframe(
+                    df_countries.style.format({"Poids %": "{:,.2f}%".format}),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+        with agg_cols[1]:
+            st.markdown("**Top holdings (agrégés)**")
+            df_holdings = _top_df(agg_holdings, "Poids %")
+            if df_holdings.empty:
+                st.info("Top holdings indisponibles.")
+            else:
+                st.dataframe(
+                    df_holdings.style.format({"Poids %": "{:,.2f}%".format}),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+        st.markdown("**Détail du fonds sélectionné**")
+        cols = st.columns(2)
+        with cols[0]:
+            st.markdown("**Allocation d’actifs**")
+            df_assets = _top_df(asset_alloc, "Poids %")
+            if df_assets.empty:
+                st.info("Allocation d’actifs indisponible.")
+            else:
+                st.dataframe(
+                    df_assets.style.format({"Poids %": "{:,.2f}%".format}),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+        with cols[1]:
+            st.markdown("**Secteurs**")
+            df_sectors = _top_df(sectors, "Poids %")
+            if df_sectors.empty:
+                st.info("Secteurs indisponibles.")
+            else:
+                st.dataframe(
+                    df_sectors.style.format({"Poids %": "{:,.2f}%".format}),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+        cols = st.columns(2)
+        with cols[0]:
+            st.markdown("**Géographie**")
+            df_countries = _top_df(countries, "Poids %")
+            if df_countries.empty:
+                st.info("Répartition géographique indisponible.")
+            else:
+                st.dataframe(
+                    df_countries.style.format({"Poids %": "{:,.2f}%".format}),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+        with cols[1]:
+            st.markdown("**Top holdings**")
+            df_holdings = _top_df(holdings, "Poids %")
+            if df_holdings.empty:
+                st.info("Top holdings indisponibles.")
+            else:
+                st.dataframe(
+                    df_holdings.style.format({"Poids %": "{:,.2f}%".format}),
+                    use_container_width=True,
+                    hide_index=True,
+                )
     except Exception as exc:
         st.error("Une erreur est survenue dans le builder. L’application reste utilisable.")
         st.exception(exc)

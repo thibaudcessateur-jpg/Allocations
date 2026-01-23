@@ -827,7 +827,6 @@ def portfolio_summary_dataframe(port_key: str) -> pd.DataFrame:
     return df
 
 
-
 def build_positions_dataframe(port_key: str) -> pd.DataFrame:
     """
     Construit un DataFrame par ligne :
@@ -997,7 +996,6 @@ def _prepare_pie_df(df_positions: pd.DataFrame, max_items: int = 8, min_pct: flo
 # ------------------------------------------------------------
 # Analytics internes : retours, corrélation, volatilité
 # ------------------------------------------------------------
-
 
 def _build_returns_df(
     lines: List[Dict[str, Any]],
@@ -1684,7 +1682,7 @@ def _safe_fund_label(name: str, isin: str) -> str:
             maybe = res[0].get("Name") or res[0].get("name")
             if maybe:
                 return f"{maybe} ({isin})"
-    return f"{isin} ({isin})"
+    return f"{isin} ({isin)}"
 
 
 def render_portfolio_builder():

@@ -1752,6 +1752,26 @@ def render_portfolio_builder():
         action_count = st.selectbox("Nombre de fonds actions", [2, 3, 4, 5, 6], index=1)
         bond_count = st.selectbox("Nombre de fonds obligataires/sécuritaires UC", [1, 2, 3], index=1)
         max_weight_pct = 25
+        objective_choice = st.selectbox(
+            "Objectif d’optimisation",
+            [
+                "Maximiser le ratio de Sharpe (UC)",
+                "Minimiser la volatilité (UC)",
+                "Maximiser le rendement annualisé (UC)",
+                "Meilleur compromis rendement/risque (UC)",
+                "Diversification maximale",
+                "Risk Parity (UC)",
+            ],
+        )
+        objective_desc = {
+            "Maximiser le ratio de Sharpe (UC)": "Optimise rendement/risque avec Sharpe sur les UC.",
+            "Minimiser la volatilité (UC)": "Recherche la volatilité la plus faible sur les UC.",
+            "Maximiser le rendement annualisé (UC)": "Priorise le rendement annualisé des UC.",
+            "Meilleur compromis rendement/risque (UC)": "Sharpe avec pénalités de corrélation/concentration.",
+            "Diversification maximale": "Minimise corrélation moyenne et concentration.",
+            "Risk Parity (UC)": "Équilibre les contributions au risque des UC.",
+        }
+        st.caption(objective_desc.get(objective_choice, ""))
 
         force_fund = st.checkbox("Forcer un fonds croissance (anchor)", value=False)
         forced_isin = None
@@ -1822,18 +1842,80 @@ def render_portfolio_builder():
 
         max_w = max_weight_pct / 100.0
         uc_max_bound = min(max_w / uc_total, 1.0)
-        weights_uc_raw = _optimize_uc_weights(
-            returns_selected,
-            "max_sharpe",
-            0.0,
-            uc_max_bound,
-            None,
-            None,
-        )
+
+        def _cap_normalize(weights: Dict[str, float]) -> Dict[str, float]:
+            capped = _apply_weight_caps(weights, uc_max_bound) if weights else {}
+            total = sum(capped.values())
+            return {k: v / total for k, v in capped.items()} if total > 0 else {}
+
+        def _risk_parity_weights(cov: pd.DataFrame) -> Dict[str, float]:
+            if cov.empty:
+                return {}
+            vols = np.sqrt(np.diag(cov))
+            inv_vol = np.where(vols > 0, 1.0 / vols, 0.0)
+            weights = inv_vol / inv_vol.sum() if inv_vol.sum() > 0 else np.ones_like(inv_vol) / len(inv_vol)
+            w = pd.Series(weights, index=cov.columns)
+            for _ in range(20):
+                port_var = float(w.T @ cov @ w)
+                if port_var <= 0:
+                    break
+                mrc = cov @ w
+                rc = w * mrc / np.sqrt(port_var)
+                target = rc.mean()
+                adj = target / rc.replace(0, np.nan)
+                w = w * adj.fillna(1.0)
+                w = w / w.sum()
+            return w.to_dict()
+
+        ann_return, ann_vol = _annualized_stats(returns_selected)
+        corr = returns_selected.corr()
+        cov = returns_selected.cov()
+        weights_uc_raw: Dict[str, float] = {}
+
+        if objective_choice == "Maximiser le ratio de Sharpe (UC)":
+            weights_uc_raw = _optimize_uc_weights(
+                returns_selected,
+                "max_sharpe",
+                0.0,
+                uc_max_bound,
+                None,
+                None,
+            )
+        elif objective_choice == "Minimiser la volatilité (UC)":
+            weights_uc_raw = _optimize_uc_weights(
+                returns_selected,
+                "target_vol",
+                0.0,
+                uc_max_bound,
+                ann_vol.min() if not ann_vol.empty else None,
+                None,
+            )
+        elif objective_choice == "Maximiser le rendement annualisé (UC)":
+            score = ann_return.clip(lower=0.0)
+            if score.sum() > 0:
+                weights_uc_raw = (score / score.sum()).to_dict()
+        elif objective_choice == "Meilleur compromis rendement/risque (UC)":
+            avg_corr = corr.mean().fillna(0.0)
+            concentration_penalty = 0.2
+            corr_penalty = 0.3
+            score = (ann_return / ann_vol.replace(0, np.nan)).fillna(0.0)
+            score = score - corr_penalty * avg_corr - concentration_penalty
+            score = score.clip(lower=0.0)
+            if score.sum() > 0:
+                weights_uc_raw = (score / score.sum()).to_dict()
+        elif objective_choice == "Diversification maximale":
+            avg_corr = corr.mean().fillna(0.0)
+            score = (1.0 - avg_corr).clip(lower=0.0)
+            if score.sum() > 0:
+                weights_uc_raw = (score / score.sum()).to_dict()
+        elif objective_choice == "Risk Parity (UC)":
+            weights_uc_raw = _risk_parity_weights(cov)
+
         if not weights_uc_raw:
             weights_uc_raw = {isin: 1.0 / len(selected_isins) for isin in selected_isins}
-        total_raw = sum(weights_uc_raw.values())
-        weights_uc = {k: (v / total_raw) * uc_total for k, v in weights_uc_raw.items()} if total_raw > 0 else {}
+
+        weights_uc_raw = _cap_normalize(weights_uc_raw)
+        weights_uc = {k: v * uc_total for k, v in weights_uc_raw.items()}
 
         corr = returns_selected.corr()
         redundant_pairs = []
@@ -1857,8 +1939,8 @@ def render_portfolio_builder():
                     selected_isins = [r for r in selected_isins if r != replaced] + replacement
                     returns_selected = returns_all[selected_isins]
                     weights_uc_raw = {isin: 1.0 / len(selected_isins) for isin in selected_isins}
-                    total_raw = sum(weights_uc_raw.values())
-                    weights_uc = {k: (v / total_raw) * uc_total for k, v in weights_uc_raw.items()} if total_raw > 0 else {}
+                    weights_uc_raw = _cap_normalize(weights_uc_raw)
+                    weights_uc = {k: v * uc_total for k, v in weights_uc_raw.items()}
                     st.info(f"Remplacement proposé : {replaced} → {replacement[0]}")
 
         euro_amount = int(round(total_budget * euro_pct / 100.0))

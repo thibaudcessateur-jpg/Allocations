@@ -1546,6 +1546,115 @@ def _avg_correlation(corr: pd.DataFrame) -> float:
     return float(np.nanmean(vals)) if vals.size else np.nan
 
 
+def _avg_offdiag_corr(corr: pd.DataFrame) -> float:
+    if corr.empty or corr.shape[0] < 2:
+        return np.nan
+    vals = corr.values[np.triu_indices_from(corr, 1)]
+    return float(np.nanmean(vals)) if vals.size else np.nan
+
+
+def _select_min_corr_subset(
+    candidates: List[str],
+    returns: pd.DataFrame,
+    k: int,
+    anchor: Optional[str] = None,
+) -> List[str]:
+    if k <= 0 or not candidates:
+        return []
+    if anchor and anchor not in candidates:
+        return []
+    if k >= len(candidates):
+        return candidates
+    corr = returns.corr()
+    if corr.empty:
+        return candidates[:k]
+    if anchor:
+        pool = [c for c in candidates if c != anchor]
+        best_combo = [anchor]
+        best_score = None
+        max_checks = 2000
+        for idx, combo in enumerate(itertools.combinations(pool, k - 1)):
+            if idx >= max_checks:
+                break
+            subset = [anchor, *combo]
+            score = _avg_offdiag_corr(corr.loc[subset, subset])
+            if best_score is None or score < best_score:
+                best_score = score
+                best_combo = subset
+        if best_score is None:
+            best_combo = [anchor] + pool[: k - 1]
+        return best_combo
+    best_combo: List[str] = []
+    best_score = None
+    max_checks = 2000
+    for idx, combo in enumerate(itertools.combinations(candidates, k)):
+        if idx >= max_checks:
+            break
+        subset = list(combo)
+        score = _avg_offdiag_corr(corr.loc[subset, subset])
+        if best_score is None or score < best_score:
+            best_score = score
+            best_combo = subset
+    if not best_combo:
+        best_combo = candidates[:k]
+    return best_combo
+
+
+def _avg_offdiag_corr(corr: pd.DataFrame) -> float:
+    if corr.empty or corr.shape[0] < 2:
+        return np.nan
+    vals = corr.values[np.triu_indices_from(corr, 1)]
+    return float(np.nanmean(vals)) if vals.size else np.nan
+
+
+def _select_min_corr_subset(
+    candidates: List[str],
+    returns: pd.DataFrame,
+    k: int,
+    anchor: Optional[str] = None,
+) -> List[str]:
+    if k <= 0 or not candidates:
+        return []
+    if anchor and anchor not in candidates:
+        return []
+    if k >= len(candidates):
+        return candidates
+    corr = returns.corr()
+    if corr.empty:
+        return candidates[:k]
+    if anchor:
+        pool = [c for c in candidates if c != anchor]
+        best_combo = [anchor]
+        best_score = None
+        max_checks = 2000
+        combos = itertools.combinations(pool, k - 1)
+        for idx, combo in enumerate(combos):
+            if idx >= max_checks:
+                break
+            subset = [anchor, *combo]
+            score = _avg_offdiag_corr(corr.loc[subset, subset])
+            if best_score is None or score < best_score:
+                best_score = score
+                best_combo = subset
+        if best_score is None:
+            best_combo = [anchor] + pool[: k - 1]
+        return best_combo
+    max_checks = 2000
+    best_combo: List[str] = []
+    best_score = None
+    for idx, combo in enumerate(itertools.combinations(candidates, k)):
+        if idx >= max_checks:
+            break
+        subset = list(combo)
+        score = _avg_offdiag_corr(corr.loc[subset, subset])
+        if best_score is None or score < best_score:
+            best_score = score
+            best_combo = subset
+    if not best_combo:
+        best_combo = candidates[:k]
+    return best_combo
+
+
 def _greedy_select(
     candidates: List[str],
     returns: pd.DataFrame,
@@ -1750,7 +1859,7 @@ def render_portfolio_builder():
         )
 
         action_count = st.selectbox("Nombre de fonds actions", [2, 3, 4, 5, 6], index=1)
-        bond_count = st.selectbox("Nombre de fonds obligataires/sécuritaires UC", [1, 2, 3], index=1)
+        bond_count = st.selectbox("Nombre de fonds obligataires UC", [1, 2, 3], index=1)
         max_weight_pct = 25
         objective_choice = st.selectbox(
             "Objectif d’optimisation",
@@ -1794,7 +1903,7 @@ def render_portfolio_builder():
             st.info("Aucun fonds UC disponible dans l’univers.")
             return
 
-        returns_all, status_all = _returns_for_isins(all_candidates, opt_start, opt_end, euro_rate=2.0)
+        returns_all, status_all = _returns_for_isins(all_candidates, opt_start, opt_end, euro_rate=euro_rate)
         insufficient = [isin for isin, status in status_all.items() if status != "ok"]
         if insufficient:
             st.warning("Certains fonds n'ont pas assez d'historique et ont été exclus.")
@@ -1806,25 +1915,65 @@ def render_portfolio_builder():
             st.warning("Le fonds imposé n'a pas assez d'historique et a été exclu.")
             forced_isin = None
 
-        action_count = min(action_count, len(valid_actions))
-        bond_count = min(bond_count, len(valid_bonds))
+        if action_count > len(valid_actions):
+            st.warning("Nombre de fonds actions réduit faute d'historique suffisant.")
+            action_count = len(valid_actions)
+        if bond_count > len(valid_bonds):
+            st.warning("Nombre de fonds obligataires réduit faute d'historique suffisant.")
+            bond_count = len(valid_bonds)
         if action_count + bond_count == 0:
             st.info("Pas assez de fonds valides. Élargissez la période ou l’univers.")
             return
 
-        selected_actions = _greedy_select(
-            valid_actions,
-            returns_all[valid_actions] if valid_actions and not returns_all.empty else pd.DataFrame(),
-            action_count,
-            forced=forced_isin,
-            corr_penalty=0.6,
-        )
-        selected_bonds = _greedy_select(
-            valid_bonds,
-            returns_all[valid_bonds] if valid_bonds and not returns_all.empty else pd.DataFrame(),
-            bond_count,
-            corr_penalty=0.6,
-        )
+        action_returns = returns_all[valid_actions] if valid_actions and not returns_all.empty else pd.DataFrame()
+        bond_returns = returns_all[valid_bonds] if valid_bonds and not returns_all.empty else pd.DataFrame()
+        action_ann_return, action_ann_vol = _annualized_stats(action_returns)
+        bond_ann_return, bond_ann_vol = _annualized_stats(bond_returns)
+
+        if objective_choice == "Maximiser le rendement annualisé (UC)":
+            selected_actions = action_ann_return.sort_values(ascending=False).index.tolist()[:action_count]
+            selected_bonds = bond_ann_return.sort_values(ascending=False).index.tolist()[:bond_count]
+        elif objective_choice == "Minimiser la volatilité (UC)":
+            selected_actions = action_ann_vol.sort_values().index.tolist()[:action_count]
+            selected_bonds = bond_ann_vol.sort_values().index.tolist()[:bond_count]
+        elif objective_choice == "Diversification maximale":
+            selected_actions = _select_min_corr_subset(valid_actions, action_returns, action_count, anchor=forced_isin)
+            selected_bonds = _select_min_corr_subset(valid_bonds, bond_returns, bond_count)
+        elif objective_choice == "Risk Parity (UC)":
+            selected_actions = _select_min_corr_subset(valid_actions, action_returns, action_count, anchor=forced_isin)
+            selected_bonds = _select_min_corr_subset(valid_bonds, bond_returns, bond_count)
+        elif objective_choice == "Meilleur compromis rendement/risque (UC)":
+            selected_actions = _greedy_select(
+                valid_actions,
+                action_returns,
+                action_count,
+                forced=forced_isin,
+                corr_penalty=0.8,
+            )
+            selected_bonds = _greedy_select(
+                valid_bonds,
+                bond_returns,
+                bond_count,
+                corr_penalty=0.8,
+            )
+        else:
+            selected_actions = _greedy_select(
+                valid_actions,
+                action_returns,
+                action_count,
+                forced=forced_isin,
+                corr_penalty=0.6,
+            )
+            selected_bonds = _greedy_select(
+                valid_bonds,
+                bond_returns,
+                bond_count,
+                corr_penalty=0.6,
+            )
+
+        if forced_isin and forced_isin in valid_actions and forced_isin not in selected_actions:
+            selected_actions = [forced_isin] + [isin for isin in selected_actions if isin != forced_isin]
+            selected_actions = selected_actions[:action_count]
         selected_isins = [isin for isin in selected_actions + selected_bonds if isin]
         if not selected_isins:
             st.info("Aucun fonds disponible pour l’optimisation.")
@@ -1882,27 +2031,35 @@ def render_portfolio_builder():
                 None,
             )
         elif objective_choice == "Minimiser la volatilité (UC)":
-            weights_uc_raw = _optimize_uc_weights(
-                returns_selected,
-                "target_vol",
-                0.0,
-                uc_max_bound,
-                ann_vol.min() if not ann_vol.empty else None,
-                None,
-            )
+            if PYPFOPT_AVAILABLE:
+                weights_uc_raw = _optimize_uc_weights(
+                    returns_selected,
+                    "target_vol",
+                    0.0,
+                    uc_max_bound,
+                    ann_vol.min() if not ann_vol.empty else None,
+                    None,
+                )
+            else:
+                score = (1.0 / ann_vol.replace(0, np.nan)).fillna(0.0)
+                if score.sum() > 0:
+                    weights_uc_raw = (score / score.sum()).to_dict()
         elif objective_choice == "Maximiser le rendement annualisé (UC)":
             score = ann_return.clip(lower=0.0)
             if score.sum() > 0:
                 weights_uc_raw = (score / score.sum()).to_dict()
         elif objective_choice == "Meilleur compromis rendement/risque (UC)":
             avg_corr = corr.mean().fillna(0.0)
-            concentration_penalty = 0.2
-            corr_penalty = 0.3
-            score = (ann_return / ann_vol.replace(0, np.nan)).fillna(0.0)
-            score = score - corr_penalty * avg_corr - concentration_penalty
-            score = score.clip(lower=0.0)
+            base_score = (ann_return / ann_vol.replace(0, np.nan)).fillna(0.0)
+            score = (base_score - 0.4 * avg_corr).clip(lower=0.0)
             if score.sum() > 0:
                 weights_uc_raw = (score / score.sum()).to_dict()
+                concentration_penalty = sum(v ** 2 for v in weights_uc_raw.values())
+                if concentration_penalty > 0:
+                    weights_uc_raw = {k: v / concentration_penalty for k, v in weights_uc_raw.items()}
+                    total = sum(weights_uc_raw.values())
+                    if total > 0:
+                        weights_uc_raw = {k: v / total for k, v in weights_uc_raw.items()}
         elif objective_choice == "Diversification maximale":
             avg_corr = corr.mean().fillna(0.0)
             score = (1.0 - avg_corr).clip(lower=0.0)
@@ -1963,7 +2120,7 @@ def render_portfolio_builder():
             }
         ]
         for isin in selected_isins:
-            cat = "Actions" if isin in selected_actions else "Oblig/Sécu"
+            cat = "Actions UC" if isin in selected_actions else "Obligataires UC"
             rows.append(
                 {
                     "Nom": _fund_name(isin),
@@ -1990,7 +2147,7 @@ def render_portfolio_builder():
 
         if MATPLOTLIB_AVAILABLE:
             fig, ax = plt.subplots(figsize=(4.4, 3.4))
-            comp_labels = ["Euros", "Oblig UC", "Actions UC"]
+            comp_labels = ["Fonds en euros", "Obligataires UC", "Actions UC"]
             comp_values = [
                 euro_amount,
                 sum(uc_amounts.get(i, 0) for i in selected_bonds),
@@ -2073,12 +2230,20 @@ def render_portfolio_builder():
             mime="text/csv",
         )
 
+        avg_corr_uc = _avg_offdiag_corr(corr)
+        st.markdown(
+            f"**Fenêtre utilisée** : {fmt_date(opt_start)} → {fmt_date(opt_end)}"
+        )
+        if insufficient:
+            st.markdown(
+                "**Fonds exclus (historique insuffisant)** : "
+                + ", ".join(insufficient)
+            )
         st.info(
             "Pourquoi cette allocation ?\n"
-            "- Diversification maximale via corrélations faibles\n"
-            "- Contraintes de poids respectées (25% max par UC)\n"
-            "- Objectif Sharpe sur UC\n"
-            "- Période d’analyse définie par l’utilisateur"
+            f"- Objectif appliqué : {objective_choice}\n"
+            f"- Corrélation moyenne UC : {avg_corr_uc:.2f}\n"
+            "- Contraintes respectées (fonds euros + 25% max par UC)"
         )
     except Exception as exc:
         st.error("Une erreur est survenue dans le builder. L’application reste utilisable.")

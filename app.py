@@ -89,6 +89,13 @@ ALLOC_LABELS = {
 # Utils format
 # ------------------------------------------------------------
 
+def params_hash(values: Tuple[Any, ...]) -> str:
+    try:
+        payload = json.dumps(values, default=str, sort_keys=True)
+    except Exception:
+        payload = repr(values)
+    return str(hash(payload))
+
 def to_eur(x: Any) -> str:
     try:
         v = float(x)
@@ -1797,46 +1804,62 @@ def _safe_fund_label(name: str, isin: str) -> str:
 
 
 def render_portfolio_builder():
-    st.title("Créer le portefeuille parfait")
-    try:
-        st.markdown("### 8) Auto-allocation (optimisation rendement/risque)")
-        profile_map = {
-            "Prudent": 50,
-            "Équilibré": 30,
-            "Dynamique": 20,
-            "Agressif": 10,
-        }
-        profile = st.selectbox("Profil de risque", list(profile_map.keys()))
+    st.title("Creer le portefeuille parfait")
+
+    st.session_state.setdefault("PP_RUN", False)
+    st.session_state.setdefault("PP_PARAMS_HASH", "")
+    st.session_state.setdefault("PP_OPT_START_DATE", (TODAY - pd.DateOffset(years=3)).date())
+    st.session_state.setdefault("PP_OPT_END_DATE", TODAY.date())
+
+    profile_map = {
+        "Prudent": 50,
+        "Equilibre": 30,
+        "Dynamique": 20,
+        "Agressif": 10,
+    }
+
+    with st.sidebar:
+        st.header("Parametres cles")
+        profile = st.selectbox("Profil", list(profile_map.keys()), index=1)
         euro_pct = profile_map[profile]
         st.caption(f"Fonds en euros obligatoire : {euro_pct}% du portefeuille.")
 
+        euro_rate = st.number_input(
+            "Rendement annuel du fonds en euros (%)",
+            min_value=0.0,
+            max_value=10.0,
+            value=2.0,
+            step=0.10,
+            key="PP_EURO_RATE",
+        )
+
         total_budget = st.number_input(
-            "Budget total (€)",
+            "Budget total (EUR)",
             min_value=0,
             max_value=10_000_000,
             value=100_000,
-            step=1_000,
+            step=10,
+            key="PP_TOTAL_BUDGET",
         )
 
         opt_window_mode = st.radio(
-            "Fenêtre d’analyse",
-            ["1 an", "3 ans", "5 ans", "10 ans", "Dates personnalisées"],
-            horizontal=True,
+            "Fenetre d'analyse",
+            ["1 an", "3 ans", "5 ans", "10 ans", "Dates personnalisees"],
+            horizontal=False,
+            key="PP_WINDOW_MODE",
         )
-        if opt_window_mode == "Dates personnalisées":
-            date_cols = st.columns(2)
-            with date_cols[0]:
-                opt_start_date = st.date_input(
-                    "Date de début",
-                    value=(TODAY - pd.DateOffset(years=3)).date(),
-                    key="OPT_START_DATE",
-                )
-            with date_cols[1]:
-                opt_end_date = st.date_input(
-                    "Date de fin",
-                    value=TODAY.date(),
-                    key="OPT_END_DATE",
-                )
+
+        if opt_window_mode == "Dates personnalisees":
+            opt_start_date = st.date_input(
+                "Date de debut",
+                value=st.session_state.get("PP_OPT_START_DATE", (TODAY - pd.DateOffset(years=3)).date()),
+                key="PP_OPT_START_DATE",
+            )
+            opt_end_date = st.date_input(
+                "Date de fin",
+                value=st.session_state.get("PP_OPT_END_DATE", TODAY.date()),
+                key="PP_OPT_END_DATE",
+            )
             opt_start = pd.Timestamp(opt_start_date)
             opt_end = pd.Timestamp(opt_end_date)
         else:
@@ -1845,366 +1868,391 @@ def render_portfolio_builder():
             opt_start = TODAY - pd.DateOffset(years=opt_years)
             opt_end = TODAY
 
-        if opt_start > opt_end:
-            st.warning("La date de début doit être antérieure à la date de fin.")
-            return
-
-        euro_rate = st.number_input("Taux fonds euros (%)", min_value=0.0, max_value=10.0, value=2.0, step=0.10)
-        euro_vol = st.number_input(
-            "Volatilité fonds euros (%)",
-            min_value=0.0,
-            max_value=5.0,
-            value=0.5,
-            step=0.1,
+    st.markdown("### Parametres UC")
+    c1, c2 = st.columns(2)
+    with c1:
+        action_count = int(
+            st.number_input(
+                "Nombre de fonds actions UC",
+                min_value=1,
+                max_value=6,
+                value=3,
+                step=1,
+                key="PP_ACTION_COUNT",
+            )
+        )
+    with c2:
+        bond_count = int(
+            st.number_input(
+                "Nombre de fonds obligataires UC",
+                min_value=0,
+                max_value=4,
+                value=1,
+                step=1,
+                key="PP_BOND_COUNT",
+            )
         )
 
-        action_count = st.selectbox("Nombre de fonds actions", [2, 3, 4, 5, 6], index=1)
-        bond_count = st.selectbox("Nombre de fonds obligataires UC", [1, 2, 3], index=1)
-        max_weight_pct = 25
-        objective_choice = st.selectbox(
-            "Objectif d’optimisation",
-            [
-                "Maximiser le ratio de Sharpe (UC)",
-                "Minimiser la volatilité (UC)",
-                "Maximiser le rendement annualisé (UC)",
-                "Meilleur compromis rendement/risque (UC)",
-                "Diversification maximale",
-                "Risk Parity (UC)",
-            ],
-        )
-        objective_desc = {
-            "Maximiser le ratio de Sharpe (UC)": "Optimise rendement/risque avec Sharpe sur les UC.",
-            "Minimiser la volatilité (UC)": "Recherche la volatilité la plus faible sur les UC.",
-            "Maximiser le rendement annualisé (UC)": "Priorise le rendement annualisé des UC.",
-            "Meilleur compromis rendement/risque (UC)": "Sharpe avec pénalités de corrélation/concentration.",
-            "Diversification maximale": "Minimise corrélation moyenne et concentration.",
-            "Risk Parity (UC)": "Équilibre les contributions au risque des UC.",
-        }
-        st.caption(objective_desc.get(objective_choice, ""))
+    objective_choice = st.selectbox(
+        "Objectif",
+        [
+            "Maximiser Sharpe",
+            "Minimiser volatilite",
+            "Maximiser rendement annualise",
+            "Meilleur compromis (Sharpe + diversification)",
+            "Diversification maximale (decorrelation)",
+            "Risk parity",
+        ],
+        key="PP_OBJECTIVE",
+    )
 
-        force_fund = st.checkbox("Forcer un fonds croissance (anchor)", value=False)
-        forced_isin = None
-        if force_fund:
-            force_options = [_safe_fund_label(name, isin) for name, isin in RECO_FUNDS_CORE]
-            force_lookup = {label: isin for label, (_, isin) in zip(force_options, RECO_FUNDS_CORE)}
-            forced_choice = st.selectbox("Fonds croissance imposé", force_options)
-            forced_isin = force_lookup.get(forced_choice)
+    force_fund = st.checkbox("Forcer un fonds action (ancre)", value=False, key="PP_FORCE_ANCHOR")
+    forced_isin = None
+    if force_fund:
+        action_labels = [_safe_fund_label(name, isin) for name, isin in RECO_FUNDS_CORE]
+        action_lookup = {label: isin for label, (_, isin) in zip(action_labels, RECO_FUNDS_CORE)}
+        forced_choice = st.selectbox("Fonds action impose", action_labels, key="PP_ANCHOR_ISIN")
+        forced_isin = action_lookup.get(forced_choice)
 
-        extra_actions_input = st.text_input("Ajouter un ISIN actions externe (optionnel)", value="")
-        extra_bonds_input = st.text_input("Ajouter un ISIN obligataire externe (optionnel)", value="")
-        extra_actions = [x.strip() for x in extra_actions_input.split(",") if x.strip()]
-        extra_bonds = [x.strip() for x in extra_bonds_input.split(",") if x.strip()]
+    params = (
+        profile,
+        float(euro_rate),
+        int(total_budget),
+        opt_window_mode,
+        str(opt_start.date()),
+        str(opt_end.date()),
+        int(action_count),
+        int(bond_count),
+        objective_choice,
+        bool(force_fund),
+        forced_isin,
+    )
+    current_hash = params_hash(params)
 
-        actions_universe = [isin for _, isin in RECO_FUNDS_CORE] + extra_actions
-        bonds_universe = [isin for _, isin in RECO_FUNDS_DEF if isin != "EUROFUND"] + extra_bonds
+    if st.session_state.get("PP_RUN") and st.session_state.get("PP_PARAMS_HASH") != current_hash:
+        st.session_state["PP_RUN"] = False
+        st.info("Parametres modifies. Cliquez de nouveau sur '✅ Creer le portefeuille parfait'.")
+
+    run_clicked = st.button("✅ Creer le portefeuille parfait", type="primary")
+    if run_clicked:
+        st.session_state["PP_RUN"] = True
+        st.session_state["PP_PARAMS_HASH"] = current_hash
+
+    if not st.session_state.get("PP_RUN"):
+        st.info("Renseignez tous les parametres puis cliquez sur '✅ Creer le portefeuille parfait'.")
+        return
+
+    if opt_start > opt_end:
+        st.warning("La date de debut doit etre anterieure a la date de fin.")
+        return
+
+    try:
+        actions_universe = [isin for _, isin in RECO_FUNDS_CORE]
+        bonds_universe = [isin for _, isin in RECO_FUNDS_DEF if isin != "EUROFUND"]
+
         all_candidates = sorted(set(actions_universe + bonds_universe))
+        returns_all, status_all = _returns_for_isins(all_candidates, opt_start, opt_end, euro_rate=float(euro_rate))
 
-        if not all_candidates:
-            st.info("Aucun fonds UC disponible dans l’univers.")
-            return
-
-        returns_all, status_all = _returns_for_isins(all_candidates, opt_start, opt_end, euro_rate=euro_rate)
         insufficient = [isin for isin, status in status_all.items() if status != "ok"]
-        if insufficient:
-            st.warning("Certains fonds n'ont pas assez d'historique et ont été exclus.")
-
         valid_actions = [isin for isin in actions_universe if status_all.get(isin) == "ok"]
         valid_bonds = [isin for isin in bonds_universe if status_all.get(isin) == "ok"]
 
+        if insufficient:
+            st.warning("Certains fonds ont ete exclus (historique insuffisant sur la fenetre).")
+
         if forced_isin and forced_isin not in valid_actions:
-            st.warning("Le fonds imposé n'a pas assez d'historique et a été exclu.")
+            st.warning("Le fonds action ancre est indisponible sur la periode et a ete ignore.")
             forced_isin = None
 
         if action_count > len(valid_actions):
-            st.warning("Nombre de fonds actions réduit faute d'historique suffisant.")
+            st.warning("Nombre de fonds actions reduit automatiquement (historique insuffisant).")
             action_count = len(valid_actions)
         if bond_count > len(valid_bonds):
-            st.warning("Nombre de fonds obligataires réduit faute d'historique suffisant.")
+            st.warning("Nombre de fonds obligataires reduit automatiquement (historique insuffisant).")
             bond_count = len(valid_bonds)
+
         if action_count + bond_count == 0:
-            st.info("Pas assez de fonds valides. Élargissez la période ou l’univers.")
+            st.info("Aucun fonds UC valide sur la fenetre choisie.")
             return
 
-        action_returns = returns_all[valid_actions] if valid_actions and not returns_all.empty else pd.DataFrame()
-        bond_returns = returns_all[valid_bonds] if valid_bonds and not returns_all.empty else pd.DataFrame()
-        action_ann_return, action_ann_vol = _annualized_stats(action_returns)
-        bond_ann_return, bond_ann_vol = _annualized_stats(bond_returns)
+        if returns_all.empty:
+            st.info("Historique insuffisant pour calculer les rendements sur la fenetre choisie.")
+            return
 
-        if objective_choice == "Maximiser le rendement annualisé (UC)":
-            selected_actions = action_ann_return.sort_values(ascending=False).index.tolist()[:action_count]
-            selected_bonds = bond_ann_return.sort_values(ascending=False).index.tolist()[:bond_count]
-        elif objective_choice == "Minimiser la volatilité (UC)":
-            selected_actions = action_ann_vol.sort_values().index.tolist()[:action_count]
-            selected_bonds = bond_ann_vol.sort_values().index.tolist()[:bond_count]
-        elif objective_choice == "Diversification maximale":
-            selected_actions = _select_min_corr_subset(valid_actions, action_returns, action_count, anchor=forced_isin)
-            selected_bonds = _select_min_corr_subset(valid_bonds, bond_returns, bond_count)
-        elif objective_choice == "Risk Parity (UC)":
-            selected_actions = _select_min_corr_subset(valid_actions, action_returns, action_count, anchor=forced_isin)
-            selected_bonds = _select_min_corr_subset(valid_bonds, bond_returns, bond_count)
-        elif objective_choice == "Meilleur compromis rendement/risque (UC)":
-            selected_actions = _greedy_select(
-                valid_actions,
-                action_returns,
-                action_count,
-                forced=forced_isin,
-                corr_penalty=0.8,
-            )
-            selected_bonds = _greedy_select(
-                valid_bonds,
-                bond_returns,
-                bond_count,
-                corr_penalty=0.8,
-            )
-        else:
-            selected_actions = _greedy_select(
-                valid_actions,
-                action_returns,
-                action_count,
-                forced=forced_isin,
-                corr_penalty=0.6,
-            )
-            selected_bonds = _greedy_select(
-                valid_bonds,
-                bond_returns,
-                bond_count,
-                corr_penalty=0.6,
-            )
+        def _zscore(s: pd.Series) -> pd.Series:
+            if s.empty:
+                return s
+            std = float(s.std())
+            if std == 0 or np.isnan(std):
+                return pd.Series(0.0, index=s.index)
+            return (s - s.mean()) / std
 
-        if forced_isin and forced_isin in valid_actions and forced_isin not in selected_actions:
-            selected_actions = [forced_isin] + [isin for isin in selected_actions if isin != forced_isin]
-            selected_actions = selected_actions[:action_count]
-        selected_isins = [isin for isin in selected_actions + selected_bonds if isin]
+        def _stats_for(candidates: List[str], ret_df: pd.DataFrame) -> Tuple[pd.Series, pd.Series, pd.Series, pd.DataFrame, pd.Series]:
+            if not candidates or ret_df.empty:
+                return pd.Series(dtype=float), pd.Series(dtype=float), pd.Series(dtype=float), pd.DataFrame(), pd.Series(dtype=float)
+            ann_log_return = ret_df[candidates].mean() * 252.0
+            ann_return = np.exp(ann_log_return) - 1.0
+            ann_vol = ret_df[candidates].std() * np.sqrt(252.0)
+            sharpe = (ann_log_return / ann_vol.replace(0, np.nan)).replace([np.inf, -np.inf], np.nan)
+            corr = ret_df[candidates].corr()
+            avg_corr = corr.apply(lambda row: row.drop(labels=row.name, errors="ignore").mean(), axis=1).fillna(0.0) if not corr.empty else pd.Series(0.0, index=candidates)
+            return ann_return, ann_vol, sharpe, corr, avg_corr
+
+        def _greedy_min_corr(candidates: List[str], corr: pd.DataFrame, k: int, seed: Optional[List[str]] = None) -> List[str]:
+            if k <= 0 or not candidates:
+                return []
+            selected = [x for x in (seed or []) if x in candidates]
+            remaining = [c for c in candidates if c not in selected]
+            while len(selected) < k and remaining:
+                best, best_score = None, None
+                for cand in remaining:
+                    score = float(corr.loc[cand, selected].mean()) if selected and not corr.empty else 0.0
+                    if best_score is None or score < best_score:
+                        best, best_score = cand, score
+                if best is None:
+                    break
+                selected.append(best)
+                remaining = [c for c in remaining if c != best]
+            return selected
+
+        def _select_by_objective(candidates: List[str], ret_df: pd.DataFrame, k: int, objective: str, forced: Optional[str] = None) -> List[str]:
+            if k <= 0 or not candidates:
+                return []
+            if ret_df.empty:
+                base = candidates[:k]
+                if forced and forced in candidates and forced not in base:
+                    base = [forced] + [x for x in base if x != forced]
+                    base = base[:k]
+                return base
+
+            ann_ret, ann_vol, sharpe, corr, avg_corr = _stats_for(candidates, ret_df)
+            sharpe_rank = sharpe.fillna(-1e9).sort_values(ascending=False)
+
+            if objective == "Maximiser rendement annualise":
+                selected = ann_ret.sort_values(ascending=False).index.tolist()[:k]
+            elif objective == "Minimiser volatilite":
+                selected = ann_vol.sort_values(ascending=True).index.tolist()[:k]
+            elif objective == "Maximiser Sharpe":
+                selected = sharpe_rank.index.tolist()[:k]
+            elif objective in ("Diversification maximale (decorrelation)", "Risk parity"):
+                seed = sharpe_rank.index.tolist()[:1]
+                selected = _greedy_min_corr(candidates, corr, k, seed=seed)
+            elif objective == "Meilleur compromis (Sharpe + diversification)":
+                score = _zscore(sharpe.fillna(0.0)) + _zscore(1.0 - avg_corr)
+                selected = score.sort_values(ascending=False).index.tolist()[:k]
+            else:
+                selected = sharpe_rank.index.tolist()[:k]
+
+            if forced and forced in candidates:
+                if forced not in selected:
+                    if objective in ("Diversification maximale (decorrelation)", "Risk parity"):
+                        selected = _greedy_min_corr(candidates, corr, k, seed=[forced])
+                    else:
+                        rest = [x for x in selected if x != forced]
+                        selected = [forced] + rest
+                        selected = selected[:k]
+                else:
+                    selected = [forced] + [x for x in selected if x != forced]
+            return selected[:k]
+
+        action_returns = returns_all[valid_actions] if valid_actions else pd.DataFrame()
+        bond_returns = returns_all[valid_bonds] if valid_bonds else pd.DataFrame()
+
+        selected_actions = _select_by_objective(valid_actions, action_returns, int(action_count), objective_choice, forced=forced_isin)
+        selected_bonds = _select_by_objective(valid_bonds, bond_returns, int(bond_count), objective_choice, forced=None)
+
+        selected_isins = [isin for isin in (selected_actions + selected_bonds) if isin]
         if not selected_isins:
-            st.info("Aucun fonds disponible pour l’optimisation.")
+            st.info("Aucun fonds selectionne apres filtrage.")
             return
 
-        returns_selected = returns_all[selected_isins] if not returns_all.empty else pd.DataFrame()
+        returns_selected = returns_all[selected_isins].dropna(how="any")
         if returns_selected.empty:
-            st.info("Historique insuffisant pour l’optimisation. Élargissez la période.")
+            st.info("Historique insuffisant apres selection des UC.")
             return
 
-        uc_total = max(0.0, 1.0 - euro_pct / 100.0)
-        if uc_total <= 0:
-            st.info("La part UC est nulle, ajustez le profil de risque.")
+        uc_total = max(0.0, 1.0 - (float(euro_pct) / 100.0))
+        if uc_total <= 0.0:
+            st.info("Part UC nulle avec le profil choisi.")
             return
 
-        max_w = max_weight_pct / 100.0
-        uc_max_bound = min(max_w / uc_total, 1.0)
+        cap_uc_final = 0.25
+        uc_max_bound = min(cap_uc_final / uc_total, 1.0)
 
-        def _cap_normalize(weights: Dict[str, float]) -> Dict[str, float]:
-            capped = _apply_weight_caps(weights, uc_max_bound) if weights else {}
-            total = sum(capped.values())
-            return {k: v / total for k, v in capped.items()} if total > 0 else {}
-
-        def _risk_parity_weights(cov: pd.DataFrame) -> Dict[str, float]:
+        def _risk_parity_weights(ret_df: pd.DataFrame) -> Dict[str, float]:
+            cov = ret_df.cov()
             if cov.empty:
                 return {}
-            vols = np.sqrt(np.diag(cov))
-            inv_vol = np.where(vols > 0, 1.0 / vols, 0.0)
-            weights = inv_vol / inv_vol.sum() if inv_vol.sum() > 0 else np.ones_like(inv_vol) / len(inv_vol)
-            w = pd.Series(weights, index=cov.columns)
-            for _ in range(20):
-                port_var = float(w.T @ cov @ w)
-                if port_var <= 0:
-                    break
-                mrc = cov @ w
-                rc = w * mrc / np.sqrt(port_var)
-                target = rc.mean()
-                adj = target / rc.replace(0, np.nan)
-                w = w * adj.fillna(1.0)
-                w = w / w.sum()
-            return w.to_dict()
+            vols = np.sqrt(np.diag(cov.values))
+            inv = np.where(vols > 0, 1.0 / vols, 0.0)
+            if float(inv.sum()) <= 0:
+                return {c: 1.0 / len(ret_df.columns) for c in ret_df.columns}
+            w = inv / inv.sum()
+            return {c: float(w[i]) for i, c in enumerate(ret_df.columns)}
 
-        ann_return, ann_vol = _annualized_stats(returns_selected)
-        corr = returns_selected.corr()
-        cov = returns_selected.cov()
         weights_uc_raw: Dict[str, float] = {}
+        if PYPFOPT_AVAILABLE:
+            try:
+                mu = expected_returns.mean_historical_return(returns_selected, returns_data=True, frequency=252)
+                cov = risk_models.sample_cov(returns_selected, returns_data=True, frequency=252)
+                ef = EfficientFrontier(mu, cov, weight_bounds=(0.0, uc_max_bound))
 
-        if objective_choice == "Maximiser le ratio de Sharpe (UC)":
-            weights_uc_raw = _optimize_uc_weights(
-                returns_selected,
-                "max_sharpe",
-                0.0,
-                uc_max_bound,
-                None,
-                None,
-            )
-        elif objective_choice == "Minimiser la volatilité (UC)":
-            if PYPFOPT_AVAILABLE:
-                weights_uc_raw = _optimize_uc_weights(
-                    returns_selected,
-                    "target_vol",
-                    0.0,
-                    uc_max_bound,
-                    ann_vol.min() if not ann_vol.empty else None,
-                    None,
-                )
+                if objective_choice == "Maximiser Sharpe":
+                    ef.max_sharpe(risk_free_rate=0.0)
+                    weights_uc_raw = ef.clean_weights()
+                elif objective_choice == "Minimiser volatilite":
+                    ef.min_volatility()
+                    weights_uc_raw = ef.clean_weights()
+                elif objective_choice == "Maximiser rendement annualise":
+                    if not mu.empty:
+                        target = float(mu.max()) - 1e-6
+                        try:
+                            ef.efficient_return(target_return=target)
+                        except Exception:
+                            ef.max_sharpe(risk_free_rate=0.0)
+                    else:
+                        ef.max_sharpe(risk_free_rate=0.0)
+                    weights_uc_raw = ef.clean_weights()
+                elif objective_choice == "Risk parity":
+                    weights_uc_raw = _risk_parity_weights(returns_selected)
+                else:
+                    ef.min_volatility() if objective_choice == "Diversification maximale (decorrelation)" else ef.max_sharpe(risk_free_rate=0.0)
+                    weights_uc_raw = ef.clean_weights()
+            except Exception:
+                weights_uc_raw = {}
+
+        if not weights_uc_raw:
+            if objective_choice == "Risk parity":
+                weights_uc_raw = _risk_parity_weights(returns_selected)
+            elif objective_choice == "Minimiser volatilite":
+                vol = returns_selected.std() * np.sqrt(252.0)
+                score = (1.0 / vol.replace(0, np.nan)).fillna(0.0)
+                weights_uc_raw = (score / score.sum()).to_dict() if float(score.sum()) > 0 else {}
+            elif objective_choice == "Maximiser rendement annualise":
+                ann_ret = np.exp(returns_selected.mean() * 252.0) - 1.0
+                score = ann_ret.clip(lower=0.0)
+                weights_uc_raw = (score / score.sum()).to_dict() if float(score.sum()) > 0 else {}
+            elif objective_choice == "Meilleur compromis (Sharpe + diversification)":
+                ann_log = returns_selected.mean() * 252.0
+                vol = returns_selected.std() * np.sqrt(252.0)
+                sharpe = (ann_log / vol.replace(0, np.nan)).fillna(0.0)
+                corr = returns_selected.corr()
+                avg_corr = corr.apply(lambda row: row.drop(labels=row.name, errors="ignore").mean(), axis=1).fillna(0.0) if not corr.empty else pd.Series(0.0, index=returns_selected.columns)
+                score = _zscore(sharpe) + _zscore(1.0 - avg_corr)
+                score = score.clip(lower=0.0)
+                weights_uc_raw = (score / score.sum()).to_dict() if float(score.sum()) > 0 else {}
+            elif objective_choice == "Diversification maximale (decorrelation)":
+                corr = returns_selected.corr()
+                avg_corr = corr.apply(lambda row: row.drop(labels=row.name, errors="ignore").mean(), axis=1).fillna(0.0) if not corr.empty else pd.Series(0.0, index=returns_selected.columns)
+                score = (1.0 - avg_corr).clip(lower=0.0)
+                weights_uc_raw = (score / score.sum()).to_dict() if float(score.sum()) > 0 else {}
             else:
-                score = (1.0 / ann_vol.replace(0, np.nan)).fillna(0.0)
-                if score.sum() > 0:
-                    weights_uc_raw = (score / score.sum()).to_dict()
-        elif objective_choice == "Maximiser le rendement annualisé (UC)":
-            score = ann_return.clip(lower=0.0)
-            if score.sum() > 0:
-                weights_uc_raw = (score / score.sum()).to_dict()
-        elif objective_choice == "Meilleur compromis rendement/risque (UC)":
-            avg_corr = corr.mean().fillna(0.0)
-            base_score = (ann_return / ann_vol.replace(0, np.nan)).fillna(0.0)
-            score = (base_score - 0.4 * avg_corr).clip(lower=0.0)
-            if score.sum() > 0:
-                weights_uc_raw = (score / score.sum()).to_dict()
-                concentration_penalty = sum(v ** 2 for v in weights_uc_raw.values())
-                if concentration_penalty > 0:
-                    weights_uc_raw = {k: v / concentration_penalty for k, v in weights_uc_raw.items()}
-                    total = sum(weights_uc_raw.values())
-                    if total > 0:
-                        weights_uc_raw = {k: v / total for k, v in weights_uc_raw.items()}
-        elif objective_choice == "Diversification maximale":
-            avg_corr = corr.mean().fillna(0.0)
-            score = (1.0 - avg_corr).clip(lower=0.0)
-            if score.sum() > 0:
-                weights_uc_raw = (score / score.sum()).to_dict()
-        elif objective_choice == "Risk Parity (UC)":
-            weights_uc_raw = _risk_parity_weights(cov)
+                ann_log = returns_selected.mean() * 252.0
+                vol = returns_selected.std() * np.sqrt(252.0)
+                score = (ann_log / vol.replace(0, np.nan)).fillna(0.0).clip(lower=0.0)
+                weights_uc_raw = (score / score.sum()).to_dict() if float(score.sum()) > 0 else {}
 
         if not weights_uc_raw:
             weights_uc_raw = {isin: 1.0 / len(selected_isins) for isin in selected_isins}
 
-        weights_uc_raw = _cap_normalize(weights_uc_raw)
-        weights_uc = {k: v * uc_total for k, v in weights_uc_raw.items()}
+        weights_uc_raw = {k: float(v) for k, v in weights_uc_raw.items() if k in selected_isins}
+        if not weights_uc_raw:
+            weights_uc_raw = {isin: 1.0 / len(selected_isins) for isin in selected_isins}
 
-        corr = returns_selected.corr()
-        redundant_pairs = []
-        if corr.shape[0] >= 2:
-            for i, a in enumerate(corr.columns):
-                for b in corr.columns[i + 1 :]:
-                    val = corr.loc[a, b]
-                    if val > 0.8:
-                        redundant_pairs.append((a, b, float(val)))
-        if redundant_pairs:
-            st.warning("Redondance détectée entre certains fonds (corrélation > 0.80).")
-            replace_candidates = [isin for isin in all_candidates if isin not in selected_isins and status_all.get(isin) == "ok"]
-            if replace_candidates:
-                replacement = _greedy_select(
-                    replace_candidates,
-                    returns_all[replace_candidates] if not returns_all.empty else pd.DataFrame(),
-                    1,
-                )
-                if replacement:
-                    replaced = redundant_pairs[0][1]
-                    selected_isins = [r for r in selected_isins if r != replaced] + replacement
-                    returns_selected = returns_all[selected_isins]
-                    weights_uc_raw = {isin: 1.0 / len(selected_isins) for isin in selected_isins}
-                    weights_uc_raw = _cap_normalize(weights_uc_raw)
-                    weights_uc = {k: v * uc_total for k, v in weights_uc_raw.items()}
-                    st.info(f"Remplacement proposé : {replaced} → {replacement[0]}")
+        weights_uc_raw = _apply_weight_caps(weights_uc_raw, uc_max_bound)
+        total_uc_raw = float(sum(weights_uc_raw.values()))
+        if total_uc_raw <= 0:
+            weights_uc_raw = {isin: 1.0 / len(selected_isins) for isin in selected_isins}
+            weights_uc_raw = _apply_weight_caps(weights_uc_raw, uc_max_bound)
+            total_uc_raw = float(sum(weights_uc_raw.values()))
+        if total_uc_raw > 0:
+            weights_uc_raw = {k: v / total_uc_raw for k, v in weights_uc_raw.items()}
 
-        euro_amount = int(round(total_budget * euro_pct / 100.0))
-        uc_budget = max(0.0, int(round(total_budget - euro_amount)))
-        uc_amounts = {}
+        weights_final = {"EUROFUND": float(euro_pct) / 100.0}
         for isin in selected_isins:
-            uc_amounts[isin] = int(round(total_budget * weights_uc.get(isin, 0.0)))
-        if selected_isins:
-            diff = uc_budget - sum(uc_amounts.values())
-            uc_amounts[selected_isins[-1]] = max(0, uc_amounts[selected_isins[-1]] + diff)
-        remainder = uc_budget - sum(uc_amounts.values())
+            weights_final[isin] = float(weights_uc_raw.get(isin, 0.0)) * uc_total
+
+        # Security clamp + exact renormalization
+        weights_final = {k: max(0.0, float(v)) for k, v in weights_final.items()}
+        total_weight = float(sum(weights_final.values()))
+        if total_weight > 0:
+            weights_final = {k: v / total_weight for k, v in weights_final.items()}
+
+        def _round_allocations_to_step(amounts: Dict[str, float], step: int, total: int) -> Dict[str, int]:
+            if step <= 0:
+                step = 1
+            rounded = {k: int(np.floor(max(0.0, v) / step)) * step for k, v in amounts.items()}
+            remaining = int(total - sum(rounded.values()))
+            if remaining > 0 and rounded:
+                frac_rank = sorted(
+                    ((k, (max(0.0, amounts[k]) / step) - np.floor(max(0.0, amounts[k]) / step)) for k in rounded.keys()),
+                    key=lambda x: x[1],
+                    reverse=True,
+                )
+                idx = 0
+                while remaining >= step and frac_rank:
+                    k = frac_rank[idx % len(frac_rank)][0]
+                    rounded[k] += step
+                    remaining -= step
+                    idx += 1
+                if remaining != 0:
+                    last_key = list(rounded.keys())[-1]
+                    rounded[last_key] = max(0, rounded[last_key] + remaining)
+            elif remaining < 0 and rounded:
+                last_key = list(rounded.keys())[-1]
+                rounded[last_key] = max(0, rounded[last_key] + remaining)
+
+            delta = int(total - sum(rounded.values()))
+            if rounded and delta != 0:
+                last_key = list(rounded.keys())[-1]
+                rounded[last_key] = max(0, rounded[last_key] + delta)
+            return rounded
+
+        amounts_raw = {k: float(total_budget) * float(w) for k, w in weights_final.items()}
+        amounts = _round_allocations_to_step(amounts_raw, step=10, total=int(total_budget))
 
         rows = [
             {
-                "Nom": "Fonds en euros (EUROFUND)",
-                "ISIN": "EUROFUND",
-                "Catégorie": "Eurofund",
-                "Poids %": euro_pct,
-                "Montant €": euro_amount,
+                "Support": "Fonds en euros (EUROFUND)",
+                "Categorie": "EUROFUND",
+                "%": weights_final.get("EUROFUND", 0.0) * 100.0,
+                "Montant EUR": amounts.get("EUROFUND", 0),
             }
         ]
         for isin in selected_isins:
-            cat = "Actions UC" if isin in selected_actions else "Obligataires UC"
             rows.append(
                 {
-                    "Nom": _fund_name(isin),
-                    "ISIN": isin,
-                    "Catégorie": cat,
-                    "Poids %": weights_uc.get(isin, 0.0) * 100.0,
-                    "Montant €": uc_amounts.get(isin, 0),
+                    "Support": _fund_name(isin),
+                    "Categorie": "Actions UC" if isin in selected_actions else "Obligataires UC",
+                    "%": weights_final.get(isin, 0.0) * 100.0,
+                    "Montant EUR": amounts.get(isin, 0),
                 }
             )
         df_alloc = pd.DataFrame(rows)
 
         st.markdown("**Allocation finale**")
         st.dataframe(
-            df_alloc.style.format(
-                {
-                    "Poids %": "{:,.2f}%".format,
-                    "Montant €": to_eur,
-                }
-            ),
+            df_alloc.style.format({"%": "{:,.2f}%".format, "Montant EUR": to_eur}),
             use_container_width=True,
             hide_index=True,
         )
-        st.caption(f"Reste non alloué (UC) : {to_eur(remainder)}")
 
         if MATPLOTLIB_AVAILABLE:
-            fig, ax = plt.subplots(figsize=(4.4, 3.4))
-            comp_labels = ["Fonds en euros", "Obligataires UC", "Actions UC"]
-            comp_values = [
-                euro_amount,
-                sum(uc_amounts.get(i, 0) for i in selected_bonds),
-                sum(uc_amounts.get(i, 0) for i in selected_actions),
-            ]
-            ax.pie(comp_values, labels=comp_labels, autopct="%1.1f%%")
-            ax.set_title("Composition globale")
-            st.pyplot(fig)
-            plt.close(fig)
-
-            fig, ax = plt.subplots(figsize=(4.4, 3.4))
-            ax.pie(
-                [row["Montant €"] for row in rows],
-                labels=[row["Nom"] for row in rows],
-                autopct="%1.1f%%",
-            )
-            ax.set_title("Répartition par ligne")
+            fig, ax = plt.subplots(figsize=(5.0, 3.2))
+            ax.pie(df_alloc["Montant EUR"], labels=df_alloc["Support"], autopct="%1.1f%%")
+            ax.set_title("Repartition finale")
             st.pyplot(fig)
             plt.close(fig)
         else:
             st.warning(f"Graphique indisponible ({MATPLOTLIB_ERROR}).")
 
-        uc_weights_norm = {k: (weights_uc.get(k, 0.0) / uc_total) for k in selected_isins if uc_total > 0}
-        w_vec = np.array([uc_weights_norm.get(k, 0.0) for k in returns_selected.columns])
-        port_ret = returns_selected.dot(w_vec)
-        ann_ret = float(port_ret.mean() * 252.0)
-        ann_vol = float(port_ret.std() * np.sqrt(252.0))
-        sharpe = ann_ret / ann_vol if ann_vol > 0 else np.nan
-
-        kpi_cols = st.columns(3)
-        with kpi_cols[0]:
-            st.metric("Rendement annualisé (UC)", fmt_pct_fr(ann_ret * 100))
-        with kpi_cols[1]:
-            st.metric("Volatilité annualisée (UC)", fmt_pct_fr(ann_vol * 100))
-        with kpi_cols[2]:
-            st.metric("Sharpe (UC)", f"{sharpe:.2f}" if sharpe == sharpe else "—")
-
-        euro_return = euro_rate / 100.0
-        euro_vol_ann = euro_vol / 100.0
-        g_ann_ret = uc_total * ann_ret + (1.0 - uc_total) * euro_return
-        g_ann_vol = np.sqrt((uc_total * ann_vol) ** 2 + ((1.0 - uc_total) * euro_vol_ann) ** 2)
-        g_sharpe = g_ann_ret / g_ann_vol if g_ann_vol > 0 else np.nan
-        st.caption(
-            f"Global (incl. fonds euros) — Rendement: {fmt_pct_fr(g_ann_ret * 100)} | "
-            f"Volatilité: {fmt_pct_fr(g_ann_vol * 100)} | Sharpe: {g_sharpe:.2f}"
-            if g_sharpe == g_sharpe
-            else f"Global (incl. fonds euros) — Rendement: {fmt_pct_fr(g_ann_ret * 100)} | "
-            f"Volatilité: {fmt_pct_fr(g_ann_vol * 100)} | Sharpe: —"
-        )
-
-        st.markdown("**Heatmap corrélation (UC)**")
-        if returns_selected.shape[1] >= 2:
-            df_corr = corr.copy()
-            df_corr["Ligne1"] = df_corr.index
-            df_melt = df_corr.melt(id_vars="Ligne1", var_name="Ligne2", value_name="corr")
+        if len(selected_isins) >= 2:
+            st.markdown("**Heatmap correlation UC**")
+            corr_uc = returns_selected.corr().copy()
+            corr_uc["Ligne1"] = corr_uc.index
+            heat_df = corr_uc.melt(id_vars="Ligne1", var_name="Ligne2", value_name="corr")
             heat = (
-                alt.Chart(df_melt)
+                alt.Chart(heat_df)
                 .mark_rect()
                 .encode(
                     x=alt.X("Ligne1:O", sort=None, title=""),
@@ -2213,42 +2261,61 @@ def render_portfolio_builder():
                     tooltip=[
                         alt.Tooltip("Ligne1:N", title="Ligne 1"),
                         alt.Tooltip("Ligne2:N", title="Ligne 2"),
-                        alt.Tooltip("corr:Q", title="Corrélation", format=".2f"),
+                        alt.Tooltip("corr:Q", title="Correlation", format=".2f"),
                     ],
                 )
                 .properties(height=260)
             )
             st.altair_chart(heat, use_container_width=True)
-            st.caption("Corrélation proche de 1 = redondant • proche de 0 = décorrélé.")
+
+        uc_weights_norm = pd.Series({k: weights_uc_raw.get(k, 0.0) for k in selected_isins}, index=selected_isins)
+        uc_weights_norm = uc_weights_norm / uc_weights_norm.sum() if float(uc_weights_norm.sum()) > 0 else pd.Series(1.0 / len(selected_isins), index=selected_isins)
+
+        port_log_ret = returns_selected[selected_isins].dot(uc_weights_norm.values)
+        ann_log = float(port_log_ret.mean() * 252.0)
+        ann_ret_uc = float(np.exp(ann_log) - 1.0)
+        ann_vol_uc = float(port_log_ret.std() * np.sqrt(252.0))
+        sharpe_uc = ann_log / ann_vol_uc if ann_vol_uc > 0 else np.nan
+
+        euro_df, _, _ = get_price_series("EUROFUND", None, float(euro_rate))
+        euro_df = euro_df.loc[(euro_df.index >= opt_start) & (euro_df.index <= opt_end)]
+        if euro_df.empty:
+            euro_total_ret = 0.0
         else:
-            st.info("Corrélation indisponible (données insuffisantes).")
+            euro_total_ret = float(euro_df["Close"].iloc[-1] / euro_df["Close"].iloc[0] - 1.0)
 
-        st.download_button(
-            "📥 Télécharger allocation (CSV)",
-            data=df_alloc.to_csv(index=False).encode("utf-8"),
-            file_name="allocation_portefeuille.csv",
-            mime="text/csv",
-        )
+        uc_path = np.exp(port_log_ret.cumsum())
+        uc_total_ret = float(uc_path.iloc[-1] - 1.0) if not uc_path.empty else 0.0
 
-        avg_corr_uc = _avg_offdiag_corr(corr)
+        total_ret = (float(euro_pct) / 100.0) * euro_total_ret + uc_total * uc_total_ret
+
+        k1, k2, k3, k4 = st.columns(4)
+        with k1:
+            st.metric("Rendement annualise UC", fmt_pct_fr(ann_ret_uc * 100.0))
+        with k2:
+            st.metric("Volatilite annualisee UC", fmt_pct_fr(ann_vol_uc * 100.0))
+        with k3:
+            st.metric("Sharpe UC", f"{sharpe_uc:.2f}" if sharpe_uc == sharpe_uc else "-")
+        with k4:
+            st.metric("Rendement total (EUROFUND+UC)", fmt_pct_fr(total_ret * 100.0))
+
         st.markdown(
-            f"**Fenêtre utilisée** : {fmt_date(opt_start)} → {fmt_date(opt_end)}"
+            """
+- Allocation calibree sur la fenetre d'analyse et l'objectif choisi.
+- EUROFUND est traite uniquement via son taux annuel parametre.
+- Les UC respectent un cap strict de 25% du portefeuille final par fonds.
+- En mode ancre, le fonds impose est conserve dans la poche actions.
+- En cas de donnees insuffisantes, la selection est reduite automatiquement.
+"""
         )
-        if insufficient:
-            st.markdown(
-                "**Fonds exclus (historique insuffisant)** : "
-                + ", ".join(insufficient)
-            )
-        st.info(
-            "Pourquoi cette allocation ?\n"
-            f"- Objectif appliqué : {objective_choice}\n"
-            f"- Corrélation moyenne UC : {avg_corr_uc:.2f}\n"
-            "- Contraintes respectées (fonds euros + 25% max par UC)"
-        )
-    except Exception as exc:
-        st.error("Une erreur est survenue dans le builder. L’application reste utilisable.")
-        st.exception(exc)
 
+        if insufficient:
+            st.caption("Fonds exclus : " + ", ".join(insufficient))
+        st.caption(f"Fenetre utilisee : {fmt_date(opt_start)} a {fmt_date(opt_end)}")
+
+    except Exception as e:
+        st.error("Une erreur est survenue dans le builder.")
+        st.exception(e)
 
 def render_app(run_page_config: bool = True):
     # ------------------------------------------------------------
@@ -3845,17 +3912,25 @@ Avec l’allocation Valority, il serait autour de **{to_eur(valB)}**, soit envir
 
 
 
+def run_comparator():
+    render_app(run_page_config=False)
+
+
+def run_perfect_portfolio():
+    render_portfolio_builder()
+
+
 def render_mode_router():
     st.set_page_config(page_title=APP_TITLE, layout="wide")
     mode = st.radio(
-        "Choisissez votre mode",
-        ["Créer le portefeuille parfait", "Comparateur de portefeuilles"],
+        "Mode",
+        ["Comparer des portefeuilles", "Créer le portefeuille parfait"],
         horizontal=True,
     )
-    if mode == "Créer le portefeuille parfait":
-        render_portfolio_builder()
+    if mode == "Comparer des portefeuilles":
+        run_comparator()
     else:
-        render_app(run_page_config=False)
+        run_perfect_portfolio()
 
 
 def _render_with_crash_shield():

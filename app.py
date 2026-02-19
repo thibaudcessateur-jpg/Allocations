@@ -77,6 +77,10 @@ RECO_FUNDS_DEF = [
 
 FUND_NAME_MAP = {isin: name for name, isin in RECO_FUNDS_CORE + RECO_FUNDS_DEF}
 
+# Univers UC explicites (hors fonds en euros)
+EQUITY_FUNDS = [isin for _, isin in RECO_FUNDS_CORE]
+BOND_FUNDS = [isin for _, isin in RECO_FUNDS_DEF if isin != "EUROFUND"]
+
 # Libellés FR -> codes internes pour l'affectation des versements
 ALLOC_LABELS = {
     "Répartition égale": "equal",
@@ -1582,28 +1586,58 @@ def _returns_for_isins(
     end: pd.Timestamp,
     euro_rate: float,
     min_points: int = 60,
-) -> Tuple[pd.DataFrame, Dict[str, str]]:
+) -> Tuple[pd.DataFrame, Dict[str, str], pd.DataFrame]:
     series_map: Dict[str, pd.Series] = {}
     status: Dict[str, str] = {}
+    rows: List[Dict[str, Any]] = []
     for isin in isins:
-        df, _, _ = get_price_series(isin, None, euro_rate)
+        df, _, _ = get_price_series(isin, start, euro_rate)
         if df.empty:
-            status[isin] = "insufficient"
+            status[isin] = "ko"
+            rows.append(
+                {
+                    "ISIN": isin,
+                    "Statut": "KO",
+                    "Debut": pd.NaT,
+                    "Points": 0,
+                    "Raison": "Aucune donnee",
+                }
+            )
             continue
         s = df["Close"].astype(float)
         s = s[(s.index >= start) & (s.index <= end)]
-        if s.dropna().shape[0] < min_points:
-            status[isin] = "insufficient"
+        points = int(s.dropna().shape[0])
+        debut = s.dropna().index.min() if points > 0 else pd.NaT
+        if points < min_points:
+            status[isin] = "ko"
+            rows.append(
+                {
+                    "ISIN": isin,
+                    "Statut": "KO",
+                    "Debut": debut,
+                    "Points": points,
+                    "Raison": f"Historique insuffisant (<{min_points} pts)",
+                }
+            )
             continue
         series_map[isin] = s
         status[isin] = "ok"
+        rows.append(
+            {
+                "ISIN": isin,
+                "Statut": "OK",
+                "Debut": debut,
+                "Points": points,
+                "Raison": "",
+            }
+        )
     if not series_map:
-        return pd.DataFrame(), status
+        return pd.DataFrame(), status, pd.DataFrame(rows)
     prices = pd.DataFrame(series_map).ffill().dropna(how="any")
     if prices.empty or prices.shape[0] < min_points:
-        return pd.DataFrame(), status
+        return pd.DataFrame(), status, pd.DataFrame(rows)
     returns = prices.pct_change().dropna(how="any")
-    return returns, status
+    return returns, status, pd.DataFrame(rows)
 
 
 def _annualized_stats(returns: pd.DataFrame) -> Tuple[pd.Series, pd.Series]:
@@ -1952,25 +1986,26 @@ def render_portfolio_builder():
     with c2:
         bond_count = int(
             st.number_input(
-                "Nombre de fonds obligataires UC",
+                "Nombre de fonds obligataires",
                 min_value=0,
-                max_value=4,
+                max_value=2,
                 value=1,
                 step=1,
                 key="PP_BOND_COUNT",
             )
         )
 
+    objective_options = [
+        "Meilleur compromis rendement/risque",
+        "Maximiser le Sharpe",
+        "Maximiser le rendement annualisé",
+        "Diversification maximale (corrélation minimale)",
+    ]
+    if st.session_state.get("PP_OBJECTIVE") not in objective_options:
+        st.session_state["PP_OBJECTIVE"] = objective_options[0]
     objective_choice = st.selectbox(
         "Objectif",
-        [
-            "Maximiser Sharpe",
-            "Minimiser volatilite",
-            "Maximiser rendement annualise",
-            "Meilleur compromis (Sharpe + diversification)",
-            "Diversification maximale (decorrelation)",
-            "Risk parity",
-        ],
+        objective_options,
         key="PP_OBJECTIVE",
     )
 
@@ -2014,30 +2049,70 @@ def render_portfolio_builder():
         st.warning("La date de debut doit etre anterieure a la date de fin.")
         return
 
+    requested_actions = int(action_count)
+    requested_bonds = int(bond_count)
+
     try:
-        actions_universe = [isin for _, isin in RECO_FUNDS_CORE]
-        bonds_universe = [isin for _, isin in RECO_FUNDS_DEF if isin != "EUROFUND"]
+        actions_universe = list(EQUITY_FUNDS)
+        bonds_universe = list(BOND_FUNDS)
 
         all_candidates = sorted(set(actions_universe + bonds_universe))
-        returns_all, status_all = _returns_for_isins(all_candidates, opt_start, opt_end, euro_rate=float(euro_rate))
+        returns_all, status_all, coverage_df = _returns_for_isins(
+            all_candidates,
+            opt_start,
+            opt_end,
+            euro_rate=float(euro_rate),
+        )
 
         insufficient = [isin for isin, status in status_all.items() if status != "ok"]
         valid_actions = [isin for isin in actions_universe if status_all.get(isin) == "ok"]
         valid_bonds = [isin for isin in bonds_universe if status_all.get(isin) == "ok"]
 
+        if isinstance(coverage_df, pd.DataFrame) and not coverage_df.empty:
+            coverage_df = coverage_df.copy()
+            coverage_df["Support"] = coverage_df["ISIN"].map(_fund_name)
+            coverage_df["Univers"] = coverage_df["ISIN"].apply(
+                lambda x: "Actions UC" if x in actions_universe else "Obligataires UC"
+            )
+            coverage_df["Debut"] = coverage_df["Debut"].apply(fmt_date)
+            coverage_df = coverage_df.rename(
+                columns={"Debut": "Date debut", "Points": "Nb points"}
+            )
+            coverage_df = coverage_df[
+                ["Univers", "Support", "ISIN", "Statut", "Date debut", "Nb points", "Raison"]
+            ]
+            st.markdown("**Couverture donnees (UC)**")
+            st.dataframe(coverage_df, hide_index=True, use_container_width=True)
+
         if insufficient:
-            st.warning("Certains fonds ont ete exclus (historique insuffisant sur la fenetre).")
+            st.warning("Certains fonds ont ete exclus (KO) sur la fenetre d'analyse.")
 
         if forced_isin and forced_isin not in valid_actions:
             st.warning("Le fonds action ancre est indisponible sur la periode et a ete ignore.")
             forced_isin = None
 
-        if action_count > len(valid_actions):
-            st.warning("Nombre de fonds actions reduit automatiquement (historique insuffisant).")
+        if requested_actions > len(valid_actions):
+            st.warning(
+                f"Actions UC : demande {requested_actions}, disponibles {len(valid_actions)}. "
+                "Reduction automatique."
+            )
             action_count = len(valid_actions)
-        if bond_count > len(valid_bonds):
-            st.warning("Nombre de fonds obligataires reduit automatiquement (historique insuffisant).")
+        if requested_bonds > len(valid_bonds):
+            st.warning(
+                f"Obligataires UC : demandes {requested_bonds}, disponibles {len(valid_bonds)}. "
+                "Reduction automatique."
+            )
             bond_count = len(valid_bonds)
+        if requested_actions > 0 and not valid_actions:
+            st.warning(
+                "Aucun fonds actions valide sur la fenetre. "
+                "Elargissez la periode ou modifiez la selection."
+            )
+        if requested_bonds > 0 and not valid_bonds:
+            st.warning(
+                "Aucun fonds obligataire valide sur la fenetre. "
+                "Elargissez la periode ou modifiez la selection."
+            )
 
         if action_count + bond_count == 0:
             st.info("Aucun fonds UC valide sur la fenetre choisie.")
@@ -2096,16 +2171,14 @@ def render_portfolio_builder():
             ann_ret, ann_vol, sharpe, corr, avg_corr = _stats_for(candidates, ret_df)
             sharpe_rank = sharpe.fillna(-1e9).sort_values(ascending=False)
 
-            if objective == "Maximiser rendement annualise":
+            if objective == "Maximiser le rendement annualisé":
                 selected = ann_ret.sort_values(ascending=False).index.tolist()[:k]
-            elif objective == "Minimiser volatilite":
-                selected = ann_vol.sort_values(ascending=True).index.tolist()[:k]
-            elif objective == "Maximiser Sharpe":
+            elif objective == "Maximiser le Sharpe":
                 selected = sharpe_rank.index.tolist()[:k]
-            elif objective in ("Diversification maximale (decorrelation)", "Risk parity"):
+            elif objective == "Diversification maximale (corrélation minimale)":
                 seed = sharpe_rank.index.tolist()[:1]
                 selected = _greedy_min_corr(candidates, corr, k, seed=seed)
-            elif objective == "Meilleur compromis (Sharpe + diversification)":
+            elif objective == "Meilleur compromis rendement/risque":
                 score = _zscore(sharpe.fillna(0.0)) + _zscore(1.0 - avg_corr)
                 selected = score.sort_values(ascending=False).index.tolist()[:k]
             else:
@@ -2113,7 +2186,7 @@ def render_portfolio_builder():
 
             if forced and forced in candidates:
                 if forced not in selected:
-                    if objective in ("Diversification maximale (decorrelation)", "Risk parity"):
+                    if objective == "Diversification maximale (corrélation minimale)":
                         selected = _greedy_min_corr(candidates, corr, k, seed=[forced])
                     else:
                         rest = [x for x in selected if x != forced]
@@ -2133,6 +2206,11 @@ def render_portfolio_builder():
         if not selected_isins:
             st.info("Aucun fonds selectionne apres filtrage.")
             return
+        if len(selected_isins) < 2:
+            st.warning(
+                "Univers UC trop reduit pour une optimisation robuste. "
+                "Allocation UC 100% sur le(s) fonds disponible(s)."
+            )
 
         returns_selected = returns_all[selected_isins].dropna(how="any")
         if returns_selected.empty:
@@ -2146,32 +2224,19 @@ def render_portfolio_builder():
 
         cap_uc_final = 0.25
         uc_max_bound = min(cap_uc_final / uc_total, 1.0)
-
-        def _risk_parity_weights(ret_df: pd.DataFrame) -> Dict[str, float]:
-            cov = ret_df.cov()
-            if cov.empty:
-                return {}
-            vols = np.sqrt(np.diag(cov.values))
-            inv = np.where(vols > 0, 1.0 / vols, 0.0)
-            if float(inv.sum()) <= 0:
-                return {c: 1.0 / len(ret_df.columns) for c in ret_df.columns}
-            w = inv / inv.sum()
-            return {c: float(w[i]) for i, c in enumerate(ret_df.columns)}
+        skip_opt = len(selected_isins) < 2
 
         weights_uc_raw: Dict[str, float] = {}
-        if PYPFOPT_AVAILABLE:
+        if not skip_opt and PYPFOPT_AVAILABLE:
             try:
                 mu = expected_returns.mean_historical_return(returns_selected, returns_data=True, frequency=252)
                 cov = risk_models.sample_cov(returns_selected, returns_data=True, frequency=252)
                 ef = EfficientFrontier(mu, cov, weight_bounds=(0.0, uc_max_bound))
 
-                if objective_choice == "Maximiser Sharpe":
+                if objective_choice == "Maximiser le Sharpe":
                     ef.max_sharpe(risk_free_rate=0.0)
                     weights_uc_raw = ef.clean_weights()
-                elif objective_choice == "Minimiser volatilite":
-                    ef.min_volatility()
-                    weights_uc_raw = ef.clean_weights()
-                elif objective_choice == "Maximiser rendement annualise":
+                elif objective_choice == "Maximiser le rendement annualisé":
                     if not mu.empty:
                         target = float(mu.max()) - 1e-6
                         try:
@@ -2181,26 +2246,23 @@ def render_portfolio_builder():
                     else:
                         ef.max_sharpe(risk_free_rate=0.0)
                     weights_uc_raw = ef.clean_weights()
-                elif objective_choice == "Risk parity":
-                    weights_uc_raw = _risk_parity_weights(returns_selected)
+                elif objective_choice == "Diversification maximale (corrélation minimale)":
+                    ef.min_volatility()
+                    weights_uc_raw = ef.clean_weights()
                 else:
-                    ef.min_volatility() if objective_choice == "Diversification maximale (decorrelation)" else ef.max_sharpe(risk_free_rate=0.0)
+                    ef.max_sharpe(risk_free_rate=0.0)
                     weights_uc_raw = ef.clean_weights()
             except Exception:
                 weights_uc_raw = {}
 
         if not weights_uc_raw:
-            if objective_choice == "Risk parity":
-                weights_uc_raw = _risk_parity_weights(returns_selected)
-            elif objective_choice == "Minimiser volatilite":
-                vol = returns_selected.std() * np.sqrt(252.0)
-                score = (1.0 / vol.replace(0, np.nan)).fillna(0.0)
-                weights_uc_raw = (score / score.sum()).to_dict() if float(score.sum()) > 0 else {}
-            elif objective_choice == "Maximiser rendement annualise":
+            if skip_opt:
+                weights_uc_raw = {isin: 1.0 / len(selected_isins) for isin in selected_isins}
+            elif objective_choice == "Maximiser le rendement annualisé":
                 ann_ret = np.exp(returns_selected.mean() * 252.0) - 1.0
                 score = ann_ret.clip(lower=0.0)
                 weights_uc_raw = (score / score.sum()).to_dict() if float(score.sum()) > 0 else {}
-            elif objective_choice == "Meilleur compromis (Sharpe + diversification)":
+            elif objective_choice == "Meilleur compromis rendement/risque":
                 ann_log = returns_selected.mean() * 252.0
                 vol = returns_selected.std() * np.sqrt(252.0)
                 sharpe = (ann_log / vol.replace(0, np.nan)).fillna(0.0)
@@ -2209,7 +2271,7 @@ def render_portfolio_builder():
                 score = _zscore(sharpe) + _zscore(1.0 - avg_corr)
                 score = score.clip(lower=0.0)
                 weights_uc_raw = (score / score.sum()).to_dict() if float(score.sum()) > 0 else {}
-            elif objective_choice == "Diversification maximale (decorrelation)":
+            elif objective_choice == "Diversification maximale (corrélation minimale)":
                 corr = returns_selected.corr()
                 avg_corr = corr.apply(lambda row: row.drop(labels=row.name, errors="ignore").mean(), axis=1).fillna(0.0) if not corr.empty else pd.Series(0.0, index=returns_selected.columns)
                 score = (1.0 - avg_corr).clip(lower=0.0)

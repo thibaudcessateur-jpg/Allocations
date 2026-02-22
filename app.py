@@ -1580,6 +1580,99 @@ def _apply_weight_caps(weights: Dict[str, float], max_weight: float) -> Dict[str
     return weights
 
 
+def _apply_practical_constraints(
+    weights: Dict[str, float],
+    min_w: float = 0.10,
+    step: float = 0.05,
+    max_w: Optional[float] = None,
+) -> Dict[str, float]:
+    if not weights:
+        return {}
+
+    cleaned: Dict[str, float] = {}
+    for k, v in weights.items():
+        try:
+            w = float(v)
+        except Exception:
+            w = 0.0
+        if not np.isfinite(w) or w < 0:
+            w = 0.0
+        cleaned[k] = w
+
+    ranked = sorted(cleaned.items(), key=lambda kv: kv[1], reverse=True)
+    filtered = {k: v for k, v in cleaned.items() if v >= min_w}
+    if not filtered:
+        keep = [k for k, v in ranked if v > 0][:3]
+        filtered = {k: cleaned[k] for k in keep}
+    if not filtered:
+        return {}
+
+    if max_w is not None:
+        filtered = _apply_weight_caps(filtered, max_w)
+
+    total = sum(filtered.values())
+    if total > 0:
+        filtered = {k: v / total for k, v in filtered.items()}
+
+    filtered = {k: v for k, v in filtered.items() if v >= min_w}
+    if not filtered:
+        keep = [k for k, v in ranked if v > 0][:3]
+        filtered = {k: cleaned[k] for k in keep}
+        total = sum(filtered.values())
+        if total > 0:
+            filtered = {k: v / total for k, v in filtered.items()}
+    if not filtered:
+        return {}
+
+    if step <= 0:
+        return filtered
+
+    def _round_step(v: float) -> float:
+        return float(np.floor((v / step) + 0.5) * step)
+
+    rounded = {k: _round_step(v) for k, v in filtered.items()}
+    min_units = int(round(min_w / step)) if min_w > 0 else 0
+    max_units = int(round(max_w / step)) if (max_w is not None and max_w > 0) else None
+
+    units: Dict[str, int] = {}
+    for k, v in rounded.items():
+        u = int(round(v / step))
+        if u < min_units:
+            continue
+        if max_units is not None and u > max_units:
+            u = max_units
+        units[k] = u
+
+    if not units:
+        keep = [k for k, v in ranked if v > 0][:3]
+        units = {k: max(min_units, 1) for k in keep}
+
+    target_units = int(round(1.0 / step))
+    delta = target_units - sum(units.values())
+    if delta > 0:
+        while delta > 0:
+            candidates = [k for k in units if max_units is None or units[k] < max_units]
+            if not candidates:
+                break
+            k = max(candidates, key=lambda k: units[k])
+            units[k] += 1
+            delta -= 1
+    elif delta < 0:
+        while delta < 0:
+            candidates = [k for k in units if units[k] > min_units]
+            if not candidates:
+                break
+            k = max(candidates, key=lambda k: units[k])
+            units[k] -= 1
+            delta += 1
+
+    result = {k: units[k] * step for k in units if units[k] > 0}
+    total = sum(result.values())
+    if total > 0 and abs(total - 1.0) > 1e-6:
+        result = {k: v / total for k, v in result.items()}
+    return result
+
+
 def _returns_for_isins(
     isins: List[str],
     start: pd.Timestamp,
@@ -1980,6 +2073,12 @@ def render_portfolio_builder():
         key="PP_OBJECTIVE",
     )
 
+    practical_mode = st.checkbox(
+        "Optimisation terrain (min 10% + arrondi 5%)",
+        value=True,
+        key="PP_PRACTICAL_MODE",
+    )
+
     force_fund = st.checkbox("Forcer un fonds action (ancre)", value=False, key="PP_FORCE_ANCHOR")
     forced_isin = None
     if force_fund:
@@ -2022,7 +2121,11 @@ def render_portfolio_builder():
 
     try:
         actions_universe = [isin for _, isin in RECO_FUNDS_CORE]
-        bonds_universe = [isin for _, isin in RECO_FUNDS_DEF if isin != "EUROFUND"]
+        bonds_universe = [
+            isin
+            for name, isin in RECO_FUNDS_DEF
+            if isin != "EUROFUND" and isin != "LU0321462953"
+        ]
 
         all_candidates = sorted(set(actions_universe + bonds_universe))
         returns_all, status_all = _returns_for_isins(all_candidates, opt_start, opt_end, euro_rate=float(euro_rate))
@@ -2242,6 +2345,22 @@ def render_portfolio_builder():
         if total_uc_raw > 0:
             weights_uc_raw = {k: v / total_uc_raw for k, v in weights_uc_raw.items()}
 
+        if practical_mode:
+            weights_uc_raw = _apply_practical_constraints(
+                weights_uc_raw,
+                min_w=0.10,
+                step=0.05,
+                max_w=uc_max_bound,
+            )
+            selected_isins = [k for k, v in weights_uc_raw.items() if v > 0]
+            if not selected_isins:
+                st.info("Aucun fonds UC conservé après l'ajustement terrain.")
+                return
+            returns_selected = returns_all[selected_isins].dropna(how="any")
+            if returns_selected.empty:
+                st.info("Historique insuffisant après ajustement terrain.")
+                return
+
         weights_final = {"EUROFUND": float(euro_pct) / 100.0}
         for isin in selected_isins:
             weights_final[isin] = float(weights_uc_raw.get(isin, 0.0)) * uc_total
@@ -2382,6 +2501,12 @@ def render_portfolio_builder():
 - En cas de donnees insuffisantes, la selection est reduite automatiquement.
 """
         )
+
+        if practical_mode:
+            st.caption(
+                "Les ponderations UC sont ajustees pour rester coherentes en pratique "
+                "(min 10 % et arrondi par paliers de 5 %)."
+            )
 
         if insufficient:
             st.caption("Fonds exclus : " + ", ".join(insufficient))

@@ -1580,13 +1580,15 @@ def _apply_weight_caps(weights: Dict[str, float], max_weight: float) -> Dict[str
     return weights
 
 
-def _apply_practical_constraints(
+def _apply_min_floor_preserve_count(
     weights: Dict[str, float],
-    min_w: float = 0.10,
-    step: float = 0.05,
-    max_w: Optional[float] = None,
+    floor: float,
 ) -> Dict[str, float]:
     if not weights:
+        return {}
+    keys = list(weights.keys())
+    n = len(keys)
+    if n == 0:
         return {}
 
     cleaned: Dict[str, float] = {}
@@ -1599,78 +1601,111 @@ def _apply_practical_constraints(
             w = 0.0
         cleaned[k] = w
 
-    ranked = sorted(cleaned.items(), key=lambda kv: kv[1], reverse=True)
-    filtered = {k: v for k, v in cleaned.items() if v >= min_w}
-    if not filtered:
-        keep = [k for k, v in ranked if v > 0][:3]
-        filtered = {k: cleaned[k] for k in keep}
-    if not filtered:
+    total = sum(cleaned.values())
+    if total <= 0:
+        base = {k: 1.0 / n for k in keys}
+    else:
+        base = {k: cleaned[k] / total for k in keys}
+
+    max_floor = (1.0 / n) - 1e-9
+    eff_floor = min(max(floor, 0.0), max_floor) if max_floor > 0 else 0.0
+    residual = 1.0 - n * eff_floor
+    if residual < 0:
+        residual = 0.0
+
+    out = {k: eff_floor + residual * base[k] for k in keys}
+    return out
+
+
+def _round_weights_to_step_preserve_count(
+    weights: Dict[str, float],
+    step: float,
+    min_w: float,
+    max_w: Optional[float] = None,
+) -> Dict[str, float]:
+    if not weights:
         return {}
-
-    if max_w is not None:
-        filtered = _apply_weight_caps(filtered, max_w)
-
-    total = sum(filtered.values())
-    if total > 0:
-        filtered = {k: v / total for k, v in filtered.items()}
-
-    filtered = {k: v for k, v in filtered.items() if v >= min_w}
-    if not filtered:
-        keep = [k for k, v in ranked if v > 0][:3]
-        filtered = {k: cleaned[k] for k in keep}
-        total = sum(filtered.values())
-        if total > 0:
-            filtered = {k: v / total for k, v in filtered.items()}
-    if not filtered:
-        return {}
-
     if step <= 0:
-        return filtered
+        return weights
 
-    def _round_step(v: float) -> float:
-        return float(np.floor((v / step) + 0.5) * step)
+    keys = list(weights.keys())
+    n = len(keys)
+    if n == 0:
+        return {}
 
-    rounded = {k: _round_step(v) for k, v in filtered.items()}
-    min_units = int(round(min_w / step)) if min_w > 0 else 0
-    max_units = int(round(max_w / step)) if (max_w is not None and max_w > 0) else None
+    def _round_half_up(v: float) -> int:
+        return int(np.floor((v / step) + 0.5 + 1e-12))
+
+    eff_min = min_w
+    if n > 0:
+        max_floor = (1.0 / n) - 1e-9
+        if max_floor > 0:
+            eff_min = min(min_w, max_floor)
+        else:
+            eff_min = 0.0
+    min_units = int(np.ceil(eff_min / step)) if eff_min > 0 else 0
+    max_units = int(np.floor(max_w / step)) if (max_w is not None and max_w > 0) else None
+    if max_units is not None and max_units < min_units:
+        max_units = min_units
+    target_units = int(round(1.0 / step))
 
     units: Dict[str, int] = {}
-    for k, v in rounded.items():
-        u = int(round(v / step))
+    for k in keys:
+        u = _round_half_up(weights.get(k, 0.0))
         if u < min_units:
-            continue
+            u = min_units
         if max_units is not None and u > max_units:
             u = max_units
         units[k] = u
 
-    if not units:
-        keep = [k for k, v in ranked if v > 0][:3]
-        units = {k: max(min_units, 1) for k in keep}
-
-    target_units = int(round(1.0 / step))
     delta = target_units - sum(units.values())
     if delta > 0:
         while delta > 0:
-            candidates = [k for k in units if max_units is None or units[k] < max_units]
+            candidates = [k for k in keys if max_units is None or units[k] < max_units]
             if not candidates:
                 break
-            k = max(candidates, key=lambda k: units[k])
+            k = max(candidates, key=lambda x: units[x])
             units[k] += 1
             delta -= 1
     elif delta < 0:
         while delta < 0:
-            candidates = [k for k in units if units[k] > min_units]
+            candidates = [k for k in keys if units[k] > min_units]
             if not candidates:
                 break
-            k = max(candidates, key=lambda k: units[k])
+            k = max(candidates, key=lambda x: units[x])
             units[k] -= 1
             delta += 1
 
-    result = {k: units[k] * step for k in units if units[k] > 0}
+    if delta != 0:
+        k = max(keys, key=lambda x: units[x])
+        units[k] = max(units[k] + delta, min_units)
+
+    result = {k: units[k] * step for k in keys}
     total = sum(result.values())
-    if total > 0 and abs(total - 1.0) > 1e-6:
+    if total > 0 and abs(total - 1.0) > 1e-9:
         result = {k: v / total for k, v in result.items()}
     return result
+
+
+def _apply_practical_constraints(
+    weights: Dict[str, float],
+    min_w: float = 0.10,
+    step: float = 0.05,
+    max_w: Optional[float] = None,
+) -> Dict[str, float]:
+    if not weights:
+        return {}
+
+    floored = _apply_min_floor_preserve_count(weights, min_w)
+
+    if max_w is not None and max_w > 0:
+        floored = _apply_weight_caps(floored, max_w)
+        total = sum(floored.values())
+        if total > 0:
+            floored = {k: v / total for k, v in floored.items()}
+
+    rounded = _round_weights_to_step_preserve_count(floored, step, min_w, max_w=max_w)
+    return rounded
 
 
 def _returns_for_isins(
@@ -2352,14 +2387,6 @@ def render_portfolio_builder():
                 step=0.05,
                 max_w=uc_max_bound,
             )
-            selected_isins = [k for k, v in weights_uc_raw.items() if v > 0]
-            if not selected_isins:
-                st.info("Aucun fonds UC conservé après l'ajustement terrain.")
-                return
-            returns_selected = returns_all[selected_isins].dropna(how="any")
-            if returns_selected.empty:
-                st.info("Historique insuffisant après ajustement terrain.")
-                return
 
         weights_final = {"EUROFUND": float(euro_pct) / 100.0}
         for isin in selected_isins:
